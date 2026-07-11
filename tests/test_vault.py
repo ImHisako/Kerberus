@@ -1,0 +1,26 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from kerberus.vault import Vault
+
+
+class VaultTests(unittest.TestCase):
+    def test_encrypted_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "vault.kbv"
+            vault = Vault(path)
+            vault.create("password-lunga-di-test")
+            vault.state["messages"].append({"text": "segreto"})
+            vault.save()
+            self.assertNotIn(b"segreto", path.read_bytes())
+            reopened = Vault(path)
+            reopened.unlock("password-lunga-di-test")
+            self.assertEqual(reopened.state["messages"][0]["text"], "segreto")
+            with self.assertRaises(ValueError):
+                Vault(path).unlock("password-completamente-errata")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
