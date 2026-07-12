@@ -36,8 +36,8 @@ def empty_state() -> dict[str, Any]:
             "send_delivery_receipts": True,
             "send_read_receipts": True,
             "link_previews": False,
-            "minimize_to_tray": True,
             "clearnet_enabled": False,
+            "language": "it",
         },
     }
 
@@ -89,9 +89,9 @@ class Vault:
         settings.setdefault("send_delivery_receipts", True)
         settings.setdefault("send_read_receipts", True)
         settings.setdefault("link_previews", False)
-        settings.setdefault("minimize_to_tray", True)
         settings.setdefault("clearnet_enabled", False)
-        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+        settings.setdefault("language", "it")
+        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray"):
             settings.pop(obsolete, None)
 
     def save(self) -> None:

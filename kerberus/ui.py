@@ -6,15 +6,17 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+import emoji as emoji_data
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
-
-from PyQt6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
+    QDesktopServices,
     QFont,
     QIcon,
     QImage,
@@ -34,6 +36,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -55,6 +58,7 @@ from PyQt6.QtWidgets import (
 from .config import AppConfig
 from . import __version__
 from .crypto import IdentityBundle, b64, destination_b32, pq_available, pq_unavailable_reason, unb64
+from .link_preview import extract_url, fetch_link_preview
 from .router import I2P_VERSION, RouterInstaller
 from .service import MessengerService
 from .updates import UpdateInfo, check_for_update, download_update
@@ -77,6 +81,111 @@ COLORS = {
     "warning": "#f0b35a",
     "danger": "#ef6b73",
 }
+
+_LANGUAGE = "it"
+_ENGLISH = {
+    "Impostazioni": "Settings", "Salva impostazioni": "Save settings", "Annulla": "Cancel",
+    "Chiudi": "Close", "Continua": "Continue", "Nuovo contatto": "New contact",
+    "Aggiungi un contatto": "Add a contact", "Invia richiesta": "Send request",
+    "Primo messaggio (opzionale)": "First message (optional)", "Scrivi un messaggio": "Write a message",
+    "Invia": "Send", "Emoji": "Emoji", "Reagisci": "React", "Copia": "Copy",
+    "Tutte le emoji…": "All emoji…",
+    "Inoltra…": "Forward…", "Elimina da questo dispositivo": "Delete from this device",
+    "Privacy di questa chat": "Privacy for this chat", "Privacy chat": "Chat privacy",
+    "Impostazioni per questa conversazione": "Settings for this conversation",
+    "Conferme di consegna": "Delivery receipts", "Conferme di lettura (spunte blu)": "Read receipts (blue ticks)",
+    "Notifiche desktop": "Desktop notifications", "Esporta chat completa + delay": "Export full chat + delays",
+    "Salva": "Save", "Attivo": "Enabled", "Disattivo": "Disabled",
+    "PRIVACY E INVITI": "PRIVACY AND INVITES", "Codice contatto": "Contact code",
+    "INTERVALLO DI ROTAZIONE": "ROTATION INTERVAL", "Ogni minuto": "Every minute",
+    "Ogni 5 minuti": "Every 5 minutes", "Ogni 15 minuti": "Every 15 minutes", "Ogni ora": "Every hour",
+    "Ruota immediatamente dopo il primo utilizzo": "Rotate immediately after first use",
+    "RICEVUTE E RETE": "RECEIPTS AND NETWORK", "Invia conferme di consegna": "Send delivery receipts",
+    "Invia conferme di lettura (spunte blu)": "Send read receipts (blue ticks)",
+    "Anteprime link esterne con titolo e immagine": "External link previews with title and image",
+    "Consenti funzioni clearnet esplicite (es. aggiornamenti)": "Allow explicit clearnet features (e.g. updates)",
+    "DIAGNOSTICA LOCALE": "LOCAL DIAGNOSTICS", "Apri Console UI": "Open UI console",
+    "Controlla aggiornamenti": "Check for updates", "Lingua dell’applicazione": "Application language",
+    "La lingua selezionata verrà applicata al prossimo avvio.": "The selected language will be applied on next launch.",
+    "Italiano": "Italian", "Inglese": "English", "Cerca emoji…": "Search emoji…",
+    "Nessuna emoji trovata": "No emoji found", "Precedente": "Previous", "Successiva": "Next",
+    "Reazione": "Reaction", "Rimuovi la reazione scegliendola di nuovo": "Choose the same reaction again to remove it",
+    "Dettagli di invio e ritardo": "Delivery and delay details", "In attesa": "Pending",
+    "Inviato": "Sent", "Consegnato": "Delivered", "Letto": "Read",
+    "Cerca conversazioni": "Search conversations", "CONVERSAZIONI": "CONVERSATIONS",
+    "Canale ibrido X25519 + ML-KEM-768": "Hybrid X25519 + ML-KEM-768 channel",
+    "Nuovo profilo": "New profile", "Crea il tuo profilo": "Create your profile",
+    "Nome visibile": "Display name", "Crea vault": "Create vault", "Sblocca Kerberus": "Unlock Kerberus",
+    "Password": "Password", "Ripeti password": "Repeat password", "Sblocca": "Unlock",
+}
+_ENGLISH.update({
+    "Aggiungi contatto": "Add contact", "Annulla richiesta": "Cancel request",
+    "Apri Kerberus": "Open Kerberus", "Apri informazioni I2P": "Open I2P information",
+    "Apri link": "Open link", "Attività dell’app": "Application activity",
+    "CODICE CONTATTO": "CONTACT CODE", "CONNESSIONE PRIVATA": "PRIVATE CONNECTION",
+    "Cambia foto": "Change picture", "Canale I2P pronto": "I2P channel ready",
+    "Caricamento anteprima…": "Loading preview…", "Chat e delay esportati in JSON": "Chat and delays exported to JSON",
+    "Configura I2P": "Configure I2P", "Console UI": "UI console", "Controllo bridge SAM": "Checking SAM bridge",
+    "Copia codice": "Copy code", "DIAGNOSTICA DI CONSEGNA": "DELIVERY DIAGNOSTICS",
+    "EVENTI LOCALI · NESSUN CONTENUTO DEI MESSAGGI": "LOCAL EVENTS · NO MESSAGE CONTENT",
+    "Esci": "Exit", "Esporta profilo": "Export profile", "I2P: verifica...": "I2P: checking...",
+    "Il mio profilo": "My profile", "Importa": "Import", "Inoltra": "Forward",
+    "Inoltra messaggio": "Forward message", "Invio e ricezione": "Sending and receiving",
+    "La chat sarà disponibile dopo la conferma firmata dell’altro dispositivo": "The chat will be available after the other device's signed confirmation",
+    "Le tue conversazioni": "Your conversations", "Messaggio copiato": "Message copied",
+    "Messaggio inoltrato con nuova cifratura": "Message forwarded with fresh encryption",
+    "Messaggistica privata attraverso I2P": "Private messaging through I2P",
+    "Mostra ID crittografico": "Show cryptographic ID", "Nascondi ID crittografico": "Hide cryptographic ID",
+    "Nuovo contatto verificato": "New verified contact", "Nuovo messaggio cifrato": "New encrypted message",
+    "PROFILO KERBERUS": "KERBERUS PROFILE", "Privacy della chat aggiornata": "Chat privacy updated",
+    "Profilo": "Profile", "Profilo firmato e aggiornato": "Signed profile updated", "Pulisci": "Clear",
+    "Richiesta contatto annullata": "Contact request cancelled", "Richiesta in attesa": "Request pending",
+    "Riconnetti": "Reconnect", "Rimuovi": "Remove", "Riprova code": "Retry queues",
+    "Router I2P avviato · attendo il bridge SAM": "I2P router started · waiting for SAM bridge",
+    "Salva messaggi, timestamp, stati e ritardi in un file JSON": "Save messages, timestamps, states and delays to a JSON file",
+    "Salva profilo": "Save profile", "Scegli la chat": "Choose a chat", "Stato I2P": "I2P status",
+    "Tempi del messaggio": "Message timing", "USERNAME": "USERNAME",
+    "Consigliato: limita il riutilizzo accidentale di un invito condiviso.": "Recommended: limits accidental reuse of a shared invitation.",
+    "Quando attive, Kerberus contatta automaticamente il sito del link. Host locali e indirizzi privati sono bloccati.":
+        "When enabled, Kerberus automatically contacts the linked website. Local hosts and private addresses are blocked.",
+    "Scegli per quanto tempo resta stabile il codice. La destination I2P non cambia; cambia soltanto il token di invito autenticato.":
+        "Choose how long the code remains stable. The I2P destination does not change; only the authenticated invitation token changes.",
+    "Le opzioni in automatico ereditano la policy generale. Le ricevute sono cifrate end-to-end. Le anteprime, se attive, contattano il sito e possono rivelare il tuo indirizzo IP al sito stesso.":
+        "Automatic options inherit the global policy. Receipts are end-to-end encrypted. When enabled, previews contact the website and may reveal your IP address to it.",
+    "L’orario di invio è autenticato nel messaggio cifrato. Il ritardo a senso unico dipende anche dalla sincronizzazione degli orologi; il tempo andata/ritorno usa invece l’orologio del mittente.":
+        "The send time is authenticated inside the encrypted message. One-way delay also depends on clock synchronization; round-trip time uses the sender's clock.",
+    "Destinatario temporaneamente non raggiungibile: messaggio cifrato in coda con retry automatico":
+        "Recipient temporarily unreachable: encrypted message queued with automatic retry",
+    "Kerberus ha ricevuto un nuovo messaggio.": "Kerberus received a new message.",
+    "Impostazioni salvate · riavvia Kerberus per applicare la lingua": "Settings saved · restart Kerberus to apply the language",
+})
+_ITALIAN = {value: key for key, value in _ENGLISH.items()}
+
+
+def set_language(language: str) -> None:
+    global _LANGUAGE
+    _LANGUAGE = language if language in {"it", "en"} else "it"
+
+
+def tr(text: str) -> str:
+    return _ENGLISH.get(text, text) if _LANGUAGE == "en" else _ITALIAN.get(text, text)
+
+
+def localize_widget(root: QWidget) -> None:
+    if isinstance(root, QDialog):
+        root.setWindowTitle(tr(root.windowTitle()))
+    for widget in [root, *root.findChildren(QWidget)]:
+        if isinstance(widget, (QLabel, QPushButton, QToolButton, QCheckBox)) and widget.text():
+            widget.setText(tr(widget.text()))
+        if isinstance(widget, QLineEdit) and widget.placeholderText():
+            widget.setPlaceholderText(tr(widget.placeholderText()))
+        if isinstance(widget, QPlainTextEdit) and widget.placeholderText():
+            widget.setPlaceholderText(tr(widget.placeholderText()))
+        if isinstance(widget, QComboBox):
+            for index in range(widget.count()):
+                widget.setItemText(index, tr(widget.itemText(index)))
+        if widget.toolTip():
+            widget.setToolTip(tr(widget.toolTip()))
 
 ICON_DIR = Path(__file__).resolve().parent / "assets" / "lucide"
 
@@ -269,6 +378,10 @@ class KerberusDialog(QDialog):
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
         super().resizeEvent(event)
 
+    def showEvent(self, event: QEvent) -> None:
+        localize_widget(self)
+        super().showEvent(event)
+
 
 class KerberusMessageDialog(KerberusDialog):
     def __init__(self, title: str, message: str, parent: QWidget | None = None, confirm: bool = False):
@@ -413,6 +526,114 @@ class ComposerEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+_EMOJI_CATALOG: list[tuple[str, str, str]] | None = None
+
+
+def emoji_catalog() -> list[tuple[str, str, str]]:
+    global _EMOJI_CATALOG
+    if _EMOJI_CATALOG is None:
+        rows = []
+        for value in emoji_data.EMOJI_DATA:
+            english = emoji_data.demojize(value, language="en").strip(":").replace("_", " ")
+            italian = emoji_data.demojize(value, language="it").strip(":").replace("_", " ")
+            rows.append((value, italian, english))
+        _EMOJI_CATALOG = rows
+    return _EMOJI_CATALOG
+
+
+def _search_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+class EmojiPicker(KerberusDialog):
+    PAGE_SIZE = 180
+
+    def __init__(self, on_selected: Callable[[str], None], parent: QWidget | None = None, reaction: bool = False):
+        super().__init__("Reazione" if reaction else "Emoji", parent, 680)
+        self.resize(680, 590)
+        self._on_selected = on_selected
+        self._page = 0
+        self._filtered = emoji_catalog()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Cerca emoji…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        self.body_layout.addWidget(self.search)
+        if reaction:
+            hint = QLabel("Rimuovi la reazione scegliendola di nuovo")
+            hint.setObjectName("muted")
+            self.body_layout.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(410)
+        self.grid_host = QWidget()
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setContentsMargins(4, 4, 4, 4)
+        self.grid.setSpacing(4)
+        scroll.setWidget(self.grid_host)
+        self.body_layout.addWidget(scroll, 1)
+        navigation = QHBoxLayout()
+        self.previous = QPushButton("Precedente")
+        self.previous.setObjectName("ghost")
+        self.previous.clicked.connect(lambda: self._change_page(-1))
+        self.page_label = QLabel()
+        self.page_label.setObjectName("muted")
+        self.next = QPushButton("Successiva")
+        self.next.setObjectName("ghost")
+        self.next.clicked.connect(lambda: self._change_page(1))
+        navigation.addWidget(self.previous)
+        navigation.addStretch()
+        navigation.addWidget(self.page_label)
+        navigation.addStretch()
+        navigation.addWidget(self.next)
+        self.body_layout.addLayout(navigation)
+        self._render()
+        self.search.setFocus()
+
+    def _filter(self, query: str) -> None:
+        needle = _search_key(query.strip())
+        self._filtered = [
+            row for row in emoji_catalog()
+            if not needle or needle in _search_key(f"{row[1]} {row[2]}")
+        ]
+        self._page = 0
+        self._render()
+
+    def _change_page(self, offset: int) -> None:
+        pages = max(1, (len(self._filtered) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._page = min(max(0, self._page + offset), pages - 1)
+        self._render()
+
+    def _render(self) -> None:
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        start = self._page * self.PAGE_SIZE
+        page = self._filtered[start:start + self.PAGE_SIZE]
+        if not page:
+            empty = QLabel(tr("Nessuna emoji trovata"))
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.grid.addWidget(empty, 0, 0, 1, 12)
+        for index, (value, italian, english) in enumerate(page):
+            button = QToolButton()
+            button.setText(value)
+            button.setFont(QFont("Segoe UI Emoji", 18))
+            button.setFixedSize(48, 42)
+            button.setToolTip(english if _LANGUAGE == "en" else italian)
+            button.clicked.connect(lambda _checked=False, selected=value: self._select(selected))
+            self.grid.addWidget(button, index // 12, index % 12)
+        pages = max(1, (len(self._filtered) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page_label.setText(f"{self._page + 1}/{pages} · {len(self._filtered)} emoji")
+        self.previous.setEnabled(self._page > 0)
+        self.next.setEnabled(self._page + 1 < pages)
+
+    def _select(self, value: str) -> None:
+        self._on_selected(value)
+        self.accept()
+
+
 class ContactRow(QWidget):
     def __init__(self, contact: IdentityBundle, last_message: str = ""):
         super().__init__()
@@ -467,6 +688,80 @@ class PendingContactRow(QWidget):
         self.setToolTip("La chat sarà disponibile dopo la conferma firmata dell’altro dispositivo")
 
 
+class LinkPreviewCard(QFrame):
+    def __init__(self, url: str):
+        super().__init__()
+        self.setObjectName("linkPreviewCard")
+        self.url = url
+        self.setStyleSheet(
+            f"QFrame#linkPreviewCard {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.accent = QFrame()
+        self.accent.setFixedWidth(4)
+        self.accent.setStyleSheet(f"background: {COLORS['cyan']}; border: 0; border-radius: 2px;")
+        outer.addWidget(self.accent)
+        content = QVBoxLayout()
+        content.setContentsMargins(12, 9, 12, 11)
+        content.setSpacing(6)
+        self.site = QLabel("Caricamento anteprima…")
+        self.site.setStyleSheet(f"border: 0; color: {COLORS['muted']}; font-size: 11px;")
+        self.author = QLabel()
+        self.author.setStyleSheet("border: 0; font-weight: 650;")
+        self.author.hide()
+        self.title = QLabel(url)
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet(f"border: 0; color: {COLORS['cyan']}; font-size: 14px; font-weight: 650;")
+        self.description = QLabel()
+        self.description.setWordWrap(True)
+        self.description.setStyleSheet(f"border: 0; color: {COLORS['muted']};")
+        self.description.hide()
+        self.image = QLabel()
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setMinimumHeight(0)
+        self.image.setStyleSheet("border: 0; background: #080a0d; border-radius: 5px;")
+        self.image.hide()
+        open_button = QPushButton("Apri link")
+        open_button.setObjectName("ghost")
+        open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
+        content.addWidget(self.site)
+        content.addWidget(self.author)
+        content.addWidget(self.title)
+        content.addWidget(self.description)
+        content.addWidget(self.image)
+        content.addWidget(open_button, alignment=Qt.AlignmentFlag.AlignRight)
+        outer.addLayout(content, 1)
+
+    def set_preview(self, preview: dict) -> None:
+        self.url = str(preview.get("url") or self.url)
+        site = str(preview.get("site") or "Link")
+        self.site.setText(site)
+        self.title.setText(str(preview.get("title") or self.url))
+        author = str(preview.get("author") or "")
+        self.author.setText(author)
+        self.author.setVisible(bool(author))
+        description = str(preview.get("description") or "")
+        self.description.setText(description)
+        self.description.setVisible(bool(description))
+        if site.lower() == "youtube":
+            self.accent.setStyleSheet(f"background: {COLORS['danger']}; border: 0; border-radius: 2px;")
+        raw_image = preview.get("image", b"")
+        if isinstance(raw_image, bytes) and raw_image:
+            image = QImage()
+            if image.loadFromData(raw_image):
+                pixmap = QPixmap.fromImage(image).scaled(
+                    430, 250, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                )
+                self.image.setPixmap(pixmap)
+                self.image.setFixedHeight(pixmap.height())
+                self.image.show()
+
+    def set_error(self) -> None:
+        self.site.setText("Anteprima non disponibile")
+
+
 class MessageBubble(QWidget):
     def __init__(
         self,
@@ -478,6 +773,8 @@ class MessageBubble(QWidget):
         on_timing: Callable[[dict], None] | None = None,
         on_action: Callable[[str, dict], None] | None = None,
         link_preview: bool = False,
+        on_link_preview: Callable[[str, LinkPreviewCard], None] | None = None,
+        author: IdentityBundle | None = None,
     ):
         super().__init__()
         self.message = timing or {"text": text, "status": status}
@@ -487,8 +784,17 @@ class MessageBubble(QWidget):
         self.customContextMenuRequested.connect(self._show_context_menu)
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 4, 20, 4)
+        outer.setSpacing(9)
+        avatar = QLabel()
+        if author is not None:
+            set_avatar(avatar, author, 34)
+        else:
+            avatar.setFixedSize(34, 34)
+            avatar.hide()
         if outgoing:
             outer.addStretch(1)
+        else:
+            outer.addWidget(avatar, alignment=Qt.AlignmentFlag.AlignTop)
         bubble = QFrame()
         bubble.setMaximumWidth(560)
         color = COLORS["accent_dark"] if outgoing else COLORS["surface_2"]
@@ -497,25 +803,25 @@ class MessageBubble(QWidget):
         content = QVBoxLayout(bubble)
         content.setContentsMargins(13, 10, 13, 8)
         content.setSpacing(5)
+        username = QLabel(author.name if author is not None else "")
+        username.setStyleSheet(
+            f"border: 0; background: transparent; color: {COLORS['accent'] if not outgoing else COLORS['text']}; "
+            "font-size: 12px; font-weight: 700;"
+        )
+        content.addWidget(username)
+        if author is None:
+            username.hide()
         body = QLabel(text)
         body.setWordWrap(True)
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.setStyleSheet("border: 0; background: transparent;")
         content.addWidget(body)
-        if link_preview:
-            match = re.search(r"https?://[^\s<>]+", text)
-            if match:
-                url = match.group(0).rstrip(".,;:!?)")
-                parsed = urlsplit(url)
-                preview = QLabel(f"🔗  {parsed.hostname or 'Link'}\n{url}")
-                preview.setWordWrap(True)
-                preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                preview.setToolTip("Anteprima locale: Kerberus non ha contattato il sito")
-                preview.setStyleSheet(
-                    f"border: 1px solid {COLORS['border']}; border-radius: 6px; "
-                    f"background: {COLORS['surface']}; padding: 8px; color: {COLORS['muted']};"
-                )
+        if link_preview and on_link_preview is not None:
+            url = extract_url(text)
+            if url:
+                preview = LinkPreviewCard(url)
                 content.addWidget(preview)
+                on_link_preview(url, preview)
         self._timestamp = timestamp
         self.time_label = QLabel()
         self.time_label.setObjectName("timestamp")
@@ -543,22 +849,27 @@ class MessageBubble(QWidget):
         content.addWidget(self.reactions_label, alignment=Qt.AlignmentFlag.AlignRight)
         self.update_message(self.message)
         outer.addWidget(bubble)
-        if not outgoing:
+        if outgoing:
+            outer.addWidget(avatar, alignment=Qt.AlignmentFlag.AlignTop)
+        else:
             outer.addStretch(1)
 
     def _show_context_menu(self, position: QPoint) -> None:
         if self.on_action is None:
             return
         menu = QMenu(self)
-        reaction_menu = menu.addMenu("Reagisci")
+        reaction_menu = menu.addMenu(tr("Reagisci"))
         reaction_actions = {reaction_menu.addAction(emoji): emoji for emoji in ("👍", "❤️", "😂", "😮", "😢", "🔥")}
-        copy_action = menu.addAction("Copia")
-        forward_action = menu.addAction("Inoltra…")
+        all_reactions = reaction_menu.addAction(tr("Tutte le emoji…"))
+        copy_action = menu.addAction(tr("Copia"))
+        forward_action = menu.addAction(tr("Inoltra…"))
         menu.addSeparator()
-        delete_action = menu.addAction("Elimina da questo dispositivo")
+        delete_action = menu.addAction(tr("Elimina da questo dispositivo"))
         selected = menu.exec(self.mapToGlobal(position))
         if selected in reaction_actions:
             self.on_action("react:" + reaction_actions[selected], self.message)
+        elif selected is all_reactions:
+            self.on_action("reaction_picker", self.message)
         elif selected is copy_action:
             self.on_action("copy", self.message)
         elif selected is forward_action:
@@ -572,10 +883,10 @@ class MessageBubble(QWidget):
         time_text = datetime.fromtimestamp(self._timestamp).strftime("%H:%M")
         if self.outgoing:
             marks = {
-                "pending": ("◷ In attesa", COLORS["muted"]),
-                "sent": ("✓ Inviato", COLORS["muted"]),
-                "delivered": ("✓✓ Consegnato", COLORS["muted"]),
-                "read": ("✓✓ Letto", COLORS["cyan"]),
+                "pending": (f"◷ {tr('In attesa')}", COLORS["muted"]),
+                "sent": (f"✓ {tr('Inviato')}", COLORS["muted"]),
+                "delivered": (f"✓✓ {tr('Consegnato')}", COLORS["muted"]),
+                "read": (f"✓✓ {tr('Letto')}", COLORS["cyan"]),
             }
             mark, color = marks.get(status, ("✓", COLORS["muted"]))
             time_text += f"  {mark}"
@@ -687,14 +998,21 @@ class KerberusWindow(QMainWindow):
         self._router_connected = False
         self._router_detail = "Verifica non ancora completata"
         self._workers: list[threading.Thread] = []
+        self._preview_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="kerberus-preview")
         self._download_dialog: KerberusProgressDialog | None = None
         # Il bordo resta ridimensionabile, ma non copre la scrollbar della chat.
         self._resize_margin = 2
         self._allow_close = False
+        self._shutdown_complete = False
         self._ui_events: list[str] = []
         self._open_dialogs: set[QDialog] = set()
+        self._modeless_by_title: dict[str, QDialog] = {}
         self._message_bubbles: dict[str, MessageBubble] = {}
+        self._link_preview_cache: dict[str, dict] = {}
+        self._link_preview_waiters: dict[str, list[LinkPreviewCard]] = {}
         self._rendered_contact = ""
+        self._message_render_start = 0
+        self._message_page_size = 160
         self._scroll_pin_generation = 0
         self._tray: QSystemTrayIcon | None = None
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -732,12 +1050,14 @@ class KerberusWindow(QMainWindow):
                 f"Dettaglio tecnico: {pq_unavailable_reason()}",
             )
             return False
+        set_language(str(self.service.settings().get("language", "it")))
         if not self.service.identity():
             name, ok = self._ask_name()
             if not ok:
                 return False
             self.service.create_identity(name)
         self._build_ui()
+        localize_widget(self)
         self._setup_tray()
         self.refresh_contacts()
         QTimer.singleShot(150, self.connect_router)
@@ -1036,7 +1356,8 @@ class KerberusWindow(QMainWindow):
         composer_layout.addWidget(self.composer, 1)
         emoji = QToolButton()
         emoji.setText("☺")
-        emoji.setFixedSize(40, 40)
+        emoji.setFont(QFont("Segoe UI Emoji", 22))
+        emoji.setFixedSize(52, 52)
         emoji.setToolTip("Emoji")
         emoji.clicked.connect(lambda: self.show_emoji_menu(emoji))
         composer_layout.addWidget(emoji, alignment=Qt.AlignmentFlag.AlignBottom)
@@ -1102,12 +1423,18 @@ class KerberusWindow(QMainWindow):
         if not contact:
             return
         self.selected_contact = contact_id
-        self.service.warm_contact(contact_id)
         set_avatar(self.chat_avatar, contact, 44)
         self.chat_name.setText(contact.name)
         self.content_stack.setCurrentIndex(1)
+        self._message_render_start = max(
+            0, len(self.service.messages_for(contact_id)) - self._message_page_size
+        )
         self.refresh_messages("select", contact_id)
-        self.service.mark_chat_read(contact_id)
+        self._run_task(
+            lambda: self.service.mark_chat_read(contact_id),
+            lambda _value: None,
+            lambda error: self._log_action(f"Errore ricevuta di lettura: {error}"),
+        )
         self.composer.setFocus()
 
     def refresh_messages(self, reason: str = "new", contact_id: str = "") -> None:
@@ -1131,7 +1458,11 @@ class KerberusWindow(QMainWindow):
         if contact_id and contact_id != self.selected_contact:
             self.refresh_contacts()
             return
-        messages = self.service.messages_for(self.selected_contact)
+        all_messages = self.service.messages_for(self.selected_contact)
+        if self._rendered_contact != self.selected_contact:
+            self._message_render_start = max(0, len(all_messages) - self._message_page_size)
+        self._message_render_start = min(self._message_render_start, len(all_messages))
+        messages = all_messages[self._message_render_start:]
         message_ids = [str(message.get("message_id", "")) for message in messages]
         rendered_ids = list(self._message_bubbles)
         if reason == "status" and self._message_bubbles and message_ids == rendered_ids:
@@ -1168,6 +1499,13 @@ class KerberusWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         self._message_bubbles.clear()
+        if self._message_render_start > 0:
+            older = QPushButton(
+                f"Carica messaggi precedenti ({self._message_render_start})"
+            )
+            older.setObjectName("ghost")
+            older.clicked.connect(self.load_older_messages)
+            self.message_layout.insertWidget(0, older, alignment=Qt.AlignmentFlag.AlignHCenter)
         for message in messages:
             self._append_message_bubble(message)
         self._rendered_contact = self.selected_contact
@@ -1184,19 +1522,69 @@ class KerberusWindow(QMainWindow):
                 ),
             )
 
+    def load_older_messages(self) -> None:
+        if not self.selected_contact or self._message_render_start <= 0:
+            return
+        scrollbar = self.message_scroll.verticalScrollBar()
+        previous_height = scrollbar.maximum()
+        self._message_render_start = max(0, self._message_render_start - self._message_page_size)
+        self.refresh_messages("older", self.selected_contact)
+        QTimer.singleShot(
+            0, lambda: scrollbar.setValue(max(0, scrollbar.maximum() - previous_height))
+        )
+
     def _append_message_bubble(self, message: dict) -> None:
+        outgoing = message["direction"] == "out"
+        author = self.service.identity() if outgoing else None
+        if not outgoing:
+            contact_data = self.service.vault.state.get("contacts", {}).get(self.selected_contact)
+            if contact_data:
+                author = IdentityBundle.from_dict(contact_data)
         bubble = MessageBubble(
             message["text"],
             int(message.get("sent_at", message["time"])),
-            message["direction"] == "out",
+            outgoing,
             message.get("status", ""),
             timing=message,
             on_timing=self.show_message_timing,
             on_action=self.message_action,
             link_preview=self.service.effective_chat_setting(self.selected_contact, "link_previews"),
+            on_link_preview=self._request_link_preview,
+            author=author,
         )
         self.message_layout.insertWidget(self.message_layout.count() - 1, bubble)
         self._message_bubbles[str(message.get("message_id", ""))] = bubble
+
+    def _request_link_preview(self, url: str, card: LinkPreviewCard) -> None:
+        cached = self._link_preview_cache.get(url)
+        if cached is not None:
+            card.set_preview(cached) if not cached.get("error") else card.set_error()
+            return
+        waiting = self._link_preview_waiters.setdefault(url, [])
+        waiting.append(card)
+        if len(waiting) > 1:
+            return
+
+        def ready(value: object) -> None:
+            preview = value if isinstance(value, dict) else {"error": True}
+            self._link_preview_cache[url] = preview
+            while len(self._link_preview_cache) > 128:
+                self._link_preview_cache.pop(next(iter(self._link_preview_cache)))
+            for target in self._link_preview_waiters.pop(url, []):
+                try:
+                    target.set_preview(preview)
+                except RuntimeError:
+                    pass
+
+        def failed(_error: str) -> None:
+            self._link_preview_cache[url] = {"error": True}
+            for target in self._link_preview_waiters.pop(url, []):
+                try:
+                    target.set_error()
+                except RuntimeError:
+                    pass
+
+        self._run_preview_task(lambda: fetch_link_preview(url), ready, failed)
 
     def _pin_scroll_to_bottom(self) -> None:
         scrollbar = self.message_scroll.verticalScrollBar()
@@ -1223,6 +1611,12 @@ class KerberusWindow(QMainWindow):
         QTimer.singleShot(350, release_pin)
 
     def message_action(self, action: str, message: dict) -> None:
+        if action == "reaction_picker":
+            picker = EmojiPicker(
+                lambda value: self.message_action("react:" + value, message), self, reaction=True
+            )
+            picker.exec()
+            return
         if action.startswith("react:"):
             emoji = action.split(":", 1)[1]
             self._run_task(
@@ -1248,22 +1642,23 @@ class KerberusWindow(QMainWindow):
             self.forward_message(message)
 
     def show_emoji_menu(self, anchor: QToolButton) -> None:
-        menu = QMenu(self)
-        for emoji in ("😀", "😂", "😊", "😍", "🥰", "😎", "😢", "😡", "👍", "👎", "❤️", "🔥", "🎉", "🙏", "🤝", "✅"):
-            action = menu.addAction(emoji)
-            action.triggered.connect(lambda _checked=False, value=emoji: self.composer.insertPlainText(value))
-        menu.exec(anchor.mapToGlobal(QPoint(0, -menu.sizeHint().height())))
+        picker = EmojiPicker(self.composer.insertPlainText, self)
+        picker.exec()
 
     def show_chat_settings(self) -> None:
         if not self.selected_contact:
             return
-        current = self.service.chat_settings(self.selected_contact)
+        chat_id = self.selected_contact
+        current = self.service.chat_settings(chat_id)
         global_settings = self.service.settings()
         dialog = KerberusDialog("Privacy chat", self, 500)
         layout = dialog.body_layout
         title = QLabel("Impostazioni per questa conversazione")
         title.setObjectName("dialogTitle")
-        detail = QLabel("Le opzioni in automatico ereditano la policy generale. Le ricevute sono cifrate end-to-end.")
+        detail = QLabel(
+            "Le opzioni in automatico ereditano la policy generale. Le ricevute sono cifrate end-to-end. "
+            "Le anteprime, se attive, contattano il sito e possono rivelare il tuo indirizzo IP al sito stesso."
+        )
         detail.setObjectName("muted")
         detail.setWordWrap(True)
         layout.addWidget(title)
@@ -1282,10 +1677,15 @@ class KerberusWindow(QMainWindow):
 
         delivery = tri_state("Conferme di consegna", "send_delivery_receipts")
         reads = tri_state("Conferme di lettura (spunte blu)", "send_read_receipts")
-        previews = tri_state("Anteprime link locali", "link_previews")
+        previews = tri_state("Anteprime link esterne con titolo e immagine", "link_previews")
         notifications = QCheckBox("Notifiche desktop")
         notifications.setChecked(current["notifications"])
         layout.addWidget(notifications)
+        export_debug = QPushButton("Esporta chat completa + delay")
+        export_debug.setIcon(lucide_icon("terminal"))
+        export_debug.setToolTip("Salva messaggi, timestamp, stati e ritardi in un file JSON")
+        export_debug.clicked.connect(lambda: self.export_chat_debug(dialog, chat_id))
+        layout.addWidget(export_debug)
         actions = QHBoxLayout()
         cancel = QPushButton("Annulla")
         cancel.setObjectName("ghost")
@@ -1300,32 +1700,59 @@ class KerberusWindow(QMainWindow):
 
         def persist() -> None:
             self.service.update_chat_settings(
-                self.selected_contact,
+                chat_id,
                 send_delivery_receipts=delivery.currentData(),
                 send_read_receipts=reads.currentData(),
                 link_previews=previews.currentData(),
                 notifications=notifications.isChecked(),
             )
+            if self.selected_contact == chat_id:
+                self._rendered_contact = ""
+                self.refresh_messages("settings", chat_id)
             self.statusBar().showMessage("Privacy della chat aggiornata", 4000)
 
         dialog.accepted.connect(persist)
         self._show_modeless(dialog)
 
+    def export_chat_debug(self, parent: QWidget, contact_id: str) -> None:
+        if not contact_id:
+            return
+        if not KerberusMessageDialog.ask(
+            parent,
+            "Esportazione in chiaro",
+            "Il file conterrà l’intera chat e i dati temporali in chiaro. Non condividerlo senza averlo controllato. Continuare?",
+        ):
+            return
+        contact = next((item for item in self.service.contacts() if item.identity_id == contact_id), None)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", contact.name if contact else "chat").strip("._") or "chat"
+        default_name = f"kerberus-debug-{safe_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            parent,
+            "Esporta chat e diagnostica",
+            default_name,
+            "Diagnostica JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.service.export_chat_debug(contact_id), encoding="utf-8")
+        except Exception as exc:
+            self._error("Esportazione chat", str(exc))
+            return
+        self._log_action("Chat e diagnostica esportate")
+        self.statusBar().showMessage("Chat e delay esportati in JSON", 5000)
+
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         tray = QSystemTrayIcon(lucide_icon("shield-check", COLORS["accent"], 32), self)
-        tray.setToolTip("Kerberus · I2P messenger")
+        tray.setToolTip(tr("Kerberus · I2P messenger"))
         menu = QMenu(self)
-        show_action = menu.addAction("Apri Kerberus")
+        show_action = menu.addAction(tr("Apri Kerberus"))
         show_action.triggered.connect(lambda: (self.showNormal(), self.raise_(), self.activateWindow()))
-        quit_action = menu.addAction("Esci")
+        quit_action = menu.addAction(tr("Esci"))
 
-        def quit_app() -> None:
-            self._allow_close = True
-            self.close()
-
-        quit_action.triggered.connect(quit_app)
+        quit_action.triggered.connect(self.exit_from_tray)
         tray.setContextMenu(menu)
         tray.activated.connect(
             lambda reason: show_action.trigger()
@@ -1507,11 +1934,30 @@ class KerberusWindow(QMainWindow):
         self._ui_events = self._ui_events[-1000:]
 
     def _show_modeless(self, dialog: QDialog) -> None:
+        title = dialog.windowTitle()
+        existing = self._modeless_by_title.get(title)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                dialog.deleteLater()
+                return
+            except RuntimeError:
+                self._modeless_by_title.pop(title, None)
         dialog.setModal(False)
         dialog.setWindowModality(Qt.WindowModality.NonModal)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._open_dialogs.add(dialog)
-        dialog.destroyed.connect(lambda: self._open_dialogs.discard(dialog))
+        self._modeless_by_title[title] = dialog
+
+        def released() -> None:
+            self._open_dialogs.discard(dialog)
+            if self._modeless_by_title.get(title) is dialog:
+                self._modeless_by_title.pop(title, None)
+
+        dialog.finished.connect(lambda _result: released())
+        dialog.destroyed.connect(released)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -1571,6 +2017,17 @@ class KerberusWindow(QMainWindow):
         layout.addWidget(eyebrow)
         layout.addWidget(title)
         layout.addWidget(description)
+        language_label = QLabel("Lingua dell’applicazione")
+        language_label.setObjectName("eyebrow")
+        language = QComboBox()
+        language.addItem("Italiano", "it")
+        language.addItem("Inglese", "en")
+        language.setCurrentIndex(0 if current.get("language", "it") == "it" else 1)
+        language_hint = QLabel("La lingua selezionata verrà applicata al prossimo avvio.")
+        language_hint.setObjectName("muted")
+        layout.addWidget(language_label)
+        layout.addWidget(language)
+        layout.addWidget(language_hint)
         interval_label = QLabel("INTERVALLO DI ROTAZIONE")
         interval_label.setObjectName("eyebrow")
         interval = QComboBox()
@@ -1594,17 +2051,20 @@ class KerberusWindow(QMainWindow):
         delivery_receipts.setChecked(current["send_delivery_receipts"])
         read_receipts = QCheckBox("Invia conferme di lettura (spunte blu)")
         read_receipts.setChecked(current["send_read_receipts"])
-        link_previews = QCheckBox("Anteprime link locali (nessuna richiesta automatica)")
+        link_previews = QCheckBox("Anteprime link esterne con titolo e immagine")
         link_previews.setChecked(current["link_previews"])
-        minimize_to_tray = QCheckBox("Chiudi nella tray invece di terminare")
-        minimize_to_tray.setChecked(current["minimize_to_tray"])
+        link_preview_hint = QLabel(
+            "Quando attive, Kerberus contatta automaticamente il sito del link. Host locali e indirizzi privati sono bloccati."
+        )
+        link_preview_hint.setObjectName("muted")
+        link_preview_hint.setWordWrap(True)
         clearnet = QCheckBox("Consenti funzioni clearnet esplicite (es. aggiornamenti)")
         clearnet.setChecked(current["clearnet_enabled"])
         layout.addWidget(receipts_label)
         layout.addWidget(delivery_receipts)
         layout.addWidget(read_receipts)
         layout.addWidget(link_previews)
-        layout.addWidget(minimize_to_tray)
+        layout.addWidget(link_preview_hint)
         layout.addWidget(clearnet)
         layout.addSpacing(10)
         diagnostics_label = QLabel("DIAGNOSTICA LOCALE")
@@ -1635,11 +2095,14 @@ class KerberusWindow(QMainWindow):
                 send_delivery_receipts=delivery_receipts.isChecked(),
                 send_read_receipts=read_receipts.isChecked(),
                 link_previews=link_previews.isChecked(),
-                minimize_to_tray=minimize_to_tray.isChecked(),
                 clearnet_enabled=clearnet.isChecked(),
+                language=str(language.currentData()),
             )
+            if self.selected_contact:
+                self._rendered_contact = ""
+                self.refresh_messages("settings", self.selected_contact)
             self._log_action("Impostazioni privacy salvate")
-            self.statusBar().showMessage("Impostazioni salvate · codice contatto aggiornato", 5000)
+            self.statusBar().showMessage("Impostazioni salvate · riavvia Kerberus per applicare la lingua", 5000)
 
         dialog.accepted.connect(save_settings)
         self._show_modeless(dialog)
@@ -2126,16 +2589,34 @@ class KerberusWindow(QMainWindow):
         self._workers.append(thread)
         thread.start()
 
+    def _run_preview_task(
+        self,
+        function: Callable[[], object],
+        success: Callable[[object], None],
+        failure: Callable[[str], None],
+    ) -> None:
+        signals = AppSignals()
+        signals.task_done.connect(success)
+        signals.task_error.connect(failure)
+        self._task_signals = getattr(self, "_task_signals", [])
+        self._task_signals.append(signals)
+
+        def work() -> None:
+            try:
+                signals.task_done.emit(function())
+            except Exception as exc:
+                signals.task_error.emit(str(exc))
+
+        try:
+            self._preview_pool.submit(work)
+        except RuntimeError:
+            failure("Anteprime in chiusura")
+
     def _error(self, title: str, message: str) -> None:
         self._log_action(f"Errore UI: {title}")
         KerberusMessageDialog.show_message(self, title, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._allow_close and self._tray is not None and self.service.settings().get("minimize_to_tray", True):
-            self.hide()
-            self._tray.showMessage("Kerberus", "Kerberus continua a funzionare nella tray.", QSystemTrayIcon.MessageIcon.Information, 2500)
-            event.ignore()
-            return
         if not self._allow_close:
             if not KerberusMessageDialog.ask(
                 self,
@@ -2145,9 +2626,30 @@ class KerberusWindow(QMainWindow):
                 event.ignore()
                 return
             self._allow_close = True
-        self.service.close()
-        RouterInstaller.stop_running()
+        self._shutdown()
         event.accept()
+
+    def exit_from_tray(self) -> None:
+        self._allow_close = True
+        self.close()
+        if not self._shutdown_complete:
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        if not self._shutdown_complete:
+            self._shutdown_complete = True
+            if self._tray is not None:
+                self._tray.hide()
+            self._preview_pool.shutdown(wait=False, cancel_futures=True)
+            self.service.close()
+            RouterInstaller.stop_running()
+        self._quit_application()
+
+    @staticmethod
+    def _quit_application() -> None:
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
 
 
 def run() -> None:

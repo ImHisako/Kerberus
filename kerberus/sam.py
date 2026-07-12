@@ -10,17 +10,56 @@ import select
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from pathlib import Path
 from typing import Callable
 
 
-FrameReceiver = Callable[[bytes], bytes | None]
+FrameReceiver = Callable[[bytes, str], bytes | None]
 
 
 class SamError(RuntimeError):
     pass
+
+
+def _restrict_private_file(path: Path) -> None:
+    """Restrict POSIX access; Windows keeps the user-profile inherited DACL."""
+    try:
+        path.chmod(0o600)
+    except OSError:
+        if os.name != "nt":
+            raise
+
+
+def _write_private_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(value)
+        os.replace(temporary, path)
+        _restrict_private_file(path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _hidden_startupinfo():
+    if os.name != "nt":
+        return None
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0
+    return startup
 
 
 def _validate_destination(destination: str) -> str:
@@ -78,6 +117,7 @@ class NativeSamTransport:
             encoding="utf-8",
             bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            startupinfo=_hidden_startupinfo(),
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name="kerberus-native-reader")
         self._frame_worker = threading.Thread(
@@ -162,7 +202,7 @@ class NativeSamTransport:
         try:
             payload = base64.b64decode(message["payload"], validate=True)
             self.frames_received += 1
-            response = self._receiver(payload)
+            response = self._receiver(payload, str(message.get("destination", "")))
             if response:
                 self._write({
                     "op": "reply",
@@ -287,6 +327,8 @@ class SamClient:
             sock = self._connect()
             sock.settimeout(300)
             try:
+                if self.keys_path.exists():
+                    _restrict_private_file(self.keys_path)
                 private_destination = self.keys_path.read_text("ascii").strip() if self.keys_path.exists() else "TRANSIENT"
                 signature_option = " SIGNATURE_TYPE=7" if private_destination == "TRANSIENT" else ""
                 reply = _command(
@@ -342,8 +384,7 @@ class SamClient:
             raise SamError(reply)
         private = values["PRIV"]
         public = values["PUB"]
-        self.keys_path.parent.mkdir(parents=True, exist_ok=True)
-        self.keys_path.write_text(private, encoding="ascii")
+        _write_private_text(self.keys_path, private)
         return public
 
     def send(self, destination: str, payload: bytes) -> None:
@@ -475,7 +516,7 @@ class SamClient:
                     handed_off = True
                     threading.Thread(
                         target=self._read_inbound_stream,
-                        args=(sock, callback),
+                        args=(sock, callback, remote.split()[0]),
                         daemon=True,
                         name="sam-inbound",
                     ).start()
@@ -505,7 +546,7 @@ class SamClient:
                     pass
                 self._stop.wait(1.5)
 
-    def _read_inbound_stream(self, sock: socket.socket, callback: FrameReceiver) -> None:
+    def _read_inbound_stream(self, sock: socket.socket, callback: FrameReceiver, remote: str) -> None:
         try:
             sock.settimeout(None)
             while not self._stop.is_set():
@@ -514,7 +555,7 @@ class SamClient:
                     raise SamError("Frame troppo grande")
                 payload = self._read_exact(sock, size)
                 try:
-                    response = callback(payload)
+                    response = callback(payload, remote)
                     if response:
                         if len(response) > 4_000_000:
                             raise SamError("Risposta troppo grande")
@@ -537,7 +578,7 @@ class SamClient:
                     raise SamError("Frame troppo grande")
                 payload = self._read_exact(sock, size)
                 try:
-                    response = callback(payload)
+                    response = callback(payload, destination)
                     if response:
                         sock.sendall(len(response).to_bytes(4, "big") + response)
                 except Exception:

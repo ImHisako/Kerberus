@@ -2,7 +2,7 @@ import copy
 import unittest
 
 from kerberus.crypto import generate_identity
-from kerberus.ratchet import RatchetError, decrypt, encrypt
+from kerberus.ratchet import RatchetError, accept_init, complete_init, decrypt, encrypt, initiate
 
 
 class DoubleRatchetTests(unittest.TestCase):
@@ -11,6 +11,15 @@ class DoubleRatchetTests(unittest.TestCase):
         self.bob, self.bob_secrets = generate_identity("Bob")
         self.alice_states = {}
         self.bob_states = {}
+        init = initiate(self.alice_states, self.alice, self.alice_secrets, self.bob)
+        ready = accept_init(self.bob_states, self.bob, self.bob_secrets, self.alice, init)
+        complete_init(self.alice_states, self.alice, self.alice_secrets, self.bob, ready)
+
+    def test_content_is_rejected_before_both_ephemeral_keys_are_contributed(self):
+        states = {}
+        initiate(states, self.alice, self.alice_secrets, self.bob)
+        with self.assertRaises(RatchetError):
+            encrypt(states, self.alice, self.alice_secrets, self.bob, {"text": "too early"})
 
     def test_alternating_messages_advance_dh_ratchet(self):
         first = encrypt(self.alice_states, self.alice, self.alice_secrets, self.bob, {"text": "one"})

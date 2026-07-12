@@ -30,14 +30,14 @@ def _initial_state(identity: IdentityBundle, secrets: IdentitySecrets, peer: Ide
     private = X25519PrivateKey.from_private_bytes(unb64(secrets.exchange_private))
     shared = private.exchange(X25519PublicKey.from_public_bytes(unb64(peer.exchange_public)))
     pair = ":".join(sorted((identity.identity_id, peer.identity_id))).encode("ascii")
-    root = _hkdf(shared, hashlib.sha256(pair).digest(), b"kerberus-double-ratchet-v2-root")
+    root = _hkdf(shared, hashlib.sha256(pair).digest(), b"kerberus-double-ratchet-v3-root")
 
     def directional(sender: str, recipient: str) -> str:
-        info = f"kerberus-dr-v2-chain:{sender}:{recipient}".encode("ascii")
+        info = f"kerberus-dr-v3-chain:{sender}:{recipient}".encode("ascii")
         return b64(_hkdf(root, hashlib.sha256(pair).digest(), info))
 
     return {
-        "version": 2,
+        "version": 3,
         "root": b64(root),
         "dh_self_private": secrets.exchange_private,
         "dh_self_public": identity.exchange_public,
@@ -47,7 +47,7 @@ def _initial_state(identity: IdentityBundle, secrets: IdentitySecrets, peer: Ide
         "send_n": 0,
         "recv_n": 0,
         "previous_send_n": 0,
-        "started": False,
+        "phase": "new",
         "skipped": {},
     }
 
@@ -56,20 +56,20 @@ def ensure_state(
     states: dict[str, Any], identity: IdentityBundle, secrets: IdentitySecrets, peer: IdentityBundle
 ) -> dict[str, Any]:
     state = states.get(peer.identity_id)
-    if not isinstance(state, dict) or state.get("version") != 2:
+    if not isinstance(state, dict) or state.get("version") != 3:
         state = _initial_state(identity, secrets, peer)
         states[peer.identity_id] = state
     return state
 
 
 def _root_step(root: bytes, dh: bytes) -> tuple[bytes, bytes]:
-    material = _hkdf(dh, root, b"kerberus-double-ratchet-v2-step", 64)
+    material = _hkdf(dh, root, b"kerberus-double-ratchet-v3-step", 64)
     return material[:32], material[32:]
 
 
 def _chain_step(chain: bytes) -> tuple[bytes, bytes]:
-    message_key = hmac.new(chain, b"kerberus-dr-v2-message", hashlib.sha256).digest()
-    next_chain = hmac.new(chain, b"kerberus-dr-v2-next", hashlib.sha256).digest()
+    message_key = hmac.new(chain, b"kerberus-dr-v3-message", hashlib.sha256).digest()
+    next_chain = hmac.new(chain, b"kerberus-dr-v3-next", hashlib.sha256).digest()
     return next_chain, message_key
 
 
@@ -90,8 +90,57 @@ def _start_initiator(state: dict[str, Any]) -> None:
     state.update({
         "root": b64(root), "send_chain": b64(chain), "send_n": 0,
         "previous_send_n": int(state.get("send_n", 0)),
-        "dh_self_private": private, "dh_self_public": public, "started": True,
+        "dh_self_private": private, "dh_self_public": public,
     })
+
+
+def is_ready(states: dict[str, Any], peer_id: str) -> bool:
+    state = states.get(peer_id)
+    return isinstance(state, dict) and state.get("version") == 3 and state.get("phase") == "ready"
+
+
+def initiate(
+    states: dict[str, Any], identity: IdentityBundle, secrets: IdentitySecrets, peer: IdentityBundle
+) -> dict[str, Any] | None:
+    """Start a content-free authenticated handshake.
+
+    User content is deliberately held back until both peers contributed an
+    ephemeral DH key. This avoids deriving the first message solely from
+    long-term identity keys.
+    """
+    state = ensure_state(states, identity, secrets, peer)
+    if state.get("phase") == "ready":
+        return None
+    if state.get("phase") == "new":
+        _start_initiator(state)
+        state["phase"] = "init_sent"
+    return {"ratchet_version": 3, "dh": state["dh_self_public"]}
+
+
+def accept_init(
+    states: dict[str, Any], identity: IdentityBundle, secrets: IdentitySecrets,
+    peer: IdentityBundle, header: dict[str, Any],
+) -> dict[str, Any]:
+    remote = str(header.get("dh", ""))
+    if header.get("ratchet_version") != 3 or not remote:
+        raise RatchetError("Handshake ratchet non valido")
+    state = _initial_state(identity, secrets, peer)
+    _dh_ratchet(state, remote)
+    state["phase"] = "ready"
+    states[peer.identity_id] = state
+    return {"ratchet_version": 3, "dh": state["dh_self_public"]}
+
+
+def complete_init(
+    states: dict[str, Any], identity: IdentityBundle, secrets: IdentitySecrets,
+    peer: IdentityBundle, header: dict[str, Any],
+) -> None:
+    state = ensure_state(states, identity, secrets, peer)
+    remote = str(header.get("dh", ""))
+    if header.get("ratchet_version") != 3 or state.get("phase") != "init_sent" or not remote:
+        raise RatchetError("Risposta handshake ratchet inattesa")
+    _dh_ratchet(state, remote)
+    state["phase"] = "ready"
 
 
 def encrypt(
@@ -102,14 +151,14 @@ def encrypt(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     state = ensure_state(states, identity, secrets, peer)
+    if state.get("phase") != "ready":
+        raise RatchetError("Handshake ratchet non completato")
     payload = dict(payload)
     payload.setdefault("sent_at", int(time.time()))
-    if not state.get("started") and identity.identity_id < peer.identity_id:
-        _start_initiator(state)
     chain, message_key = _chain_step(unb64(state["send_chain"]))
     number = int(state.get("send_n", 0))
     header = {
-        "ratchet_version": 2,
+        "ratchet_version": 3,
         "dh": state["dh_self_public"],
         "pn": int(state.get("previous_send_n", 0)),
         "n": number,
@@ -150,7 +199,7 @@ def _dh_ratchet(state: dict[str, Any], remote: str) -> None:
     root, send_chain = _root_step(root, _dh(private, remote))
     state.update({
         "root": b64(root), "recv_chain": b64(recv_chain), "send_chain": b64(send_chain),
-        "dh_self_private": private, "dh_self_public": public, "started": True,
+        "dh_self_private": private, "dh_self_public": public,
     })
 
 
@@ -162,7 +211,9 @@ def decrypt(
     envelope: dict[str, Any],
 ) -> dict[str, Any]:
     existing = states.get(peer.identity_id)
-    state = copy.deepcopy(existing) if isinstance(existing, dict) and existing.get("version") == 2 else _initial_state(identity, secrets, peer)
+    state = copy.deepcopy(existing) if isinstance(existing, dict) and existing.get("version") == 3 else _initial_state(identity, secrets, peer)
+    if state.get("phase") != "ready":
+        raise RatchetError("Handshake ratchet non completato")
     remote = str(envelope.get("dh", ""))
     number = envelope.get("n")
     if not remote or not isinstance(number, int) or number < 0:

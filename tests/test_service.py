@@ -7,8 +7,9 @@ import unittest
 from pathlib import Path
 
 from kerberus.config import AppConfig
-from kerberus.crypto import destination_b32, generate_identity, pq_available, seal_message, update_destination
+from kerberus.crypto import destination_b32, generate_identity, pq_available, profile_destination, seal_message, sign_control, update_destination
 from kerberus.service import MessengerService
+from kerberus.ratchet import accept_init, complete_init, initiate
 
 
 @unittest.skipUnless(pq_available(), "pqcrypto non installato")
@@ -53,6 +54,7 @@ class ServiceTests(unittest.TestCase):
             bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
             alice_service.vault.save()
             bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
 
             captured = []
 
@@ -136,6 +138,7 @@ class ServiceTests(unittest.TestCase):
             bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
             alice_service.vault.save()
             bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
             routes = {
                 alice.destination: alice_service,
                 destination_b32(alice.destination): alice_service,
@@ -356,6 +359,44 @@ class ServiceTests(unittest.TestCase):
             alice_service.close(wait=True)
             bob_service.close(wait=True)
 
+    def test_chat_debug_export_contains_delays_without_secrets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            bob = bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            alice_service.vault.state["messages"].append({
+                "message_id": "d" * 32,
+                "contact_id": bob.identity_id,
+                "direction": "out",
+                "text": "Messaggio diagnostico",
+                "time": 100,
+                "sent_at": 100,
+                "received_at": None,
+                "recipient_received_at": 102,
+                "delivered_at": 104,
+                "read_at": 106,
+                "status": "read",
+                "reactions": {bob.identity_id: "👍"},
+            })
+            alice_service.vault.save()
+            report = json.loads(alice_service.export_chat_debug(bob.identity_id))
+            self.assertEqual(report["format"], "kerberus-chat-debug-v1")
+            self.assertEqual(report["diagnostics"]["message_count"], 1)
+            exported = report["messages"][0]
+            self.assertEqual(exported["text"], "Messaggio diagnostico")
+            self.assertEqual(exported["delays_seconds"]["one_way_clock_dependent"], 2)
+            self.assertEqual(exported["delays_seconds"]["round_trip_local_clock"], 4)
+            self.assertEqual(exported["delays_seconds"]["read_after_send"], 6)
+            self.assertNotIn("payload", exported)
+            self.assertNotIn("destination", report["contact"])
+            self.assertNotIn("secrets", report)
+            self.assertNotIn("ratchets", report)
+            self.assertNotIn(alice_service.secrets().signing_private, alice_service.export_chat_debug(bob.identity_id))
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
     def test_recent_previous_minute_contact_code_is_accepted(self):
         with tempfile.TemporaryDirectory() as folder:
             service = self._service(Path(folder) / "bob", "Bob")
@@ -379,6 +420,32 @@ class ServiceTests(unittest.TestCase):
                 service._consume_contact_code(previous)
             service.close(wait=True)
 
+    def test_unsolicited_or_wrong_stream_contact_accept_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            victim = self._service(root / "victim", "Victim")
+            attacker = self._service(root / "attacker", "Attacker")
+            request_id = "a" * 32
+            accept = {
+                "version": 1, "type": "contact_accept", "request_id": request_id,
+                "sender": attacker.identity().to_dict(),
+            }
+            accept["signature"] = sign_control(attacker.secrets(), accept)
+            with self.assertRaises(ValueError):
+                victim._receive(json.dumps(accept).encode())
+            self.assertNotIn(attacker.identity().identity_id, victim.vault.state["contacts"])
+
+            destination = profile_destination(attacker.identity().profile_code)
+            victim.vault.state["pending"][destination] = {"request_id": request_id, "first_message": ""}
+            victim.vault.save()
+            wrong_peer = self._service(root / "wrong-peer", "Wrong peer")
+            with self.assertRaises(ValueError):
+                victim._receive(json.dumps(accept).encode(), wrong_peer.identity().destination)
+            self.assertNotIn(attacker.identity().identity_id, victim.vault.state["contacts"])
+            victim.close(wait=True)
+            attacker.close(wait=True)
+            wrong_peer.close(wait=True)
+
     def test_contact_code_policy_is_persisted_and_rotates_after_use(self):
         with tempfile.TemporaryDirectory() as folder:
             service = self._service(Path(folder) / "bob", "Bob")
@@ -388,6 +455,10 @@ class ServiceTests(unittest.TestCase):
             second = service.contact_code()
             self.assertNotEqual(first, second)
             self.assertEqual(service.settings()["contact_code_period_minutes"], 5)
+            service.update_privacy_settings(language="en")
+            self.assertEqual(service.settings()["language"], "en")
+            with self.assertRaises(ValueError):
+                service.update_privacy_settings(language="xx")
             service.close(wait=True)
 
     def test_encrypted_read_receipt_and_reaction_round_trip(self):
@@ -419,6 +490,11 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(self._wait_for(lambda: alice_service.messages_for(bob.identity_id)[0]["status"] == "read"))
             outgoing = alice_service.messages_for(bob.identity_id)[0]
             self.assertEqual(outgoing["reactions"][bob.identity_id], "👍")
+            bob_service.react_to_message(alice.identity_id, incoming["message_id"], "👍")
+            self.assertTrue(self._wait_for(lambda: bob.identity_id not in outgoing.get("reactions", {})))
+            self.assertNotIn(bob.identity_id, incoming.get("reactions", {}))
+            with self.assertRaises(ValueError):
+                bob_service.react_to_message(alice.identity_id, incoming["message_id"], "not-an-emoji")
             self.assertEqual(alice_service.vault.state["outbox"], [])
             alice_service.close(wait=True)
             bob_service.close(wait=True)
@@ -449,6 +525,15 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(captured, [])
             alice_service.close(wait=True)
             bob_service.close(wait=True)
+
+    @staticmethod
+    def _establish_ratchet(first: MessengerService, second: MessengerService) -> None:
+        first_identity, second_identity = first.identity(), second.identity()
+        init = initiate(first.vault.state.setdefault("ratchets", {}), first_identity, first.secrets(), second_identity)
+        ready = accept_init(second.vault.state.setdefault("ratchets", {}), second_identity, second.secrets(), first_identity, init)
+        complete_init(first.vault.state["ratchets"], first_identity, first.secrets(), second_identity, ready)
+        first.vault.save()
+        second.vault.save()
 
     @staticmethod
     def _service(root: Path, name: str) -> MessengerService:

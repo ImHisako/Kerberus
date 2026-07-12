@@ -274,6 +274,8 @@ def seal_payload(
     secrets: IdentitySecrets,
     recipient: IdentityBundle,
     payload: dict[str, Any],
+    *,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     if not pq_available():
         raise RuntimeError(f"ML-KEM-768 non disponibile: {pq_unavailable_reason()}")
@@ -294,7 +296,7 @@ def seal_payload(
         "type": "message",
         "sender_id": sender.identity_id,
         "recipient_id": recipient.identity_id,
-        "message_id": uuid.uuid4().hex,
+        "message_id": message_id or uuid.uuid4().hex,
         "ephemeral": b64(ephemeral_public),
         "pq_ciphertext": b64(pq_ciphertext),
     }

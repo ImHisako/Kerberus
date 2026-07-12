@@ -6,30 +6,43 @@ import json
 import copy
 import threading
 import time
+import uuid
+import emoji as emoji_data
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 from .config import AppConfig
 from .crypto import (
     IdentityBundle,
     IdentitySecrets,
+    destination_b32,
     generate_identity,
     open_message_payload,
     profile_destination,
     rotating_contact_code,
     seal_payload,
+    sign_control,
     update_destination,
     update_public_profile,
     verify_control,
 )
 from .sam import SamClient
-from .ratchet import decrypt as ratchet_decrypt, encrypt as ratchet_encrypt
+from .ratchet import (
+    accept_init as ratchet_accept_init,
+    complete_init as ratchet_complete_init,
+    decrypt as ratchet_decrypt,
+    encrypt as ratchet_encrypt,
+    initiate as ratchet_initiate,
+    is_ready as ratchet_is_ready,
+)
 from .vault import Vault
 
 
 class MessengerService:
     _MESSAGE_RETRY_SECONDS = (2, 3, 5, 8, 12, 20)
     _CONTROL_RETRY_SECONDS = (2, 3, 5, 8, 12)
+    _CONTACT_RETRY_SECONDS = (3, 5, 8, 12, 20, 30)
     def __init__(self, config: AppConfig):
         self.config = config
         self.vault = Vault(config.vault_path)
@@ -84,9 +97,9 @@ class MessengerService:
         self.warm_recent_contacts()
         return active
 
-    def _receive_safely(self, payload: bytes) -> bytes | None:
+    def _receive_safely(self, payload: bytes, remote_destination: str = "") -> bytes | None:
         try:
-            return self._receive(payload, inline_reply=True)
+            return self._receive(payload, remote_destination, inline_reply=True)
         except Exception as exc:
             self._emit_protocol_event("receive_error", f"Frame I2P ricevuto ma rifiutato: {type(exc).__name__}")
             return None
@@ -100,8 +113,33 @@ class MessengerService:
             }
 
     def retry_all_now(self) -> dict[str, int]:
+        handshakes: set[str] = set()
         with self._state_lock:
+            # Upgrade locally-created requests from pre-authentication releases.
+            # They can be re-signed safely because the original target code and
+            # local signed profile are still inside the encrypted vault.
+            for entry in self.vault.state.get("pending", {}).values():
+                try:
+                    request = json.loads(str(entry.get("payload", "")))
+                    if request.get("type") == "contact_request" and not request.get("signature"):
+                        request_id = uuid.uuid4().hex
+                        request["request_id"] = request_id
+                        request["signature"] = sign_control(self.secrets(), request)
+                        entry["request_id"] = request_id
+                        entry["payload"] = json.dumps(request, separators=(",", ":"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
             for entry in self.vault.state.get("outbox", []):
+                contact_id = str(entry.get("contact_id", ""))
+                if not ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), contact_id):
+                    stored = next(
+                        (message for message in self.vault.state.get("messages", [])
+                         if message.get("message_id") == entry.get("message_id")), None
+                    )
+                    if stored:
+                        entry["payload"] = ""
+                        entry["deferred"] = {"kind": "message", "text": str(stored.get("text", ""))}
+                        handshakes.add(contact_id)
                 entry["last_attempt"] = 0
             for entry in self.vault.state.get("pending", {}).values():
                 entry["last_attempt"] = 0
@@ -109,6 +147,10 @@ class MessengerService:
                 entry["last_attempt"] = 0
             status = self.queue_status()
             self.vault.save()
+        for contact_id in handshakes:
+            contact_data = self.vault.state.get("contacts", {}).get(contact_id)
+            if contact_data:
+                self._ensure_ratchet_handshake(IdentityBundle.from_dict(contact_data))
         self.flush_control_outbox(background=True)
         self.flush_pending_contacts(background=True)
         self.flush_outbox(background=True)
@@ -188,9 +230,9 @@ class MessengerService:
         settings.setdefault("send_delivery_receipts", True)
         settings.setdefault("send_read_receipts", True)
         settings.setdefault("link_previews", False)
-        settings.setdefault("minimize_to_tray", True)
         settings.setdefault("clearnet_enabled", False)
-        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+        settings.setdefault("language", "it")
+        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray"):
             settings.pop(obsolete, None)
         return dict(settings)
 
@@ -213,15 +255,18 @@ class MessengerService:
     def update_privacy_settings(self, **values: object) -> dict:
         allowed = {
             "send_delivery_receipts", "send_read_receipts", "link_previews",
-            "minimize_to_tray", "clearnet_enabled",
+            "clearnet_enabled",
+            "language",
         }
         unknown = set(values) - allowed
         if unknown:
             raise ValueError(f"Impostazioni non supportate: {', '.join(sorted(unknown))}")
+        if "language" in values and values["language"] not in {"it", "en"}:
+            raise ValueError("Lingua non supportata")
         with self._state_lock:
             settings = self.vault.state.setdefault("settings", {})
             settings.update(values)
-            for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+            for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray"):
                 settings.pop(obsolete, None)
             self.vault.save()
         self._emit_protocol_event("privacy_settings_updated", "Policy rete e ricevute aggiornata")
@@ -283,13 +328,16 @@ class MessengerService:
         request = {
             "version": 1,
             "type": "contact_request",
+            "request_id": uuid.uuid4().hex,
             "target_code": normalized,
             "sender": identity.to_dict(),
         }
+        request["signature"] = sign_control(self.secrets(), request)
         payload = json.dumps(request, separators=(",", ":"))
         with self._state_lock:
             self.vault.state["pending"][destination] = {
                 "target_code": normalized,
+                "request_id": request["request_id"],
                 "first_message": first_message.strip(),
                 "payload": payload,
                 "created_at": int(time.time()),
@@ -327,6 +375,90 @@ class MessengerService:
     def messages_for(self, contact_id: str) -> list[dict]:
         return [m for m in self.vault.state["messages"] if m["contact_id"] == contact_id]
 
+    def export_chat_debug(self, contact_id: str) -> str:
+        contact_data = self.vault.state.get("contacts", {}).get(contact_id)
+        identity = self.identity()
+        if not contact_data or not identity:
+            raise ValueError("Chat non trovata")
+        contact = IdentityBundle.from_dict(contact_data)
+
+        def iso_time(value: object) -> str | None:
+            if not isinstance(value, int) or value < 0:
+                return None
+            return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+        def delay(later: object, earlier: object) -> int | None:
+            if not isinstance(later, int) or not isinstance(earlier, int):
+                return None
+            return later - earlier
+
+        with self._state_lock:
+            exported_messages = []
+            for message in self.vault.state.get("messages", []):
+                if message.get("contact_id") != contact_id:
+                    continue
+                sent_at = message.get("sent_at", message.get("time"))
+                received_at = message.get("received_at")
+                recipient_received_at = message.get("recipient_received_at")
+                delivered_at = message.get("delivered_at")
+                read_at = message.get("read_at")
+                outgoing = message.get("direction") == "out"
+                peer_received_at = recipient_received_at if outgoing else received_at
+                exported_messages.append({
+                    "index": len(exported_messages),
+                    "message_id": str(message.get("message_id", "")),
+                    "direction": "out" if outgoing else "in",
+                    "status": str(message.get("status", "")),
+                    "text": str(message.get("text", "")),
+                    "timestamps": {
+                        "sent_epoch": sent_at,
+                        "sent_utc": iso_time(sent_at),
+                        "local_received_epoch": received_at,
+                        "local_received_utc": iso_time(received_at),
+                        "peer_received_epoch": recipient_received_at,
+                        "peer_received_utc": iso_time(recipient_received_at),
+                        "delivery_ack_epoch": delivered_at,
+                        "delivery_ack_utc": iso_time(delivered_at),
+                        "read_epoch": read_at,
+                        "read_utc": iso_time(read_at),
+                    },
+                    "delays_seconds": {
+                        "one_way_clock_dependent": delay(peer_received_at, sent_at),
+                        "round_trip_local_clock": delay(delivered_at, sent_at) if outgoing else None,
+                        "read_after_send": delay(read_at, sent_at) if outgoing else None,
+                    },
+                    "reactions": dict(message.get("reactions", {}))
+                    if isinstance(message.get("reactions", {}), dict) else {},
+                })
+            pending_messages = sum(
+                entry.get("contact_id") == contact_id for entry in self.vault.state.get("outbox", [])
+            )
+            pending_controls = sum(
+                entry.get("destination") == contact.destination
+                for entry in self.vault.state.get("control_outbox", [])
+            )
+
+        report = {
+            "format": "kerberus-chat-debug-v1",
+            "warning": "Contiene testo dei messaggi in chiaro. Non contiene password, chiavi private, stato ratchet o payload cifrati.",
+            "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+            "local_profile": {"name": identity.name, "identity_id": identity.identity_id},
+            "contact": {"name": contact.name, "identity_id": contact.identity_id},
+            "diagnostics": {
+                "message_count": len(exported_messages),
+                "pending_messages": pending_messages,
+                "pending_controls": pending_controls,
+                "native_transport_active": bool(getattr(self.sam, "native_active", False)),
+                "last_protocol_event": self.last_protocol_event,
+                "delay_notes": {
+                    "one_way_clock_dependent": "Dipende dalla sincronizzazione degli orologi dei due dispositivi.",
+                    "round_trip_local_clock": "Calcolato interamente con l'orologio del mittente.",
+                },
+            },
+            "messages": exported_messages,
+        }
+        return json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+
     def delete_message(self, message_id: str) -> bool:
         """Delete one local copy and cancel its pending delivery, if any."""
         if not message_id:
@@ -358,10 +490,11 @@ class MessengerService:
         if not identity:
             raise RuntimeError("Identità non configurata")
         contact = IdentityBundle.from_dict(self.vault.state["contacts"][contact_id])
+        message_id = uuid.uuid4().hex
         with self._state_lock:
-            envelope = self._seal_ratchet(contact, {"kind": "message", "text": text})
-        message_id = envelope["message_id"]
-        payload = json.dumps(envelope, separators=(",", ":"))
+            ready = ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), contact_id)
+            envelope = self._seal_ratchet(contact, {"kind": "message", "text": text}, message_id=message_id) if ready else None
+        payload = json.dumps(envelope, separators=(",", ":")) if envelope else ""
         now = int(time.time())
         with self._state_lock:
             self.vault.state["messages"].append({
@@ -383,19 +516,22 @@ class MessengerService:
                 "contact_id": contact_id,
                 "destination": contact.destination,
                 "payload": payload,
+                "deferred": None if envelope else {"kind": "message", "text": text},
                 "created_at": now,
                 "last_attempt": 0,
                 "attempts": 0,
             })
             self.vault.state["outbox"] = self.vault.state["outbox"][-10_000:]
             self.vault.save()
+        if not ready:
+            self._ensure_ratchet_handshake(contact)
         if self.on_message:
             self.on_message("new", contact_id)
         sent = self._attempt_outbox(message_id, force=True)
         return "sent" if sent else "queued"
 
     def react_to_message(self, contact_id: str, message_id: str, emoji: str) -> None:
-        if not emoji or len(emoji) > 16:
+        if not emoji_data.is_emoji(emoji) or len(emoji) > 32:
             raise ValueError("Reazione non valida")
         contact = IdentityBundle.from_dict(self.vault.state["contacts"][contact_id])
         target = next((m for m in self.vault.state["messages"] if m.get("message_id") == message_id), None)
@@ -406,11 +542,16 @@ class MessengerService:
             raise RuntimeError("Identità non configurata")
         with self._state_lock:
             reactions = target.setdefault("reactions", {})
-            reactions[identity.identity_id] = emoji
+            remove = reactions.get(identity.identity_id) == emoji
+            if remove:
+                reactions.pop(identity.identity_id, None)
+            else:
+                reactions[identity.identity_id] = emoji
             self.vault.save()
         with self._state_lock:
             envelope = self._seal_ratchet(contact, {
-                "kind": "reaction", "target_id": message_id, "emoji": emoji,
+                "kind": "reaction", "target_id": message_id,
+                "emoji": "" if remove else emoji, "remove": remove,
             })
             self.vault.save()
         self._queue_control(contact.destination, envelope, background=True)
@@ -440,23 +581,87 @@ class MessengerService:
             self._queue_control(contact.destination, envelope, background=True)
         return len(unread)
 
-    def _seal_ratchet(self, contact: IdentityBundle, payload: dict) -> dict:
+    def _seal_ratchet(self, contact: IdentityBundle, payload: dict, *, message_id: str | None = None) -> dict:
         identity = self.identity()
         if not identity:
             raise RuntimeError("Identità non configurata")
         states = self.vault.state.setdefault("ratchets", {})
         working = copy.deepcopy(states)
         inner = ratchet_encrypt(working, identity, self.secrets(), contact, payload)
-        envelope = seal_payload(identity, self.secrets(), contact, {"kind": "ratchet", **inner})
+        envelope = seal_payload(
+            identity, self.secrets(), contact, {"kind": "ratchet", **inner}, message_id=message_id
+        )
         states[contact.identity_id] = working[contact.identity_id]
         return envelope
 
-    def _receive(self, payload: bytes, inline_reply: bool = False) -> bytes | None:
+    def _send_ratchet_handshake(
+        self, contact: IdentityBundle, action: str, header: dict | None = None, *, background: bool = False
+    ) -> None:
+        identity = self.identity()
+        if not identity:
+            return
+        envelope = seal_payload(identity, self.secrets(), contact, {
+            "kind": "ratchet_handshake", "action": action, "header": header or {},
+        })
+        self._queue_control(contact.destination, envelope, background=background)
+
+    def _ensure_ratchet_handshake(self, contact: IdentityBundle) -> None:
+        identity = self.identity()
+        if not identity:
+            return
+        with self._state_lock:
+            states = self.vault.state.setdefault("ratchets", {})
+            if ratchet_is_ready(states, contact.identity_id):
+                return
+            state = states.get(contact.identity_id, {})
+            if identity.identity_id < contact.identity_id:
+                header = ratchet_initiate(states, identity, self.secrets(), contact)
+                self.vault.save()
+                action = "init"
+            elif not state.get("nudge_sent"):
+                state = states.setdefault(contact.identity_id, state)
+                state["nudge_sent"] = True
+                self.vault.save()
+                header, action = {}, "nudge"
+            else:
+                return
+        if header is not None:
+            self._send_ratchet_handshake(contact, action, header)
+
+    def _receive_ratchet_handshake(self, sender: IdentityBundle, clear: dict) -> None:
+        identity = self.identity()
+        if not identity:
+            return
+        action = clear.get("action")
+        header = clear.get("header")
+        if not isinstance(header, dict):
+            raise ValueError("Header handshake ratchet non valido")
+        reply: tuple[str, dict] | None = None
+        with self._state_lock:
+            states = self.vault.state.setdefault("ratchets", {})
+            if action == "nudge":
+                if identity.identity_id < sender.identity_id:
+                    init = ratchet_initiate(states, identity, self.secrets(), sender)
+                    if init is not None:
+                        reply = ("init", init)
+            elif action == "init":
+                reply = ("ready", ratchet_accept_init(states, identity, self.secrets(), sender, header))
+            elif action == "ready":
+                ratchet_complete_init(states, identity, self.secrets(), sender, header)
+            else:
+                raise ValueError("Azione handshake ratchet non valida")
+            self.vault.save()
+        if reply:
+            self._send_ratchet_handshake(sender, *reply)
+        if action in {"init", "ready"}:
+            self.flush_outbox(background=True)
+
+    def _receive(self, payload: bytes, remote_destination: str = "", inline_reply: bool = False) -> bytes | None:
         envelope = json.loads(payload.decode("utf-8"))
         message_type = envelope.get("type")
         if message_type == "contact_request":
             try:
-                destination, response = self._receive_contact_request(envelope)
+                destination, response = self._receive_contact_request(envelope, remote_destination)
                 if inline_reply:
                     self._emit_protocol_event(
                         "contact_accept_inline", "Conferma contatto restituita sullo stesso stream I2P"
@@ -469,10 +674,10 @@ class MessengerService:
                 self._send_contact_reject(envelope, str(exc))
             return
         if message_type == "contact_accept":
-            self._receive_contact_accept(envelope)
+            self._receive_contact_accept(envelope, remote_destination)
             return
         if message_type == "contact_reject":
-            self._receive_contact_reject(envelope)
+            self._receive_contact_reject(envelope, remote_destination)
             return
         if message_type == "profile_update":
             self._receive_profile_update(envelope)
@@ -498,6 +703,8 @@ class MessengerService:
                 (message for message in self.vault.state["messages"] if message.get("message_id") == message_id),
                 {},
             )
+            if not stored:
+                return None
             received_at = int(stored.get("received_at") or time.time())
             if self._privacy_enabled(sender_id, "send_delivery_receipts"):
                 if inline_reply:
@@ -507,6 +714,13 @@ class MessengerService:
         clear = open_message_payload(identity, self.secrets(), sender, envelope)
         received_at = int(time.time())
         kind = clear.get("kind", "message")
+        if kind == "ratchet_handshake":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+                self.vault.save()
+            self._receive_ratchet_handshake(sender, clear)
+            return None
         if kind == "ratchet":
             with self._state_lock:
                 clear = ratchet_decrypt(
@@ -568,12 +782,17 @@ class MessengerService:
 
     def _receive_reaction(self, sender_id: str, clear: dict) -> None:
         target_id, emoji = clear.get("target_id", ""), str(clear.get("emoji", ""))
-        if not target_id or not emoji or len(emoji) > 16:
+        remove = clear.get("remove") is True
+        if not target_id or (not remove and (not emoji_data.is_emoji(emoji) or len(emoji) > 32)):
             return
         with self._state_lock:
             for message in self.vault.state.get("messages", []):
                 if message.get("message_id") == target_id and message.get("contact_id") == sender_id:
-                    message.setdefault("reactions", {})[sender_id] = emoji
+                    reactions = message.setdefault("reactions", {})
+                    if remove:
+                        reactions.pop(sender_id, None)
+                    else:
+                        reactions[sender_id] = emoji
                     self.vault.save()
                     break
         if self.on_message:
@@ -619,8 +838,31 @@ class MessengerService:
             self.on_contacts_changed(contact.identity_id)
         self.warm_contact(contact.identity_id)
 
-    def _receive_contact_request(self, envelope: dict) -> tuple[str, dict]:
+    @staticmethod
+    def _signed_control(sender: IdentityBundle, envelope: dict) -> None:
+        signed = dict(envelope)
+        signature = str(signed.pop("signature", ""))
+        verify_control(sender, signed, signature)
+
+    @staticmethod
+    def _remote_matches(sender: IdentityBundle, remote_destination: str) -> bool:
+        if not remote_destination:
+            return True  # Direct unit/in-process transports have no SAM peer metadata.
+        try:
+            claimed = profile_destination(sender.profile_code)
+            actual = remote_destination.lower() if remote_destination.lower().endswith(".b32.i2p") else destination_b32(remote_destination)
+            return hmac.compare_digest(claimed, actual)
+        except ValueError:
+            return False
+
+    def _receive_contact_request(self, envelope: dict, remote_destination: str = "") -> tuple[str, dict]:
         sender = self._validated_contact(envelope["sender"])
+        self._signed_control(sender, envelope)
+        if not self._remote_matches(sender, remote_destination):
+            raise ValueError("Destination I2P del richiedente non autenticata")
+        request_id = envelope.get("request_id", "")
+        if not isinstance(request_id, str) or len(request_id) != 32:
+            raise ValueError("Identificatore richiesta non valido")
         duplicate = self._consume_contact_code(envelope.get("target_code", ""), sender.identity_id)
         self._save_contact(sender)
         event = "Ritrasmissione valida" if duplicate else "Richiesta valida"
@@ -628,17 +870,44 @@ class MessengerService:
         identity = self.identity()
         if not identity:
             raise RuntimeError("Identità locale non configurata")
-        response = {"version": 1, "type": "contact_accept", "sender": identity.to_dict()}
+        response = {
+            "version": 1, "type": "contact_accept", "request_id": request_id,
+            "sender": identity.to_dict(),
+        }
+        if identity.identity_id < sender.identity_id:
+            with self._state_lock:
+                response["ratchet_init"] = ratchet_initiate(
+                    self.vault.state.setdefault("ratchets", {}), identity, self.secrets(), sender
+                )
+                self.vault.save()
+        response["signature"] = sign_control(self.secrets(), response)
         return sender.destination, response
 
-    def _receive_contact_accept(self, envelope: dict) -> None:
+    def _receive_contact_accept(self, envelope: dict, remote_destination: str = "") -> None:
         sender = self._validated_contact(envelope["sender"])
+        self._signed_control(sender, envelope)
+        if not self._remote_matches(sender, remote_destination):
+            raise ValueError("Destination I2P della conferma non autenticata")
+        destination = profile_destination(sender.profile_code)
+        request_id = envelope.get("request_id", "")
+        with self._state_lock:
+            pending = self.vault.state["pending"].get(destination)
+            if not pending or not hmac.compare_digest(str(pending.get("request_id", "")), str(request_id)):
+                raise ValueError("Conferma contatto non richiesta o scaduta")
+            self.vault.state["pending"].pop(destination, None)
+            self.vault.save()
         self._save_contact(sender)
         self._emit_protocol_event("contact_accept_received", f"Contatto confermato: {sender.name}")
-        pending = None
-        with self._state_lock:
-            pending = self.vault.state["pending"].pop(profile_destination(sender.profile_code), None)
-            self.vault.save()
+        init_header = envelope.get("ratchet_init")
+        if isinstance(init_header, dict):
+            with self._state_lock:
+                ready = ratchet_accept_init(
+                    self.vault.state.setdefault("ratchets", {}), self.identity(), self.secrets(), sender, init_header
+                )
+                self.vault.save()
+            self._send_ratchet_handshake(sender, "ready", ready)
+        else:
+            self._ensure_ratchet_handshake(sender)
         if pending and pending.get("first_message"):
             self.send_message(sender.identity_id, pending["first_message"])
 
@@ -656,15 +925,25 @@ class MessengerService:
         response = {
             "version": 1,
             "type": "contact_reject",
+            "request_id": str(envelope.get("request_id", "")),
             "reason": public_reason,
             "sender": identity.to_dict(),
         }
+        response["signature"] = sign_control(self.secrets(), response)
         self._queue_control(sender.destination, response)
 
-    def _receive_contact_reject(self, envelope: dict) -> None:
+    def _receive_contact_reject(self, envelope: dict, remote_destination: str = "") -> None:
         sender = self._validated_contact(envelope["sender"])
+        self._signed_control(sender, envelope)
+        if not self._remote_matches(sender, remote_destination):
+            raise ValueError("Destination I2P del rifiuto non autenticata")
         destination = profile_destination(sender.profile_code)
         with self._state_lock:
+            pending = self.vault.state["pending"].get(destination)
+            if not pending or not hmac.compare_digest(
+                str(pending.get("request_id", "")), str(envelope.get("request_id", ""))
+            ):
+                raise ValueError("Rifiuto riferito a una richiesta diversa o scaduta")
             self.vault.state["pending"].pop(destination, None)
             self.vault.save()
         self._emit_protocol_event(
@@ -691,6 +970,9 @@ class MessengerService:
     def _message_ack(self, sender: IdentityBundle, message_id: str, received_at: int) -> dict | None:
         identity = self.identity()
         if not identity:
+            return None
+        if not ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), sender.identity_id):
+            self._ensure_ratchet_handshake(sender)
             return None
         # Delivery receipts are encrypted like messages. A passive relay can no
         # longer correlate a clear message id with its acknowledgement.
@@ -781,7 +1063,9 @@ class MessengerService:
                 self._emit_protocol_event("contact_request_expired", "Nessuna conferma ricevuta entro 10 minuti")
                 return False
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
-            retry_after = min(120, 15 * (2 ** min(prior_attempts, 3)))
+            retry_after = self._CONTACT_RETRY_SECONDS[
+                min(prior_attempts, len(self._CONTACT_RETRY_SECONDS) - 1)
+            ]
             if not force and now - entry.get("last_attempt", 0) < retry_after:
                 return False
             entry["last_attempt"] = now
@@ -903,6 +1187,18 @@ class MessengerService:
             entry = next((item for item in self.vault.state["outbox"] if item["message_id"] == message_id), None)
             if not entry:
                 return True
+            if not entry.get("payload"):
+                contact_data = self.vault.state.get("contacts", {}).get(entry.get("contact_id"))
+                if not contact_data or not ratchet_is_ready(
+                    self.vault.state.setdefault("ratchets", {}), str(entry.get("contact_id", ""))
+                ):
+                    return False
+                contact = IdentityBundle.from_dict(contact_data)
+                envelope = self._seal_ratchet(
+                    contact, dict(entry.get("deferred") or {}), message_id=message_id
+                )
+                entry["payload"] = json.dumps(envelope, separators=(",", ":"))
+                entry.pop("deferred", None)
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
             retry_after = self._MESSAGE_RETRY_SECONDS[min(prior_attempts, len(self._MESSAGE_RETRY_SECONDS) - 1)]
             if not force and now - entry.get("last_attempt", 0) < retry_after:

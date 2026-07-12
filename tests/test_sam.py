@@ -1,8 +1,10 @@
 import unittest
+import os
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
-from kerberus.sam import SamClient, SamError
+from kerberus.sam import SamClient, SamError, _write_private_text
 
 
 class FakeSocket:
@@ -14,6 +16,14 @@ class FakeSocket:
 
 
 class SamTests(unittest.TestCase):
+    def test_persistent_destination_is_written_as_a_private_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sam-destination.txt"
+            _write_private_text(path, "private-key")
+            self.assertEqual(path.read_text("ascii"), "private-key")
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_persistent_session_does_not_send_transient_signature_option(self):
         from tempfile import TemporaryDirectory
 
