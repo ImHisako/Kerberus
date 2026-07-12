@@ -14,6 +14,36 @@ class FakeSocket:
 
 
 class SamTests(unittest.TestCase):
+    def test_persistent_session_does_not_send_transient_signature_option(self):
+        from tempfile import TemporaryDirectory
+
+        class SessionSocket:
+            def settimeout(self, _value):
+                pass
+
+            def close(self):
+                pass
+
+        with TemporaryDirectory() as folder:
+            keys = Path(folder) / "sam.keys"
+            keys.write_text("persistent-private-key", encoding="ascii")
+            client = SamClient("127.0.0.1", 7656, keys)
+            commands = []
+
+            def command(_sock, value):
+                commands.append(value)
+                if value.startswith("NAMING LOOKUP"):
+                    return "NAMING REPLY RESULT=OK VALUE=public-destination"
+                return "SESSION STATUS RESULT=OK"
+
+            with patch.object(client, "_connect", return_value=SessionSocket()), patch(
+                "kerberus.sam._command", side_effect=command
+            ), patch("kerberus.sam._native_helper_path", return_value=None), patch("kerberus.sam.threading.Thread"):
+                client.start_session()
+            session = next(value for value in commands if value.startswith("SESSION CREATE"))
+            self.assertNotIn("SIGNATURE_TYPE", session)
+            self.assertIn("i2cp.leaseSetEncType=6,4", session)
+
     def test_each_process_client_uses_a_unique_session_id(self):
         first = SamClient("127.0.0.1", 7656, Path("one"))
         second = SamClient("127.0.0.1", 7656, Path("two"))

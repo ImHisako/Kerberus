@@ -46,6 +46,7 @@ installer.log
 .idea/
 .vscode/
 *.code-workspace
+To-Do.txt
 .DS_Store
 Thumbs.db
 Desktop.ini

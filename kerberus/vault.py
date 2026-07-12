@@ -26,11 +26,23 @@ def empty_state() -> dict[str, Any]:
         "seen": [],
         "pending": {},
         "used_contact_codes": [],
+        "chat_settings": {},
+        "ratchets": {},
         "settings": {
             "contact_code_period_minutes": 1,
             "contact_code_single_use": True,
             "contact_code_generation": 0,
             "contact_code_anchor_time": int(time.time()),
+            "send_delivery_receipts": True,
+            "send_read_receipts": True,
+            "link_previews": False,
+            "minimize_to_tray": True,
+            "clearnet_enabled": False,
+            "dns_mode": "none",
+            "dns_host": "base.dns.mullvad.net",
+            "dns_ipv4": "194.242.2.4",
+            "dns_ipv6": "2a07:e340::4",
+            "dns_port": 853,
         },
     }
 
@@ -72,11 +84,23 @@ class Vault:
         self.state.setdefault("control_outbox", [])
         self.state.setdefault("pending", {})
         self.state.setdefault("used_contact_codes", [])
+        self.state.setdefault("chat_settings", {})
+        self.state.setdefault("ratchets", {})
         settings = self.state.setdefault("settings", {})
         settings.setdefault("contact_code_period_minutes", 1)
         settings.setdefault("contact_code_single_use", True)
         settings.setdefault("contact_code_generation", 0)
         settings.setdefault("contact_code_anchor_time", int(time.time()))
+        settings.setdefault("send_delivery_receipts", True)
+        settings.setdefault("send_read_receipts", True)
+        settings.setdefault("link_previews", False)
+        settings.setdefault("minimize_to_tray", True)
+        settings.setdefault("clearnet_enabled", False)
+        settings.setdefault("dns_mode", "none")
+        settings.setdefault("dns_host", "base.dns.mullvad.net")
+        settings.setdefault("dns_ipv4", "194.242.2.4")
+        settings.setdefault("dns_ipv6", "2a07:e340::4")
+        settings.setdefault("dns_port", 853)
 
     def save(self) -> None:
         if self._key is None:

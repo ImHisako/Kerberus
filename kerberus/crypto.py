@@ -269,16 +269,22 @@ def _message_key(classical: bytes, quantum: bytes, context: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA512(), length=32, salt=hashlib.sha256(context).digest(), info=b"kerberus-v1-hybrid-message").derive(classical + quantum)
 
 
-def seal_message(sender: IdentityBundle, secrets: IdentitySecrets, recipient: IdentityBundle, plaintext: str) -> dict[str, Any]:
+def seal_payload(
+    sender: IdentityBundle,
+    secrets: IdentitySecrets,
+    recipient: IdentityBundle,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
     if not pq_available():
         raise RuntimeError(f"ML-KEM-768 non disponibile: {pq_unavailable_reason()}")
     sent_at = int(time.time())
-    unpadded = canonical({"text": plaintext, "sent_at": sent_at, "padding": ""})
+    clear_fields = {**payload, "sent_at": sent_at}
+    unpadded = canonical({**clear_fields, "padding": ""})
     bucket = next((size for size in (512, 2048, 8192, 32768) if len(unpadded) <= size), None)
     if bucket is None:
         raise ValueError("Messaggio troppo lungo")
     padding = b64(os.urandom(max(0, (bucket - len(unpadded)) * 3 // 4)))
-    clear_payload = canonical({"text": plaintext, "sent_at": sent_at, "padding": padding})
+    clear_payload = canonical({**clear_fields, "padding": padding})
     ephemeral = X25519PrivateKey.generate()
     ephemeral_public = ephemeral.public_key().public_bytes_raw()
     classical = ephemeral.exchange(X25519PublicKey.from_public_bytes(unb64(recipient.exchange_public)))
@@ -300,6 +306,10 @@ def seal_message(sender: IdentityBundle, secrets: IdentitySecrets, recipient: Id
     signer = Ed25519PrivateKey.from_private_bytes(unb64(secrets.signing_private))
     envelope["signature"] = b64(signer.sign(canonical(envelope)))
     return envelope
+
+
+def seal_message(sender: IdentityBundle, secrets: IdentitySecrets, recipient: IdentityBundle, plaintext: str) -> dict[str, Any]:
+    return seal_payload(sender, secrets, recipient, {"kind": "message", "text": plaintext})
 
 
 def open_message_payload(
@@ -326,7 +336,13 @@ def open_message_payload(
     sent_at = payload.get("sent_at")
     if not isinstance(sent_at, int) or sent_at < 0:
         raise ValueError("Timestamp mittente non valido")
-    return {"text": str(payload["text"]), "sent_at": sent_at}
+    kind = str(payload.get("kind", "message"))
+    result = {key: value for key, value in payload.items() if key != "padding"}
+    result["kind"] = kind
+    result["sent_at"] = sent_at
+    if kind == "message":
+        result["text"] = str(payload["text"])
+    return result
 
 
 def open_message(recipient: IdentityBundle, secrets: IdentitySecrets, sender: IdentityBundle, envelope: dict[str, Any]) -> str:

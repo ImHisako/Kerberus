@@ -88,7 +88,7 @@ class NativeSamTransport:
         self._reader.start()
         self._frame_worker.start()
 
-    def request(self, operation: str, destination: str, payload: bytes | None = None, timeout: float = 20) -> None:
+    def request(self, operation: str, destination: str, payload: bytes | None = None, timeout: float = 6) -> None:
         request_id = uuid.uuid4().hex
         event = threading.Event()
         result: dict = {}
@@ -267,7 +267,8 @@ class SamClient:
             return False
 
     def _connect(self) -> socket.socket:
-        sock = socket.create_connection((self.host, self.port), timeout=15)
+        sock = socket.create_connection((self.host, self.port), timeout=4)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             _check(_command(sock, "HELLO VERSION MIN=3.1 MAX=3.3"))
             return sock
@@ -287,10 +288,11 @@ class SamClient:
             sock.settimeout(300)
             try:
                 private_destination = self.keys_path.read_text("ascii").strip() if self.keys_path.exists() else "TRANSIENT"
+                signature_option = " SIGNATURE_TYPE=7" if private_destination == "TRANSIENT" else ""
                 reply = _command(
                     sock,
                     f"SESSION CREATE STYLE=STREAM ID={self.session_id} "
-                    f"DESTINATION={private_destination} SIGNATURE_TYPE=7 "
+                    f"DESTINATION={private_destination}{signature_option} "
                     "i2cp.leaseSetEncType=6,4 inbound.quantity=3 outbound.quantity=3 "
                     "inbound.backupQuantity=1 outbound.backupQuantity=1 "
                     "i2cp.reduceOnIdle=false i2cp.closeOnIdle=false i2cp.fastReceive=true "

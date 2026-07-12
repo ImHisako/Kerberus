@@ -12,11 +12,15 @@ Kerberus è un messenger desktop sperimentale che comunica attraverso I2P usando
 - Identità self-sovereign firmate con Ed25519.
 - Cifratura messaggi ibrida X25519 + ML-KEM-768.
 - Payload protetti con XChaCha20-Poly1305.
+- Double Ratchet v2 persistente con ratchet DH X25519, cancellazione delle chiavi usate e supporto limitato ai messaggi fuori ordine.
 - Codici contatto con rotazione configurabile (1, 5, 15 o 60 minuti) e opzione monouso.
 - Impostazioni integrate e console UI locale con log delle azioni privo di contenuti dei messaggi.
 - Username e foto profilo firmati.
 - Cronologia e outbox salvate nel vault cifrato.
 - ACK firmati, anti-replay e retry automatici.
+- Ricevute di consegna e lettura cifrate end-to-end, disattivabili globalmente o per chat.
+- Spunte di stato, reazioni cifrate, selettore emoji, impostazioni per chat e tray desktop.
+- Anteprime link locali senza richieste remote e policy clearnet/DNS disattivata per impostazione predefinita.
 - Stream I2P persistenti e riutilizzati tra contatti per ridurre la latenza.
 - Helper nativo Go incluso nelle release per multiplexare invio, ricezione e ACK sugli stream SAM senza richiedere Go sul PC dell'utente.
 - Apertura stream 0-RTT: il primo frame può viaggiare nel SYN I2P Streaming.
@@ -41,7 +45,7 @@ MessengerService
 
 Kerberus mantiene una destination I2P persistente per profilo. Il codice contatto contiene l'indirizzo `.b32.i2p` derivato dalla destination, più un token temporaneo verificabile soltanto dal proprietario. Quando la richiesta viene accettata, i due client si scambiano i profili pubblici firmati e creano la conversazione.
 
-Ogni messaggio viene cifrato per il destinatario e salvato localmente prima dell'invio. Se il peer o la sua LeaseSet non sono raggiungibili, il messaggio resta nella outbox cifrata e viene ritentato con backoff. Un ACK Ed25519 valido lo marca come consegnato.
+Ogni messaggio viene cifrato per il destinatario e salvato localmente prima dell'invio. Se il peer o la sua LeaseSet non sono raggiungibili, il messaggio resta nella outbox cifrata e viene ritentato con backoff breve. Una ricevuta cifrata e autenticata lo marca come consegnato.
 
 Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i contatti rimangono attivi. `SILENT=true` e un breve `connectDelay` permettono al primo frame di essere incluso nel SYN, evitando un round-trip applicativo. Kerberus usa tre tunnel in ingresso e uscita, un tunnel di backup e il profilo streaming interattivo. Non riduce la lunghezza dei tunnel per guadagnare velocità, perché cambierebbe il compromesso di anonimato. Queste impostazioni seguono le indicazioni delle documentazioni ufficiali [SAM v3](https://i2p.net/en/docs/api/samv3/), [I2CP](https://i2p.net/en/docs/specs/i2cp-overview/) e [Streaming](https://i2p.net/en/docs/api/streaming/).
 
@@ -116,15 +120,16 @@ py -3 -m venv .venv
 2. Il destinatario apre il proprio profilo e genera il codice contatto.
 3. Il mittente inserisce il codice tramite il pulsante per aggiungere un contatto.
 4. Il codice visualizzato cambia ogni minuto ed è monouso; le ritrasmissioni tecniche dello stesso mittente restano idempotenti.
-5. Dopo la conferma firmata, la chat appare su entrambi i client.
+5. La richiesta appare come **Richiesta in attesa**. La conferma firmata torna sullo stesso stream I2P full-duplex e, solo dopo la verifica, la chat diventa utilizzabile su entrambi i client.
 
 Mittente e destinatario devono essere online contemporaneamente per la consegna. L'attuale outbox è locale: non esiste ancora una mailbox I2P esterna sempre attiva.
 
 ## Stati dei messaggi
 
 - **In attesa**: salvato nel vault, ancora da inviare.
-- **Inviato**: scritto nello stream I2P, ACK non ancora ricevuto.
-- **Consegnato**: ACK firmato ricevuto dal destinatario.
+- **Inviato**: scritto nello stream I2P, ricevuta non ancora ricevuta.
+- **Consegnato**: ricevuta cifrata ricevuta dal destinatario.
+- **Letto**: ricevuta cifrata di lettura ricevuta; le doppie spunte diventano azzurre.
 
 Un errore `CANT_REACH_PEER` non distrugge la sessione SAM: viene riaperto soltanto lo stream del contatto e il messaggio resta in coda. Un errore `INVALID_ID` causa una sola ricostruzione coordinata della sessione se la sua generazione è ancora quella guasta.
 
@@ -210,9 +215,11 @@ Aggiorna entrambi i client alla stessa versione indicata nella finestra **Stato 
 ## Sicurezza e limiti
 
 - La destination privata SAM è persistente e salvata separatamente dal vault perché serve per creare la sessione prima del traffico applicativo.
-- Non è ancora presente un Double Ratchet completo, quindi il progetto non offre ancora le stesse proprietà di post-compromise recovery dei messenger maturi.
+- Il Double Ratchet cancella le chiavi consumate e rinnova le catene dopo i cambi DH. Il protocollo è nuovo, non interoperabile con la 0.3 per i nuovi messaggi e non è stato sottoposto a audit indipendente.
 - Non sono ancora implementati gruppi, multi-device, allegati o mailbox distribuite.
 - La protezione dei metadati dipende anche dal router I2P, dal sistema operativo e dal comportamento dell'utente.
+- Kerberus non raccoglie telemetria. Padding a bucket, identificatori casuali, chiavi effimere e ricevute cifrate riducono i metadati applicativi, ma non possono nascondere ogni correlazione temporale a un avversario globale.
+- Le anteprime link non contattano il sito: mostrano solo hostname e URL già presenti nel messaggio. Clearnet e DNS sono off di default; sono disponibili DNS di sistema, Mullvad DoH/DoT (`base.dns.mullvad.net`, `194.242.2.4`, porte 443/853) o un endpoint cifrato personalizzato.
 - Le release non sono ancora firmate con un certificato di code signing.
 
 ## Licenze

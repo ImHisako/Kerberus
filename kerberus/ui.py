@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -8,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from PyQt6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -44,6 +46,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -431,6 +434,33 @@ class ContactRow(QWidget):
         layout.addLayout(text, 1)
 
 
+class PendingContactRow(QWidget):
+    def __init__(self, pending: dict):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(11)
+        mark = QLabel("…")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(40, 40)
+        mark.setStyleSheet(
+            f"background: {COLORS['surface_2']}; color: {COLORS['warning']}; "
+            "border-radius: 20px; font-size: 18px; font-weight: 700;"
+        )
+        layout.addWidget(mark)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title = QLabel("Richiesta in attesa")
+        title.setStyleSheet("font-weight: 650;")
+        attempts = int(pending.get("attempts", 0))
+        meta = QLabel(f"Conferma non ancora ricevuta · tentativi {attempts}")
+        meta.setObjectName("contactMeta")
+        text.addWidget(title)
+        text.addWidget(meta)
+        layout.addLayout(text, 1)
+        self.setToolTip("La chat sarà disponibile dopo la conferma firmata dell’altro dispositivo")
+
+
 class MessageBubble(QWidget):
     def __init__(
         self,
@@ -441,9 +471,11 @@ class MessageBubble(QWidget):
         timing: dict | None = None,
         on_timing: Callable[[dict], None] | None = None,
         on_action: Callable[[str, dict], None] | None = None,
+        link_preview: bool = False,
     ):
         super().__init__()
-        self.message = timing or {"text": text}
+        self.message = timing or {"text": text, "status": status}
+        self.outgoing = outgoing
         self.on_action = on_action
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -464,23 +496,30 @@ class MessageBubble(QWidget):
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.setStyleSheet("border: 0; background: transparent;")
         content.addWidget(body)
-        status_labels = {
-            "pending": "In attesa",
-            "sent": "Inviato",
-            "delivered": "Consegnato",
-        }
-        time_text = datetime.fromtimestamp(timestamp).strftime("%H:%M")
-        if outgoing:
-            time_text += f"  ·  {status_labels.get(status, 'Salvato')}"
-        time_label = QLabel(time_text)
-        time_label.setObjectName("timestamp")
-        time_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        time_label.setStyleSheet("border: 0; background: transparent; font-size: 11px;")
+        if link_preview:
+            match = re.search(r"https?://[^\s<>]+", text)
+            if match:
+                url = match.group(0).rstrip(".,;:!?)")
+                parsed = urlsplit(url)
+                preview = QLabel(f"🔗  {parsed.hostname or 'Link'}\n{url}")
+                preview.setWordWrap(True)
+                preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                preview.setToolTip("Anteprima locale: Kerberus non ha contattato il sito")
+                preview.setStyleSheet(
+                    f"border: 1px solid {COLORS['border']}; border-radius: 6px; "
+                    f"background: {COLORS['surface']}; padding: 8px; color: {COLORS['muted']};"
+                )
+                content.addWidget(preview)
+        self._timestamp = timestamp
+        self.time_label = QLabel()
+        self.time_label.setObjectName("timestamp")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.time_label.setStyleSheet("border: 0; background: transparent; font-size: 11px;")
         metadata = QHBoxLayout()
         metadata.setContentsMargins(0, 0, 0, 0)
         metadata.setSpacing(4)
         metadata.addStretch()
-        metadata.addWidget(time_label)
+        metadata.addWidget(self.time_label)
         timing_button = QToolButton()
         timing_button.setObjectName("timingButton")
         timing_button.setIcon(lucide_icon("clock", COLORS["muted"], 13))
@@ -493,6 +532,10 @@ class MessageBubble(QWidget):
             timing_button.setEnabled(False)
         metadata.addWidget(timing_button)
         content.addLayout(metadata)
+        self.reactions_label = QLabel()
+        self.reactions_label.setStyleSheet("border: 0; background: transparent; font-size: 14px;")
+        content.addWidget(self.reactions_label, alignment=Qt.AlignmentFlag.AlignRight)
+        self.update_message(self.message)
         outer.addWidget(bubble)
         if not outgoing:
             outer.addStretch(1)
@@ -501,17 +544,41 @@ class MessageBubble(QWidget):
         if self.on_action is None:
             return
         menu = QMenu(self)
+        reaction_menu = menu.addMenu("Reagisci")
+        reaction_actions = {reaction_menu.addAction(emoji): emoji for emoji in ("👍", "❤️", "😂", "😮", "😢", "🔥")}
         copy_action = menu.addAction("Copia")
         forward_action = menu.addAction("Inoltra…")
         menu.addSeparator()
         delete_action = menu.addAction("Elimina da questo dispositivo")
         selected = menu.exec(self.mapToGlobal(position))
-        if selected is copy_action:
+        if selected in reaction_actions:
+            self.on_action("react:" + reaction_actions[selected], self.message)
+        elif selected is copy_action:
             self.on_action("copy", self.message)
         elif selected is forward_action:
             self.on_action("forward", self.message)
         elif selected is delete_action:
             self.on_action("delete", self.message)
+
+    def update_message(self, message: dict) -> None:
+        self.message = message
+        status = str(message.get("status", ""))
+        time_text = datetime.fromtimestamp(self._timestamp).strftime("%H:%M")
+        if self.outgoing:
+            marks = {
+                "pending": ("◷ In attesa", COLORS["muted"]),
+                "sent": ("✓ Inviato", COLORS["muted"]),
+                "delivered": ("✓✓ Consegnato", COLORS["muted"]),
+                "read": ("✓✓ Letto", COLORS["cyan"]),
+            }
+            mark, color = marks.get(status, ("✓", COLORS["muted"]))
+            time_text += f"  {mark}"
+            self.time_label.setStyleSheet(f"border: 0; background: transparent; font-size: 11px; color: {color};")
+        self.time_label.setText(time_text)
+        reactions = message.get("reactions", {})
+        values = list(reactions.values()) if isinstance(reactions, dict) else []
+        self.reactions_label.setText(" ".join(values))
+        self.reactions_label.setVisible(bool(values))
 
 
 class ClickableFrame(QFrame):
@@ -620,6 +687,10 @@ class KerberusWindow(QMainWindow):
         self._allow_close = False
         self._ui_events: list[str] = []
         self._open_dialogs: set[QDialog] = set()
+        self._message_bubbles: dict[str, MessageBubble] = {}
+        self._rendered_contact = ""
+        self._scroll_pin_generation = 0
+        self._tray: QSystemTrayIcon | None = None
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Kerberus")
@@ -661,9 +732,11 @@ class KerberusWindow(QMainWindow):
                 return False
             self.service.create_identity(name)
         self._build_ui()
+        self._setup_tray()
         self.refresh_contacts()
         QTimer.singleShot(150, self.connect_router)
-        QTimer.singleShot(5000, self.check_updates)
+        if self.service.settings().get("clearnet_enabled", False):
+            QTimer.singleShot(5000, self.check_updates)
         return True
 
     def _ask_name(self) -> tuple[str, bool]:
@@ -928,6 +1001,11 @@ class KerberusWindow(QMainWindow):
         name_box.addWidget(self.chat_security)
         topbar_layout.addLayout(name_box)
         topbar_layout.addStretch()
+        chat_settings = QToolButton()
+        chat_settings.setIcon(lucide_icon("settings-2"))
+        chat_settings.setToolTip("Privacy di questa chat")
+        chat_settings.clicked.connect(self.show_chat_settings)
+        topbar_layout.addWidget(chat_settings)
         chat_layout.addWidget(topbar)
 
         self.message_scroll = QScrollArea()
@@ -950,6 +1028,12 @@ class KerberusWindow(QMainWindow):
         self.composer.setFixedHeight(58)
         self.composer.send_requested.connect(self.send_message)
         composer_layout.addWidget(self.composer, 1)
+        emoji = QToolButton()
+        emoji.setText("☺")
+        emoji.setFixedSize(40, 40)
+        emoji.setToolTip("Emoji")
+        emoji.clicked.connect(lambda: self.show_emoji_menu(emoji))
+        composer_layout.addWidget(emoji, alignment=Qt.AlignmentFlag.AlignBottom)
         send = QToolButton()
         send.setObjectName("sendButton")
         send.setIcon(lucide_icon("send", "#07120e"))
@@ -980,6 +1064,15 @@ class KerberusWindow(QMainWindow):
             self.contacts_list.setItemWidget(item, ContactRow(contact, preview))
             if contact.identity_id == selected:
                 self.contacts_list.setCurrentItem(item)
+        for pending in self.service.pending_contacts():
+            if query and query not in "richiesta in attesa":
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, "")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setSizeHint(QSize(270, 62))
+            self.contacts_list.addItem(item)
+            self.contacts_list.setItemWidget(item, PendingContactRow(pending))
 
     def _select_contact_item(self, item: QListWidgetItem) -> None:
         self.select_contact(item.data(Qt.ItemDataRole.UserRole))
@@ -994,48 +1087,129 @@ class KerberusWindow(QMainWindow):
         set_avatar(self.chat_avatar, contact, 44)
         self.chat_name.setText(contact.name)
         self.content_stack.setCurrentIndex(1)
-        self.refresh_messages()
+        self.refresh_messages("select", contact_id)
+        self.service.mark_chat_read(contact_id)
         self.composer.setFocus()
 
     def refresh_messages(self, reason: str = "new", contact_id: str = "") -> None:
+        if reason == "new" and contact_id and self._tray is not None and not self.isActiveWindow():
+            contact_messages = self.service.messages_for(contact_id)
+            if (
+                contact_messages
+                and contact_messages[-1].get("direction") == "in"
+                and self.service.chat_settings(contact_id).get("notifications", True)
+            ):
+                self._tray.showMessage(
+                    "Nuovo messaggio cifrato",
+                    "Kerberus ha ricevuto un nuovo messaggio.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000,
+                )
         if not self.selected_contact or not hasattr(self, "message_layout"):
             return
         if contact_id and contact_id != self.selected_contact:
             self.refresh_contacts()
             return
+        messages = self.service.messages_for(self.selected_contact)
+        message_ids = [str(message.get("message_id", "")) for message in messages]
+        rendered_ids = list(self._message_bubbles)
+        if reason == "status" and self._message_bubbles and message_ids == rendered_ids:
+            for message in messages:
+                bubble = self._message_bubbles.get(str(message.get("message_id", "")))
+                if bubble is not None:
+                    bubble.update_message(message)
+            self.refresh_contacts()
+            return
         scrollbar = self.message_scroll.verticalScrollBar()
         distance_from_bottom = max(0, scrollbar.maximum() - scrollbar.value())
+        was_at_bottom = distance_from_bottom <= 24
+        can_append = (
+            self._rendered_contact == self.selected_contact
+            and len(message_ids) >= len(rendered_ids)
+            and message_ids[:len(rendered_ids)] == rendered_ids
+        )
+        if can_append:
+            added = messages[len(rendered_ids):]
+            for message in added:
+                self._append_message_bubble(message)
+            for message in messages[:len(rendered_ids)]:
+                bubble = self._message_bubbles.get(str(message.get("message_id", "")))
+                if bubble is not None:
+                    bubble.update_message(message)
+            self.refresh_contacts()
+            self.message_layout.invalidate()
+            if added and (was_at_bottom or any(message.get("direction") == "out" for message in added)):
+                self._pin_scroll_to_bottom()
+            return
+        changed_contact = self._rendered_contact != self.selected_contact
         while self.message_layout.count() > 1:
             item = self.message_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for message in self.service.messages_for(self.selected_contact):
-            self.message_layout.insertWidget(
-                self.message_layout.count() - 1,
-                MessageBubble(
-                    message["text"],
-                    int(message.get("sent_at", message["time"])),
-                    message["direction"] == "out",
-                    message.get("status", ""),
-                    timing=message,
-                    on_timing=self.show_message_timing,
-                    on_action=self.message_action,
-                ),
-            )
+        self._message_bubbles.clear()
+        for message in messages:
+            self._append_message_bubble(message)
+        self._rendered_contact = self.selected_contact
         self.refresh_contacts()
         self.message_layout.invalidate()
         self.message_container.adjustSize()
+        if changed_contact or reason in {"new", "select"}:
+            self._pin_scroll_to_bottom()
+        else:
+            QTimer.singleShot(
+                0,
+                lambda: scrollbar.setValue(
+                    max(scrollbar.minimum(), scrollbar.maximum() - distance_from_bottom)
+                ),
+            )
 
-        def restore_scroll() -> None:
-            if reason == "new":
-                scrollbar.setValue(scrollbar.maximum())
-            else:
-                scrollbar.setValue(max(scrollbar.minimum(), scrollbar.maximum() - distance_from_bottom))
+    def _append_message_bubble(self, message: dict) -> None:
+        bubble = MessageBubble(
+            message["text"],
+            int(message.get("sent_at", message["time"])),
+            message["direction"] == "out",
+            message.get("status", ""),
+            timing=message,
+            on_timing=self.show_message_timing,
+            on_action=self.message_action,
+            link_preview=self.service.effective_chat_setting(self.selected_contact, "link_previews"),
+        )
+        self.message_layout.insertWidget(self.message_layout.count() - 1, bubble)
+        self._message_bubbles[str(message.get("message_id", ""))] = bubble
 
-        QTimer.singleShot(0, restore_scroll)
-        QTimer.singleShot(60, restore_scroll)
+    def _pin_scroll_to_bottom(self) -> None:
+        scrollbar = self.message_scroll.verticalScrollBar()
+        self._scroll_pin_generation += 1
+        generation = self._scroll_pin_generation
+
+        def pin_bottom(_minimum: int = 0, maximum: int | None = None) -> None:
+            if generation == self._scroll_pin_generation:
+                try:
+                    scrollbar.setValue(scrollbar.maximum() if maximum is None else maximum)
+                except RuntimeError:
+                    pass
+
+        scrollbar.rangeChanged.connect(pin_bottom)
+        pin_bottom()
+
+        def release_pin() -> None:
+            try:
+                scrollbar.rangeChanged.disconnect(pin_bottom)
+            except (TypeError, RuntimeError):
+                pass
+            pin_bottom()
+
+        QTimer.singleShot(350, release_pin)
 
     def message_action(self, action: str, message: dict) -> None:
+        if action.startswith("react:"):
+            emoji = action.split(":", 1)[1]
+            self._run_task(
+                lambda: self.service.react_to_message(self.selected_contact, str(message.get("message_id", "")), emoji),
+                lambda _value: self.refresh_messages("status", self.selected_contact),
+                lambda error: self._error("Reazione", error),
+            )
+            return
         if action == "copy":
             QApplication.clipboard().setText(str(message.get("text", "")))
             self.statusBar().showMessage("Messaggio copiato", 2500)
@@ -1051,6 +1225,93 @@ class KerberusWindow(QMainWindow):
             return
         if action == "forward":
             self.forward_message(message)
+
+    def show_emoji_menu(self, anchor: QToolButton) -> None:
+        menu = QMenu(self)
+        for emoji in ("😀", "😂", "😊", "😍", "🥰", "😎", "😢", "😡", "👍", "👎", "❤️", "🔥", "🎉", "🙏", "🤝", "✅"):
+            action = menu.addAction(emoji)
+            action.triggered.connect(lambda _checked=False, value=emoji: self.composer.insertPlainText(value))
+        menu.exec(anchor.mapToGlobal(QPoint(0, -menu.sizeHint().height())))
+
+    def show_chat_settings(self) -> None:
+        if not self.selected_contact:
+            return
+        current = self.service.chat_settings(self.selected_contact)
+        global_settings = self.service.settings()
+        dialog = KerberusDialog("Privacy chat", self, 500)
+        layout = dialog.body_layout
+        title = QLabel("Impostazioni per questa conversazione")
+        title.setObjectName("dialogTitle")
+        detail = QLabel("Le opzioni in automatico ereditano la policy generale. Le ricevute sono cifrate end-to-end.")
+        detail.setObjectName("muted")
+        detail.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(detail)
+
+        def tri_state(label: str, key: str) -> QComboBox:
+            box = QComboBox()
+            box.addItem(f"Automatico ({'attivo' if global_settings.get(key) else 'disattivo'})", None)
+            box.addItem("Attivo", True)
+            box.addItem("Disattivo", False)
+            value = current.get(key)
+            box.setCurrentIndex(0 if value is None else (1 if value else 2))
+            layout.addWidget(QLabel(label))
+            layout.addWidget(box)
+            return box
+
+        delivery = tri_state("Conferme di consegna", "send_delivery_receipts")
+        reads = tri_state("Conferme di lettura (spunte blu)", "send_read_receipts")
+        previews = tri_state("Anteprime link locali", "link_previews")
+        notifications = QCheckBox("Notifiche desktop")
+        notifications.setChecked(current["notifications"])
+        layout.addWidget(notifications)
+        actions = QHBoxLayout()
+        cancel = QPushButton("Annulla")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(dialog.reject)
+        save = QPushButton("Salva")
+        save.setObjectName("primary")
+        save.clicked.connect(dialog.accept)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+        def persist() -> None:
+            self.service.update_chat_settings(
+                self.selected_contact,
+                send_delivery_receipts=delivery.currentData(),
+                send_read_receipts=reads.currentData(),
+                link_previews=previews.currentData(),
+                notifications=notifications.isChecked(),
+            )
+            self.statusBar().showMessage("Privacy della chat aggiornata", 4000)
+
+        dialog.accepted.connect(persist)
+        self._show_modeless(dialog)
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(lucide_icon("shield-check", COLORS["accent"], 32), self)
+        tray.setToolTip("Kerberus · I2P messenger")
+        menu = QMenu(self)
+        show_action = menu.addAction("Apri Kerberus")
+        show_action.triggered.connect(lambda: (self.showNormal(), self.raise_(), self.activateWindow()))
+        quit_action = menu.addAction("Esci")
+
+        def quit_app() -> None:
+            self._allow_close = True
+            self.close()
+
+        quit_action.triggered.connect(quit_app)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda reason: show_action.trigger()
+            if reason == QSystemTrayIcon.ActivationReason.Trigger else None
+        )
+        tray.show()
+        self._tray = tray
 
     def forward_message(self, message: dict) -> None:
         contacts = self.service.contacts()
@@ -1175,7 +1436,7 @@ class KerberusWindow(QMainWindow):
         )
 
     def _message_send_result(self, value: object) -> None:
-        self.refresh_messages("new", self.selected_contact)
+        self.refresh_messages("status", self.selected_contact)
         if value == "queued":
             self.statusBar().showMessage(
                 "Destinatario temporaneamente non raggiungibile: messaggio cifrato in coda con retry automatico",
@@ -1201,13 +1462,14 @@ class KerberusWindow(QMainWindow):
         self._show_modeless(dialog)
 
     def _contact_request_result(self, value: object) -> None:
-        message = "Richiesta inviata: attendo la conferma firmata"
+        self.refresh_contacts()
+        message = "Richiesta affidata a I2P: la chat si aprirà dopo la conferma firmata"
         if value == "queued":
             message = "Contatto non ancora raggiungibile: richiesta salvata e ritentata automaticamente"
         self.statusBar().showMessage(message, 8000)
 
     def _protocol_event(self, kind: str, detail: str) -> None:
-        self._log_action(f"Evento protocollo: {kind}")
+        self._log_action(f"Evento protocollo: {kind} · {detail}")
         if kind == "contact_reject_received":
             KerberusMessageDialog.show_message(self, "Richiesta contatto rifiutata", detail)
             return
@@ -1260,7 +1522,16 @@ class KerberusWindow(QMainWindow):
         self._log_action("Apertura Impostazioni")
         current = self.service.settings()
         dialog = KerberusDialog("Impostazioni", self, 590)
-        layout = dialog.body_layout
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(520)
+        scroll.setMaximumHeight(720)
+        settings_page = QWidget()
+        layout = QVBoxLayout(settings_page)
+        layout.setContentsMargins(4, 4, 10, 4)
+        layout.setSpacing(10)
+        scroll.setWidget(settings_page)
+        dialog.body_layout.addWidget(scroll)
         eyebrow = QLabel("PRIVACY E INVITI")
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Codice contatto")
@@ -1291,6 +1562,48 @@ class KerberusWindow(QMainWindow):
         layout.addWidget(single_use)
         layout.addWidget(hint)
         layout.addSpacing(10)
+        receipts_label = QLabel("RICEVUTE E RETE")
+        receipts_label.setObjectName("eyebrow")
+        delivery_receipts = QCheckBox("Invia conferme di consegna")
+        delivery_receipts.setChecked(current["send_delivery_receipts"])
+        read_receipts = QCheckBox("Invia conferme di lettura (spunte blu)")
+        read_receipts.setChecked(current["send_read_receipts"])
+        link_previews = QCheckBox("Anteprime link locali (nessuna richiesta automatica)")
+        link_previews.setChecked(current["link_previews"])
+        minimize_to_tray = QCheckBox("Chiudi nella tray invece di terminare")
+        minimize_to_tray.setChecked(current["minimize_to_tray"])
+        clearnet = QCheckBox("Consenti funzioni clearnet esplicite (es. aggiornamenti)")
+        clearnet.setChecked(current["clearnet_enabled"])
+        dns_mode = QComboBox()
+        for value, label in (("none", "Senza DNS / solo I2P"), ("mullvad", "Mullvad encrypted DNS"), ("custom", "DNS personalizzato"), ("system", "DNS di sistema")):
+            dns_mode.addItem(label, value)
+            if value == current["dns_mode"]:
+                dns_mode.setCurrentIndex(dns_mode.count() - 1)
+        dns_host = QLineEdit(str(current["dns_host"]))
+        dns_host.setPlaceholderText("Hostname DNS, es. base.dns.mullvad.net")
+        dns_ipv4 = QLineEdit(str(current["dns_ipv4"]))
+        dns_ipv4.setPlaceholderText("IPv4 bootstrap, es. 194.242.2.4")
+        dns_ipv6 = QLineEdit(str(current["dns_ipv6"]))
+        dns_ipv6.setPlaceholderText("IPv6 bootstrap, es. 2a07:e340::4")
+        dns_port = QLineEdit(str(current["dns_port"]))
+        dns_port.setPlaceholderText("443 per DoH oppure 853 per DoT")
+        layout.addWidget(receipts_label)
+        layout.addWidget(delivery_receipts)
+        layout.addWidget(read_receipts)
+        layout.addWidget(link_previews)
+        layout.addWidget(minimize_to_tray)
+        layout.addWidget(clearnet)
+        layout.addWidget(QLabel("Resolver per le sole funzioni clearnet"))
+        layout.addWidget(dns_mode)
+        layout.addWidget(dns_host)
+        layout.addWidget(dns_ipv4)
+        layout.addWidget(dns_ipv6)
+        layout.addWidget(dns_port)
+        dns_hint = QLabel("Gli indirizzi .b32.i2p passano sempre da SAM/I2P e non usano DNS. In modalità senza DNS gli aggiornamenti automatici restano disabilitati.")
+        dns_hint.setObjectName("muted")
+        dns_hint.setWordWrap(True)
+        layout.addWidget(dns_hint)
+        layout.addSpacing(10)
         diagnostics_label = QLabel("DIAGNOSTICA LOCALE")
         diagnostics_label.setObjectName("eyebrow")
         console_button = QPushButton("Apri Console UI")
@@ -1315,6 +1628,18 @@ class KerberusWindow(QMainWindow):
         layout.addLayout(actions)
         def save_settings() -> None:
             self.service.update_settings(int(interval.currentData()), single_use.isChecked())
+            self.service.update_privacy_settings(
+                send_delivery_receipts=delivery_receipts.isChecked(),
+                send_read_receipts=read_receipts.isChecked(),
+                link_previews=link_previews.isChecked(),
+                minimize_to_tray=minimize_to_tray.isChecked(),
+                clearnet_enabled=clearnet.isChecked(),
+                dns_mode=str(dns_mode.currentData()),
+                dns_host=dns_host.text().strip(),
+                dns_ipv4=dns_ipv4.text().strip(),
+                dns_ipv6=dns_ipv6.text().strip(),
+                dns_port=int(dns_port.text().strip()),
+            )
             self._log_action("Impostazioni privacy salvate")
             self.statusBar().showMessage("Impostazioni salvate · codice contatto aggiornato", 5000)
 
@@ -1322,6 +1647,14 @@ class KerberusWindow(QMainWindow):
         self._show_modeless(dialog)
 
     def check_updates(self, manual: bool = False) -> None:
+        network_settings = self.service.settings()
+        if not network_settings.get("clearnet_enabled", False):
+            if manual:
+                KerberusMessageDialog.show_message(
+                    self, "Clearnet disabilitata",
+                    "Abilita le funzioni clearnet nelle impostazioni e scegli un resolver DNS prima di controllare gli aggiornamenti.",
+                )
+            return
         self._log_action("Controllo aggiornamenti GitHub")
 
         def found(value: object) -> None:
@@ -1343,7 +1676,7 @@ class KerberusWindow(QMainWindow):
             if manual:
                 self._error("Aggiornamenti", error)
 
-        self._run_task(lambda: check_for_update(__version__), found, failed)
+        self._run_task(lambda: check_for_update(__version__, network_settings), found, failed)
 
     def _download_update(self, info: UpdateInfo) -> None:
         self.statusBar().showMessage(f"Download Kerberus {info.version}…", 10000)
@@ -1368,7 +1701,7 @@ class KerberusWindow(QMainWindow):
             self.close()
 
         self._run_task(
-            lambda: download_update(info, self.service.config.downloads_path / "updates"),
+            lambda: download_update(info, self.service.config.downloads_path / "updates", self.service.settings()),
             ready,
             lambda error: self._error("Aggiornamenti", error),
         )
@@ -1621,7 +1954,7 @@ class KerberusWindow(QMainWindow):
         self.router_text.setText("I2P: connesso" if connected else "I2P: non connesso")
         self.router_meta.setText("Tunnel pronto · SAM locale" if connected else "Nuovo tentativo tra 10 s")
         self.router_text.setToolTip(detail)
-        self._log_action("I2P connesso" if connected else "Connessione I2P non riuscita")
+        self._log_action("I2P connesso" if connected else f"Connessione I2P non riuscita · {detail}")
         if connected:
             self.statusBar().showMessage("Canale I2P pronto", 3500)
         else:
@@ -1800,6 +2133,11 @@ class KerberusWindow(QMainWindow):
         KerberusMessageDialog.show_message(self, title, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._allow_close and self._tray is not None and self.service.settings().get("minimize_to_tray", True):
+            self.hide()
+            self._tray.showMessage("Kerberus", "Kerberus continua a funzionare nella tray.", QSystemTrayIcon.MessageIcon.Information, 2500)
+            event.ignore()
+            return
         if not self._allow_close:
             if not KerberusMessageDialog.ask(
                 self,

@@ -169,6 +169,7 @@ func (b *bridge) stream(destination string) (*peerStream, error) {
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 	reader := bufio.NewReader(conn)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := writeLine(conn, "HELLO VERSION MIN=3.1 MAX=3.3"); err != nil {
 		conn.Close()
 		return nil, err
@@ -184,6 +185,7 @@ func (b *bridge) stream(destination string) (*peerStream, error) {
 		conn.Close()
 		return nil, err
 	}
+	_ = conn.SetDeadline(time.Time{})
 	stream := &peerStream{destination: destination, token: b.token("out"), conn: conn}
 	b.streamsMu.Lock()
 	if current := b.outbound[destination]; current != nil {
@@ -306,6 +308,7 @@ func (b *bridge) acceptOne() error {
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 	reader := bufio.NewReader(conn)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := writeLine(conn, "HELLO VERSION MIN=3.1 MAX=3.3"); err != nil {
 		conn.Close()
 		return err
@@ -322,6 +325,7 @@ func (b *bridge) acceptOne() error {
 		conn.Close()
 		return fmt.Errorf("accept SAM fallito: %s", strings.TrimSpace(line))
 	}
+	_ = conn.SetDeadline(time.Time{})
 	remote, err := reader.ReadString('\n')
 	if err != nil {
 		conn.Close()

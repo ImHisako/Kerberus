@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import copy
 import threading
 import time
 from collections.abc import Callable
@@ -16,17 +17,19 @@ from .crypto import (
     open_message_payload,
     profile_destination,
     rotating_contact_code,
-    seal_message,
-    sign_control,
+    seal_payload,
     update_destination,
     update_public_profile,
     verify_control,
 )
 from .sam import SamClient
+from .ratchet import decrypt as ratchet_decrypt, encrypt as ratchet_encrypt
 from .vault import Vault
 
 
 class MessengerService:
+    _MESSAGE_RETRY_SECONDS = (2, 3, 5, 8, 12, 20)
+    _CONTROL_RETRY_SECONDS = (2, 3, 5, 8, 12)
     def __init__(self, config: AppConfig):
         self.config = config
         self.vault = Vault(config.vault_path)
@@ -182,6 +185,16 @@ class MessengerService:
         settings.setdefault("contact_code_single_use", True)
         settings.setdefault("contact_code_generation", 0)
         settings.setdefault("contact_code_anchor_time", int(time.time()))
+        settings.setdefault("send_delivery_receipts", True)
+        settings.setdefault("send_read_receipts", True)
+        settings.setdefault("link_previews", False)
+        settings.setdefault("minimize_to_tray", True)
+        settings.setdefault("clearnet_enabled", False)
+        settings.setdefault("dns_mode", "none")
+        settings.setdefault("dns_host", "base.dns.mullvad.net")
+        settings.setdefault("dns_ipv4", "194.242.2.4")
+        settings.setdefault("dns_ipv6", "2a07:e340::4")
+        settings.setdefault("dns_port", 853)
         return dict(settings)
 
     def update_settings(self, period_minutes: int, single_use: bool) -> dict:
@@ -199,6 +212,58 @@ class MessengerService:
             self.vault.save()
         self._emit_protocol_event("settings_updated", "Impostazioni privacy aggiornate")
         return dict(settings)
+
+    def update_privacy_settings(self, **values: object) -> dict:
+        allowed = {
+            "send_delivery_receipts", "send_read_receipts", "link_previews",
+            "minimize_to_tray", "clearnet_enabled", "dns_mode", "dns_host",
+            "dns_ipv4", "dns_ipv6", "dns_port",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Impostazioni non supportate: {', '.join(sorted(unknown))}")
+        mode = str(values.get("dns_mode", self.settings()["dns_mode"]))
+        if mode not in {"none", "system", "mullvad", "custom"}:
+            raise ValueError("Modalità DNS non valida")
+        port = int(values.get("dns_port", self.settings()["dns_port"]))
+        if not 1 <= port <= 65535:
+            raise ValueError("Porta DNS non valida")
+        with self._state_lock:
+            settings = self.vault.state.setdefault("settings", {})
+            settings.update(values)
+            settings["dns_mode"] = mode
+            settings["dns_port"] = port
+            self.vault.save()
+        self._emit_protocol_event("privacy_settings_updated", "Policy rete e ricevute aggiornata")
+        return self.settings()
+
+    def chat_settings(self, contact_id: str) -> dict:
+        stored = self.vault.state.setdefault("chat_settings", {}).setdefault(contact_id, {})
+        return {
+            "send_delivery_receipts": stored.get("send_delivery_receipts"),
+            "send_read_receipts": stored.get("send_read_receipts"),
+            "link_previews": stored.get("link_previews"),
+            "notifications": bool(stored.get("notifications", True)),
+        }
+
+    def update_chat_settings(self, contact_id: str, **values: object) -> dict:
+        if contact_id not in self.vault.state.get("contacts", {}):
+            raise ValueError("Contatto non trovato")
+        allowed = {"send_delivery_receipts", "send_read_receipts", "link_previews", "notifications"}
+        if set(values) - allowed:
+            raise ValueError("Impostazione chat non supportata")
+        with self._state_lock:
+            stored = self.vault.state.setdefault("chat_settings", {}).setdefault(contact_id, {})
+            stored.update(values)
+            self.vault.save()
+        return self.chat_settings(contact_id)
+
+    def _privacy_enabled(self, contact_id: str, name: str) -> bool:
+        override = self.chat_settings(contact_id).get(name)
+        return bool(self.settings().get(name, False) if override is None else override)
+
+    def effective_chat_setting(self, contact_id: str, name: str) -> bool:
+        return self._privacy_enabled(contact_id, name)
 
     def update_profile(self, name: str, avatar_data: str) -> IdentityBundle:
         identity = self.identity()
@@ -234,6 +299,7 @@ class MessengerService:
         payload = json.dumps(request, separators=(",", ":"))
         with self._state_lock:
             self.vault.state["pending"][destination] = {
+                "target_code": normalized,
                 "first_message": first_message.strip(),
                 "payload": payload,
                 "created_at": int(time.time()),
@@ -243,6 +309,20 @@ class MessengerService:
             self.vault.save()
         sent = self._attempt_pending_contact(destination, force=True)
         return "sent" if sent else "queued"
+
+    def pending_contacts(self) -> list[dict]:
+        with self._state_lock:
+            return [
+                {
+                    "destination": destination,
+                    "target_code": str(entry.get("target_code", "")),
+                    "created_at": int(entry.get("created_at", 0)),
+                    "last_attempt": int(entry.get("last_attempt", 0)),
+                    "attempts": int(entry.get("attempts", 0)),
+                }
+                for destination, entry in self.vault.state.get("pending", {}).items()
+                if entry.get("payload")
+            ]
 
     def messages_for(self, contact_id: str) -> list[dict]:
         return [m for m in self.vault.state["messages"] if m["contact_id"] == contact_id]
@@ -278,7 +358,8 @@ class MessengerService:
         if not identity:
             raise RuntimeError("Identità non configurata")
         contact = IdentityBundle.from_dict(self.vault.state["contacts"][contact_id])
-        envelope = seal_message(identity, self.secrets(), contact, text)
+        with self._state_lock:
+            envelope = self._seal_ratchet(contact, {"kind": "message", "text": text})
         message_id = envelope["message_id"]
         payload = json.dumps(envelope, separators=(",", ":"))
         now = int(time.time())
@@ -293,6 +374,8 @@ class MessengerService:
                 "received_at": None,
                 "delivered_at": None,
                 "recipient_received_at": None,
+                "read_at": None,
+                "reactions": {},
                 "status": "pending",
             })
             self.vault.state["outbox"].append({
@@ -311,12 +394,76 @@ class MessengerService:
         sent = self._attempt_outbox(message_id, force=True)
         return "sent" if sent else "queued"
 
+    def react_to_message(self, contact_id: str, message_id: str, emoji: str) -> None:
+        if not emoji or len(emoji) > 16:
+            raise ValueError("Reazione non valida")
+        contact = IdentityBundle.from_dict(self.vault.state["contacts"][contact_id])
+        target = next((m for m in self.vault.state["messages"] if m.get("message_id") == message_id), None)
+        if not target or target.get("contact_id") != contact_id:
+            raise ValueError("Messaggio non trovato")
+        identity = self.identity()
+        if not identity:
+            raise RuntimeError("Identità non configurata")
+        with self._state_lock:
+            reactions = target.setdefault("reactions", {})
+            reactions[identity.identity_id] = emoji
+            self.vault.save()
+        with self._state_lock:
+            envelope = self._seal_ratchet(contact, {
+                "kind": "reaction", "target_id": message_id, "emoji": emoji,
+            })
+            self.vault.save()
+        self._queue_control(contact.destination, envelope, background=True)
+        if self.on_message:
+            self.on_message("status", contact_id)
+
+    def mark_chat_read(self, contact_id: str) -> int:
+        identity = self.identity()
+        contact_data = self.vault.state.get("contacts", {}).get(contact_id)
+        if not identity or not contact_data:
+            return 0
+        unread: list[str] = []
+        with self._state_lock:
+            for message in self.vault.state.get("messages", []):
+                if message.get("contact_id") == contact_id and message.get("direction") == "in" and not message.get("read_at"):
+                    message["read_at"] = int(time.time())
+                    unread.append(str(message.get("message_id", "")))
+            if unread:
+                self.vault.save()
+        if unread and self._privacy_enabled(contact_id, "send_read_receipts"):
+            contact = IdentityBundle.from_dict(contact_data)
+            with self._state_lock:
+                envelope = self._seal_ratchet(contact, {
+                    "kind": "read", "message_ids": unread[-100:],
+                })
+                self.vault.save()
+            self._queue_control(contact.destination, envelope, background=True)
+        return len(unread)
+
+    def _seal_ratchet(self, contact: IdentityBundle, payload: dict) -> dict:
+        identity = self.identity()
+        if not identity:
+            raise RuntimeError("Identità non configurata")
+        states = self.vault.state.setdefault("ratchets", {})
+        working = copy.deepcopy(states)
+        inner = ratchet_encrypt(working, identity, self.secrets(), contact, payload)
+        envelope = seal_payload(identity, self.secrets(), contact, {"kind": "ratchet", **inner})
+        states[contact.identity_id] = working[contact.identity_id]
+        return envelope
+
     def _receive(self, payload: bytes, inline_reply: bool = False) -> bytes | None:
         envelope = json.loads(payload.decode("utf-8"))
         message_type = envelope.get("type")
         if message_type == "contact_request":
             try:
-                self._receive_contact_request(envelope)
+                destination, response = self._receive_contact_request(envelope)
+                if inline_reply:
+                    self._emit_protocol_event(
+                        "contact_accept_inline", "Conferma contatto restituita sullo stesso stream I2P"
+                    )
+                    return json.dumps(response, separators=(",", ":")).encode("utf-8")
+                self._queue_control(destination, response, background=False)
+                self._emit_protocol_event("contact_accept_queued", "Conferma contatto inserita nella coda I2P")
             except Exception as exc:
                 self._emit_protocol_event("contact_request_rejected", str(exc))
                 self._send_contact_reject(envelope, str(exc))
@@ -352,12 +499,41 @@ class MessengerService:
                 {},
             )
             received_at = int(stored.get("received_at") or time.time())
-            if inline_reply:
-                return self._message_ack_payload(sender, message_id, received_at)
-            self._send_message_ack(sender, message_id, received_at)
+            if self._privacy_enabled(sender_id, "send_delivery_receipts"):
+                if inline_reply:
+                    return self._message_ack_payload(sender, message_id, received_at)
+                self._send_message_ack(sender, message_id, received_at)
             return None
         clear = open_message_payload(identity, self.secrets(), sender, envelope)
         received_at = int(time.time())
+        kind = clear.get("kind", "message")
+        if kind == "ratchet":
+            with self._state_lock:
+                clear = ratchet_decrypt(
+                    self.vault.state.setdefault("ratchets", {}), identity, self.secrets(), sender, clear
+                )
+                self.vault.save()
+            kind = clear.get("kind", "")
+        if kind == "delivery":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+            self._receive_encrypted_delivery(sender_id, clear)
+            return None
+        if kind == "read":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+            self._receive_read_receipt(sender_id, clear)
+            return None
+        if kind == "reaction":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+            self._receive_reaction(sender_id, clear)
+            return None
+        if kind != "message":
+            return None
         with self._state_lock:
             self.vault.state["seen"].append(message_id)
             self.vault.state["seen"] = self.vault.state["seen"][-10000:]
@@ -373,10 +549,60 @@ class MessengerService:
         self._emit_protocol_event("message_received", f"Messaggio cifrato ricevuto da {sender.name}")
         if self.on_message:
             self.on_message("new", sender_id)
-        if inline_reply:
-            return self._message_ack_payload(sender, message_id, received_at)
-        self._send_message_ack(sender, message_id, received_at)
+        if self._privacy_enabled(sender_id, "send_delivery_receipts"):
+            if inline_reply:
+                return self._message_ack_payload(sender, message_id, received_at)
+            self._send_message_ack(sender, message_id, received_at)
         return None
+
+    def _receive_encrypted_delivery(self, sender_id: str, clear: dict) -> None:
+        message_id = clear.get("target_id", "")
+        if not isinstance(message_id, str):
+            return
+        self._mark_outgoing_status(sender_id, [message_id], "delivered", clear.get("received_at"))
+
+    def _receive_read_receipt(self, sender_id: str, clear: dict) -> None:
+        ids = clear.get("message_ids", [])
+        if isinstance(ids, list):
+            self._mark_outgoing_status(sender_id, [str(value) for value in ids[:100]], "read")
+
+    def _receive_reaction(self, sender_id: str, clear: dict) -> None:
+        target_id, emoji = clear.get("target_id", ""), str(clear.get("emoji", ""))
+        if not target_id or not emoji or len(emoji) > 16:
+            return
+        with self._state_lock:
+            for message in self.vault.state.get("messages", []):
+                if message.get("message_id") == target_id and message.get("contact_id") == sender_id:
+                    message.setdefault("reactions", {})[sender_id] = emoji
+                    self.vault.save()
+                    break
+        if self.on_message:
+            self.on_message("status", sender_id)
+
+    def _mark_outgoing_status(self, contact_id: str, message_ids: list[str], status: str, received_at: object = None) -> None:
+        changed = False
+        now = int(time.time())
+        with self._state_lock:
+            if status in {"delivered", "read"}:
+                pending = set(message_ids)
+                self.vault.state["outbox"] = [item for item in self.vault.state["outbox"] if item.get("message_id") not in pending]
+            for message in self.vault.state.get("messages", []):
+                if message.get("message_id") in message_ids and message.get("direction") == "out" and message.get("contact_id") == contact_id:
+                    current_status = str(message.get("status", "pending"))
+                    rank = {"pending": 0, "sent": 1, "delivered": 2, "read": 3}
+                    message["status"] = status if rank.get(status, 0) >= rank.get(current_status, 0) else current_status
+                    if status == "delivered":
+                        message["delivered_at"] = now
+                        if isinstance(received_at, int):
+                            message["recipient_received_at"] = received_at
+                    elif status == "read":
+                        message["delivered_at"] = message.get("delivered_at") or now
+                        message["read_at"] = now
+                    changed = True
+            if changed:
+                self.vault.save()
+        if changed and self.on_message:
+            self.on_message("status", contact_id)
 
     def _validated_contact(self, value: dict) -> IdentityBundle:
         contact = IdentityBundle.from_dict(value)
@@ -393,7 +619,7 @@ class MessengerService:
             self.on_contacts_changed(contact.identity_id)
         self.warm_contact(contact.identity_id)
 
-    def _receive_contact_request(self, envelope: dict) -> None:
+    def _receive_contact_request(self, envelope: dict) -> tuple[str, dict]:
         sender = self._validated_contact(envelope["sender"])
         duplicate = self._consume_contact_code(envelope.get("target_code", ""), sender.identity_id)
         self._save_contact(sender)
@@ -401,10 +627,9 @@ class MessengerService:
         self._emit_protocol_event("contact_request_received", f"{event} ricevuta da {sender.name}")
         identity = self.identity()
         if not identity:
-            return
+            raise RuntimeError("Identità locale non configurata")
         response = {"version": 1, "type": "contact_accept", "sender": identity.to_dict()}
-        self._queue_control(sender.destination, response)
-        self._emit_protocol_event("contact_accept_queued", "Conferma firmata inserita nella coda I2P")
+        return sender.destination, response
 
     def _receive_contact_accept(self, envelope: dict) -> None:
         sender = self._validated_contact(envelope["sender"])
@@ -467,19 +692,14 @@ class MessengerService:
         identity = self.identity()
         if not identity:
             return None
-        ack = {
-            "version": 1,
-            "type": "message_ack",
-            "message_id": message_id,
-            "sender_id": identity.identity_id,
-            "recipient_id": sender.identity_id,
-        }
-        timing = {**ack, "received_at": received_at}
-        return {
-            **timing,
-            "signature": sign_control(self.secrets(), ack),
-            "timing_signature": sign_control(self.secrets(), timing),
-        }
+        # Delivery receipts are encrypted like messages. A passive relay can no
+        # longer correlate a clear message id with its acknowledgement.
+        with self._state_lock:
+            envelope = self._seal_ratchet(sender, {
+                "kind": "delivery", "target_id": message_id, "received_at": received_at,
+            })
+            self.vault.save()
+        return envelope
 
     def _message_ack_payload(self, sender: IdentityBundle, message_id: str, received_at: int) -> bytes | None:
         envelope = self._message_ack(sender, message_id, received_at)
@@ -533,7 +753,7 @@ class MessengerService:
             self.flush_control_outbox(background=True)
             self.flush_pending_contacts(background=True)
             self.flush_outbox(background=True)
-            self._stop_delivery.wait(2)
+            self._stop_delivery.wait(1)
 
     def flush_pending_contacts(self, background: bool = False) -> None:
         with self._state_lock:
@@ -573,7 +793,10 @@ class MessengerService:
         except Exception as exc:
             self._emit_protocol_event("contact_request_retry", f"Destinatario non raggiungibile; nuovo tentativo automatico: {exc}")
             return False
-        self._emit_protocol_event("contact_request_sent", "Stream aperto; attendo la conferma firmata")
+        self._emit_protocol_event(
+            "contact_request_dispatched",
+            "Frame affidato a SAM; attendo la conferma firmata del destinatario",
+        )
         return True
 
     def _queue_control(self, destination: str, envelope: dict, background: bool = False) -> None:
@@ -620,7 +843,7 @@ class MessengerService:
             if not entry:
                 return True
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
-            retry_after = min(60, 5 * (2 ** min(prior_attempts, 4)))
+            retry_after = self._CONTROL_RETRY_SECONDS[min(prior_attempts, len(self._CONTROL_RETRY_SECONDS) - 1)]
             if not force and now - entry.get("last_attempt", 0) < retry_after:
                 return False
             entry["last_attempt"] = now
@@ -681,7 +904,7 @@ class MessengerService:
             if not entry:
                 return True
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
-            retry_after = min(60, 5 * (2 ** min(prior_attempts, 4)))
+            retry_after = self._MESSAGE_RETRY_SECONDS[min(prior_attempts, len(self._MESSAGE_RETRY_SECONDS) - 1)]
             if not force and now - entry.get("last_attempt", 0) < retry_after:
                 return False
             entry["last_attempt"] = now
@@ -689,11 +912,17 @@ class MessengerService:
             destination = entry["destination"]
             payload = entry["payload"].encode("utf-8")
             self.vault.save()
+        started = time.monotonic()
         try:
             self.sam.send(destination, payload)
         except Exception as exc:
-            self._emit_protocol_event("message_retry", f"Messaggio in coda; retry I2P automatico: {exc}")
+            elapsed = time.monotonic() - started
+            self._emit_protocol_event(
+                "message_retry",
+                f"Invio I2P fallito dopo {elapsed:.2f}s ({type(exc).__name__}): {exc}",
+            )
             return False
+        elapsed = time.monotonic() - started
         with self._state_lock:
             still_pending = any(item["message_id"] == message_id for item in self.vault.state["outbox"])
             if still_pending:
@@ -703,7 +932,9 @@ class MessengerService:
                         break
                 self.vault.save()
         if still_pending:
-            self._emit_protocol_event("message_stream_sent", "Messaggio inviato; attendo conferma dal destinatario")
+            self._emit_protocol_event(
+                "message_stream_sent", f"Frame scritto sullo stream in {elapsed:.2f}s; attendo conferma cifrata"
+            )
         else:
             self._emit_protocol_event("message_delivered", "Messaggio consegnato e confermato")
         if self.on_message:
@@ -772,6 +1003,8 @@ class MessengerService:
                 "received_at": received_at,
                 "delivered_at": None,
                 "recipient_received_at": None,
+                "read_at": None,
+                "reactions": {},
                 "status": status,
             })
             self.vault.save()

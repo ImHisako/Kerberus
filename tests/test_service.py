@@ -77,10 +77,11 @@ class ServiceTests(unittest.TestCase):
             alice_service.send_message(bob.identity_id, "Timing alterato")
             tampered_reply = bob_service._receive(captured[1], inline_reply=True)
             tampered = json.loads(tampered_reply)
-            tampered["received_at"] += 10_000
-            alice_service._receive(json.dumps(tampered).encode("utf-8"))
+            tampered["ciphertext"] = tampered["ciphertext"][:-2] + "AA"
+            with self.assertRaises(Exception):
+                alice_service._receive(json.dumps(tampered).encode("utf-8"))
             second = alice_service.messages_for(bob.identity_id)[1]
-            self.assertEqual(second["status"], "delivered")
+            self.assertNotEqual(second["status"], "delivered")
             self.assertIsNone(second["recipient_received_at"])
             alice_service.close(wait=True)
             bob_service.close(wait=True)
@@ -305,6 +306,33 @@ class ServiceTests(unittest.TestCase):
             alice_service.close(wait=True)
             bob_service.close(wait=True)
 
+    def test_contact_accept_returns_on_same_full_duplex_stream(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            captured = []
+
+            class Capture:
+                def send(self, _destination, payload):
+                    captured.append(payload)
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Capture()
+            bob_service.sam = Capture()
+            alice_service.request_contact(bob_service.contact_code())
+            response = bob_service._receive(captured[0], inline_reply=True)
+            self.assertIsNotNone(response)
+            self.assertEqual(json.loads(response)["type"], "contact_accept")
+            self.assertEqual(bob_service.vault.state["control_outbox"], [])
+            alice_service._receive(response)
+            self.assertEqual(len(alice_service.contacts()), 1)
+            self.assertEqual(alice_service.vault.state["pending"], {})
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
     def test_recent_previous_minute_contact_code_is_accepted(self):
         with tempfile.TemporaryDirectory() as folder:
             service = self._service(Path(folder) / "bob", "Bob")
@@ -338,6 +366,66 @@ class ServiceTests(unittest.TestCase):
             self.assertNotEqual(first, second)
             self.assertEqual(service.settings()["contact_code_period_minutes"], 5)
             service.close(wait=True)
+
+    def test_encrypted_read_receipt_and_reaction_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            routes = {alice.destination: alice_service, bob.destination: bob_service}
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    routes[destination]._receive(payload)
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            bob_service.sam = Endpoint()
+            alice_service.send_message(bob.identity_id, "Ricevuta cifrata")
+            self.assertTrue(self._wait_for(lambda: bool(bob_service.messages_for(alice.identity_id))))
+            incoming = bob_service.messages_for(alice.identity_id)[0]
+            bob_service.react_to_message(alice.identity_id, incoming["message_id"], "👍")
+            bob_service.mark_chat_read(alice.identity_id)
+            self.assertTrue(self._wait_for(lambda: alice_service.messages_for(bob.identity_id)[0]["status"] == "read"))
+            outgoing = alice_service.messages_for(bob.identity_id)[0]
+            self.assertEqual(outgoing["reactions"][bob.identity_id], "👍")
+            self.assertEqual(alice_service.vault.state["outbox"], [])
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_read_receipts_can_be_disabled_per_chat(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            captured = []
+
+            class Endpoint:
+                def send(self, _destination, payload):
+                    captured.append(payload)
+
+                def stop(self):
+                    pass
+
+            bob_service.sam = Endpoint()
+            bob_service._store_message(alice.identity_id, "in", "Privato", message_id="a" * 32)
+            bob_service.update_chat_settings(alice.identity_id, send_read_receipts=False)
+            self.assertEqual(bob_service.mark_chat_read(alice.identity_id), 1)
+            self.assertEqual(captured, [])
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
 
     @staticmethod
     def _service(root: Path, name: str) -> MessengerService:
