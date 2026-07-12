@@ -20,7 +20,7 @@ Kerberus è un messenger desktop sperimentale che comunica attraverso I2P usando
 - ACK firmati, anti-replay e retry automatici.
 - Ricevute di consegna e lettura cifrate end-to-end, disattivabili globalmente o per chat.
 - Spunte di stato, reazioni cifrate, selettore emoji, impostazioni per chat e tray desktop.
-- Anteprime link locali senza richieste remote e policy clearnet/DNS disattivata per impostazione predefinita.
+- Anteprime link locali senza richieste remote e funzioni clearnet disattivate per impostazione predefinita.
 - Stream I2P persistenti e riutilizzati tra contatti per ridurre la latenza.
 - Helper nativo Go incluso nelle release per multiplexare invio, ricezione e ACK sugli stream SAM senza richiedere Go sul PC dell'utente.
 - Apertura stream 0-RTT: il primo frame può viaggiare nel SYN I2P Streaming.
@@ -219,7 +219,7 @@ Aggiorna entrambi i client alla stessa versione indicata nella finestra **Stato 
 - Non sono ancora implementati gruppi, multi-device, allegati o mailbox distribuite.
 - La protezione dei metadati dipende anche dal router I2P, dal sistema operativo e dal comportamento dell'utente.
 - Kerberus non raccoglie telemetria. Padding a bucket, identificatori casuali, chiavi effimere e ricevute cifrate riducono i metadati applicativi, ma non possono nascondere ogni correlazione temporale a un avversario globale.
-- Le anteprime link non contattano il sito: mostrano solo hostname e URL già presenti nel messaggio. Clearnet e DNS sono off di default; sono disponibili DNS di sistema, Mullvad DoH/DoT (`base.dns.mullvad.net`, `194.242.2.4`, porte 443/853) o un endpoint cifrato personalizzato.
+- Le anteprime link non contattano il sito: mostrano solo hostname e URL già presenti nel messaggio. Le funzioni clearnet restano disattivate per impostazione predefinita e Kerberus non offre più configurazioni DNS proprie.
 - Le release non sono ancora firmate con un certificato di code signing.
 
 ## Licenze

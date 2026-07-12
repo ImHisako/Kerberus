@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -77,6 +78,18 @@ class UiTests(unittest.TestCase):
         window.refresh_messages("new", "peer")
         self.assertIs(window._message_bubbles["1" * 32], original)
         self.assertEqual(len(window._message_bubbles), 2)
+        window.service.close()
+
+    def test_incoming_contact_events_reconcile_sidebar(self):
+        window = KerberusWindow()
+        window._build_ui()
+        window.refresh_contacts = Mock()
+        window._protocol_event("contact_request_received", "Richiesta valida")
+        window.refresh_contacts.assert_called_once()
+        window.refresh_contacts.reset_mock()
+        window.selected_contact = ""
+        window.refresh_messages("new", "peer")
+        window.refresh_contacts.assert_called_once()
         window.service.close()
 
     def test_operational_dialogs_are_modeless(self):

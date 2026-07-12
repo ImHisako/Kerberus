@@ -38,11 +38,6 @@ def empty_state() -> dict[str, Any]:
             "link_previews": False,
             "minimize_to_tray": True,
             "clearnet_enabled": False,
-            "dns_mode": "none",
-            "dns_host": "base.dns.mullvad.net",
-            "dns_ipv4": "194.242.2.4",
-            "dns_ipv6": "2a07:e340::4",
-            "dns_port": 853,
         },
     }
 
@@ -96,11 +91,8 @@ class Vault:
         settings.setdefault("link_previews", False)
         settings.setdefault("minimize_to_tray", True)
         settings.setdefault("clearnet_enabled", False)
-        settings.setdefault("dns_mode", "none")
-        settings.setdefault("dns_host", "base.dns.mullvad.net")
-        settings.setdefault("dns_ipv4", "194.242.2.4")
-        settings.setdefault("dns_ipv6", "2a07:e340::4")
-        settings.setdefault("dns_port", 853)
+        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+            settings.pop(obsolete, None)
 
     def save(self) -> None:
         if self._key is None:

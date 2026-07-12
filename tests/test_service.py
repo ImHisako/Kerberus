@@ -333,6 +333,29 @@ class ServiceTests(unittest.TestCase):
             alice_service.close(wait=True)
             bob_service.close(wait=True)
 
+    def test_pending_contact_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+
+            class Offline:
+                def send(self, *_args):
+                    raise ConnectionError("offline")
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Offline()
+            self.assertEqual(alice_service.request_contact(bob_service.contact_code()), "queued")
+            pending = alice_service.pending_contacts()
+            self.assertEqual(len(pending), 1)
+            self.assertTrue(alice_service.cancel_pending_contact(pending[0]["destination"]))
+            self.assertEqual(alice_service.pending_contacts(), [])
+            self.assertFalse(alice_service.cancel_pending_contact(pending[0]["destination"]))
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
     def test_recent_previous_minute_contact_code_is_accepted(self):
         with tempfile.TemporaryDirectory() as folder:
             service = self._service(Path(folder) / "bob", "Bob")

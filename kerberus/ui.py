@@ -435,7 +435,7 @@ class ContactRow(QWidget):
 
 
 class PendingContactRow(QWidget):
-    def __init__(self, pending: dict):
+    def __init__(self, pending: dict, on_cancel: Callable[[str], None]):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -458,6 +458,12 @@ class PendingContactRow(QWidget):
         text.addWidget(title)
         text.addWidget(meta)
         layout.addLayout(text, 1)
+        cancel = QToolButton()
+        cancel.setIcon(lucide_icon("x", COLORS["danger"], 16))
+        cancel.setToolTip("Annulla richiesta")
+        destination = str(pending.get("destination", ""))
+        cancel.clicked.connect(lambda: on_cancel(destination))
+        layout.addWidget(cancel)
         self.setToolTip("La chat sarà disponibile dopo la conferma firmata dell’altro dispositivo")
 
 
@@ -1069,10 +1075,23 @@ class KerberusWindow(QMainWindow):
                 continue
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, "")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setSizeHint(QSize(270, 62))
             self.contacts_list.addItem(item)
-            self.contacts_list.setItemWidget(item, PendingContactRow(pending))
+            self.contacts_list.setItemWidget(item, PendingContactRow(pending, self.cancel_pending_contact))
+
+    def cancel_pending_contact(self, destination: str) -> None:
+        if not destination:
+            return
+        if not KerberusMessageDialog.ask(
+            self,
+            "Annulla richiesta",
+            "Annullare questa richiesta di contatto e interrompere i tentativi automatici?",
+        ):
+            return
+        if self.service.cancel_pending_contact(destination):
+            self.refresh_contacts()
+            self.statusBar().showMessage("Richiesta contatto annullata", 4000)
 
     def _select_contact_item(self, item: QListWidgetItem) -> None:
         self.select_contact(item.data(Qt.ItemDataRole.UserRole))
@@ -1106,6 +1125,8 @@ class KerberusWindow(QMainWindow):
                     4000,
                 )
         if not self.selected_contact or not hasattr(self, "message_layout"):
+            if contact_id:
+                self.refresh_contacts()
             return
         if contact_id and contact_id != self.selected_contact:
             self.refresh_contacts()
@@ -1470,6 +1491,11 @@ class KerberusWindow(QMainWindow):
 
     def _protocol_event(self, kind: str, detail: str) -> None:
         self._log_action(f"Evento protocollo: {kind} · {detail}")
+        if kind in {
+            "contact_request_received", "contact_accept_inline", "contact_accept_received",
+            "contact_request_cancelled",
+        }:
+            self.refresh_contacts()
         if kind == "contact_reject_received":
             KerberusMessageDialog.show_message(self, "Richiesta contatto rifiutata", detail)
             return
@@ -1574,35 +1600,12 @@ class KerberusWindow(QMainWindow):
         minimize_to_tray.setChecked(current["minimize_to_tray"])
         clearnet = QCheckBox("Consenti funzioni clearnet esplicite (es. aggiornamenti)")
         clearnet.setChecked(current["clearnet_enabled"])
-        dns_mode = QComboBox()
-        for value, label in (("none", "Senza DNS / solo I2P"), ("mullvad", "Mullvad encrypted DNS"), ("custom", "DNS personalizzato"), ("system", "DNS di sistema")):
-            dns_mode.addItem(label, value)
-            if value == current["dns_mode"]:
-                dns_mode.setCurrentIndex(dns_mode.count() - 1)
-        dns_host = QLineEdit(str(current["dns_host"]))
-        dns_host.setPlaceholderText("Hostname DNS, es. base.dns.mullvad.net")
-        dns_ipv4 = QLineEdit(str(current["dns_ipv4"]))
-        dns_ipv4.setPlaceholderText("IPv4 bootstrap, es. 194.242.2.4")
-        dns_ipv6 = QLineEdit(str(current["dns_ipv6"]))
-        dns_ipv6.setPlaceholderText("IPv6 bootstrap, es. 2a07:e340::4")
-        dns_port = QLineEdit(str(current["dns_port"]))
-        dns_port.setPlaceholderText("443 per DoH oppure 853 per DoT")
         layout.addWidget(receipts_label)
         layout.addWidget(delivery_receipts)
         layout.addWidget(read_receipts)
         layout.addWidget(link_previews)
         layout.addWidget(minimize_to_tray)
         layout.addWidget(clearnet)
-        layout.addWidget(QLabel("Resolver per le sole funzioni clearnet"))
-        layout.addWidget(dns_mode)
-        layout.addWidget(dns_host)
-        layout.addWidget(dns_ipv4)
-        layout.addWidget(dns_ipv6)
-        layout.addWidget(dns_port)
-        dns_hint = QLabel("Gli indirizzi .b32.i2p passano sempre da SAM/I2P e non usano DNS. In modalità senza DNS gli aggiornamenti automatici restano disabilitati.")
-        dns_hint.setObjectName("muted")
-        dns_hint.setWordWrap(True)
-        layout.addWidget(dns_hint)
         layout.addSpacing(10)
         diagnostics_label = QLabel("DIAGNOSTICA LOCALE")
         diagnostics_label.setObjectName("eyebrow")
@@ -1634,11 +1637,6 @@ class KerberusWindow(QMainWindow):
                 link_previews=link_previews.isChecked(),
                 minimize_to_tray=minimize_to_tray.isChecked(),
                 clearnet_enabled=clearnet.isChecked(),
-                dns_mode=str(dns_mode.currentData()),
-                dns_host=dns_host.text().strip(),
-                dns_ipv4=dns_ipv4.text().strip(),
-                dns_ipv6=dns_ipv6.text().strip(),
-                dns_port=int(dns_port.text().strip()),
             )
             self._log_action("Impostazioni privacy salvate")
             self.statusBar().showMessage("Impostazioni salvate · codice contatto aggiornato", 5000)
@@ -1647,12 +1645,11 @@ class KerberusWindow(QMainWindow):
         self._show_modeless(dialog)
 
     def check_updates(self, manual: bool = False) -> None:
-        network_settings = self.service.settings()
-        if not network_settings.get("clearnet_enabled", False):
+        if not self.service.settings().get("clearnet_enabled", False):
             if manual:
                 KerberusMessageDialog.show_message(
                     self, "Clearnet disabilitata",
-                    "Abilita le funzioni clearnet nelle impostazioni e scegli un resolver DNS prima di controllare gli aggiornamenti.",
+                    "Abilita le funzioni clearnet nelle impostazioni prima di controllare gli aggiornamenti.",
                 )
             return
         self._log_action("Controllo aggiornamenti GitHub")
@@ -1676,7 +1673,7 @@ class KerberusWindow(QMainWindow):
             if manual:
                 self._error("Aggiornamenti", error)
 
-        self._run_task(lambda: check_for_update(__version__, network_settings), found, failed)
+        self._run_task(lambda: check_for_update(__version__), found, failed)
 
     def _download_update(self, info: UpdateInfo) -> None:
         self.statusBar().showMessage(f"Download Kerberus {info.version}…", 10000)
@@ -1701,7 +1698,7 @@ class KerberusWindow(QMainWindow):
             self.close()
 
         self._run_task(
-            lambda: download_update(info, self.service.config.downloads_path / "updates", self.service.settings()),
+            lambda: download_update(info, self.service.config.downloads_path / "updates"),
             ready,
             lambda error: self._error("Aggiornamenti", error),
         )
@@ -2102,6 +2099,7 @@ class KerberusWindow(QMainWindow):
 
     def _contact_arrived(self, contact_id: str) -> None:
         self.refresh_contacts()
+        QTimer.singleShot(100, self.refresh_contacts)
         if not self.selected_contact or self.selected_contact == contact_id:
             self.select_contact(contact_id)
         self.statusBar().showMessage("Nuovo contatto verificato", 5000)

@@ -9,9 +9,6 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .network import build_opener
-
-
 API_URL = "https://api.github.com/repos/ImHisako/Kerberus/releases/latest"
 RELEASES_URL = "https://github.com/ImHisako/Kerberus/releases"
 USER_AGENT = "Kerberus-Update/1"
@@ -49,9 +46,8 @@ def _request(url: str):
     )
 
 
-def _read_limited(url: str, limit: int, network_settings: dict | None = None) -> bytes:
-    open_url = build_opener(network_settings).open if network_settings is not None else urllib.request.urlopen
-    with open_url(_request(url), timeout=20) as response:
+def _read_limited(url: str, limit: int) -> bytes:
+    with urllib.request.urlopen(_request(url), timeout=20) as response:
         declared = int(response.headers.get("Content-Length", "0") or 0)
         if declared > limit:
             raise RuntimeError("Download di aggiornamento troppo grande")
@@ -61,8 +57,8 @@ def _read_limited(url: str, limit: int, network_settings: dict | None = None) ->
     return data
 
 
-def check_for_update(current_version: str, network_settings: dict | None = None) -> UpdateInfo | None:
-    raw = json.loads(_read_limited(API_URL, MAX_METADATA, network_settings).decode("utf-8"))
+def check_for_update(current_version: str) -> UpdateInfo | None:
+    raw = json.loads(_read_limited(API_URL, MAX_METADATA).decode("utf-8"))
     if raw.get("draft") or raw.get("prerelease"):
         return None
     tag = str(raw.get("tag_name", ""))
@@ -90,8 +86,8 @@ def check_for_update(current_version: str, network_settings: dict | None = None)
     )
 
 
-def download_update(info: UpdateInfo, target_dir: Path, network_settings: dict | None = None) -> Path:
-    manifest = _read_limited(info.checksum_url, MAX_METADATA, network_settings).decode("ascii", "strict")
+def download_update(info: UpdateInfo, target_dir: Path) -> Path:
+    manifest = _read_limited(info.checksum_url, MAX_METADATA).decode("ascii", "strict")
     expected = ""
     for line in manifest.splitlines():
         parts = line.split()
@@ -106,8 +102,7 @@ def download_update(info: UpdateInfo, target_dir: Path, network_settings: dict |
     digest = hashlib.sha256()
     total = 0
     try:
-        open_url = build_opener(network_settings).open if network_settings is not None else urllib.request.urlopen
-        with open_url(_request(info.asset_url), timeout=30) as response, temporary.open("wb") as output:
+        with urllib.request.urlopen(_request(info.asset_url), timeout=30) as response, temporary.open("wb") as output:
             declared = int(response.headers.get("Content-Length", "0") or 0)
             if declared > MAX_ARTIFACT:
                 raise RuntimeError("Aggiornamento troppo grande")

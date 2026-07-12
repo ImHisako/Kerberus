@@ -190,11 +190,8 @@ class MessengerService:
         settings.setdefault("link_previews", False)
         settings.setdefault("minimize_to_tray", True)
         settings.setdefault("clearnet_enabled", False)
-        settings.setdefault("dns_mode", "none")
-        settings.setdefault("dns_host", "base.dns.mullvad.net")
-        settings.setdefault("dns_ipv4", "194.242.2.4")
-        settings.setdefault("dns_ipv6", "2a07:e340::4")
-        settings.setdefault("dns_port", 853)
+        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+            settings.pop(obsolete, None)
         return dict(settings)
 
     def update_settings(self, period_minutes: int, single_use: bool) -> dict:
@@ -216,23 +213,16 @@ class MessengerService:
     def update_privacy_settings(self, **values: object) -> dict:
         allowed = {
             "send_delivery_receipts", "send_read_receipts", "link_previews",
-            "minimize_to_tray", "clearnet_enabled", "dns_mode", "dns_host",
-            "dns_ipv4", "dns_ipv6", "dns_port",
+            "minimize_to_tray", "clearnet_enabled",
         }
         unknown = set(values) - allowed
         if unknown:
             raise ValueError(f"Impostazioni non supportate: {', '.join(sorted(unknown))}")
-        mode = str(values.get("dns_mode", self.settings()["dns_mode"]))
-        if mode not in {"none", "system", "mullvad", "custom"}:
-            raise ValueError("Modalità DNS non valida")
-        port = int(values.get("dns_port", self.settings()["dns_port"]))
-        if not 1 <= port <= 65535:
-            raise ValueError("Porta DNS non valida")
         with self._state_lock:
             settings = self.vault.state.setdefault("settings", {})
             settings.update(values)
-            settings["dns_mode"] = mode
-            settings["dns_port"] = port
+            for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port"):
+                settings.pop(obsolete, None)
             self.vault.save()
         self._emit_protocol_event("privacy_settings_updated", "Policy rete e ricevute aggiornata")
         return self.settings()
@@ -323,6 +313,16 @@ class MessengerService:
                 for destination, entry in self.vault.state.get("pending", {}).items()
                 if entry.get("payload")
             ]
+
+    def cancel_pending_contact(self, destination: str) -> bool:
+        with self._state_lock:
+            removed = self.vault.state.get("pending", {}).pop(destination, None)
+            if removed is not None:
+                self.vault.save()
+        if removed is not None:
+            self._emit_protocol_event("contact_request_cancelled", "Richiesta contatto annullata localmente")
+            return True
+        return False
 
     def messages_for(self, contact_id: str) -> list[dict]:
         return [m for m in self.vault.state["messages"] if m["contact_id"] == contact_id]
