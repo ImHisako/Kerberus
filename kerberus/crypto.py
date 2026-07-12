@@ -229,12 +229,29 @@ def rotating_contact_code(
     identity: IdentityBundle,
     secrets: IdentitySecrets,
     minute: int | None = None,
+    *,
+    period_minutes: int = 1,
+    generation: int = 0,
+    anchor_time: int = 0,
+    timestamp: int | None = None,
 ) -> str:
     if not identity.destination:
         raise ValueError("Profilo non ancora collegato a I2P")
-    slot = int(time.time() // 60) if minute is None else minute
+    if period_minutes not in (1, 5, 15, 60):
+        raise ValueError("Durata codice contatto non supportata")
+    current_time = timestamp if timestamp is not None else (int(time.time()) if minute is None else minute * 60)
+    period_seconds = period_minutes * 60
+    slot = (
+        max(0, current_time - anchor_time) // period_seconds
+        if anchor_time > 0
+        else current_time // period_seconds
+    )
     key = unb64(secrets.signing_private)
-    digest = hmac.new(key, f"kerberus-contact-code-v1:{slot}".encode("ascii"), hashlib.sha256).digest()
+    digest = hmac.new(
+        key,
+        f"kerberus-contact-code-v2:{slot}:{generation}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
     token = base64.b32encode(digest).decode("ascii").rstrip("=")
     prefix = token[:4].replace("I", "8").replace("O", "9")
     rotating = token[4:20].replace("I", "8").replace("O", "9")
@@ -279,7 +296,12 @@ def seal_message(sender: IdentityBundle, secrets: IdentitySecrets, recipient: Id
     return envelope
 
 
-def open_message(recipient: IdentityBundle, secrets: IdentitySecrets, sender: IdentityBundle, envelope: dict[str, Any]) -> str:
+def open_message_payload(
+    recipient: IdentityBundle,
+    secrets: IdentitySecrets,
+    sender: IdentityBundle,
+    envelope: dict[str, Any],
+) -> dict[str, Any]:
     signed = dict(envelope)
     signature = unb64(signed.pop("signature"))
     Ed25519PublicKey.from_public_bytes(unb64(sender.signing_public)).verify(signature, canonical(signed))
@@ -295,7 +317,14 @@ def open_message(recipient: IdentityBundle, secrets: IdentitySecrets, sender: Id
     key = _message_key(classical, quantum, context)
     clear = crypto_aead_xchacha20poly1305_ietf_decrypt(unb64(envelope["ciphertext"]), context, unb64(envelope["nonce"]), key)
     payload = json.loads(clear.decode("utf-8"))
-    return str(payload["text"])
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, int) or sent_at < 0:
+        raise ValueError("Timestamp mittente non valido")
+    return {"text": str(payload["text"]), "sent_at": sent_at}
+
+
+def open_message(recipient: IdentityBundle, secrets: IdentitySecrets, sender: IdentityBundle, envelope: dict[str, Any]) -> str:
+    return str(open_message_payload(recipient, secrets, sender, envelope)["text"])
 
 
 def derive_vault_key(password: str, salt: bytes) -> bytes:

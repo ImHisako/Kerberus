@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,12 @@ def empty_state() -> dict[str, Any]:
         "seen": [],
         "pending": {},
         "used_contact_codes": [],
+        "settings": {
+            "contact_code_period_minutes": 1,
+            "contact_code_single_use": True,
+            "contact_code_generation": 0,
+            "contact_code_anchor_time": int(time.time()),
+        },
     }
 
 
@@ -65,6 +72,11 @@ class Vault:
         self.state.setdefault("control_outbox", [])
         self.state.setdefault("pending", {})
         self.state.setdefault("used_contact_codes", [])
+        settings = self.state.setdefault("settings", {})
+        settings.setdefault("contact_code_period_minutes", 1)
+        settings.setdefault("contact_code_single_use", True)
+        settings.setdefault("contact_code_generation", 0)
+        settings.setdefault("contact_code_anchor_time", int(time.time()))
 
     def save(self) -> None:
         if self._key is None:

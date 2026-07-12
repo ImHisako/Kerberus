@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Callable
 
 
+FrameReceiver = Callable[[bytes], bytes | None]
+
+
 class SamError(RuntimeError):
     pass
 
@@ -52,6 +55,10 @@ class SamClient:
         self._peer_locks: dict[str, threading.Lock] = {}
         self._inbound_sockets: set[socket.socket] = set()
         self._generation = 0
+        self._receiver: FrameReceiver | None = None
+
+    def set_receiver(self, receiver: FrameReceiver) -> None:
+        self._receiver = receiver
 
     def available(self, timeout: float = 0.8) -> bool:
         try:
@@ -89,7 +96,7 @@ class SamClient:
                     "i2cp.leaseSetEncType=6,4 inbound.quantity=3 outbound.quantity=3 "
                     "inbound.backupQuantity=1 outbound.backupQuantity=1 "
                     "i2cp.reduceOnIdle=false i2cp.closeOnIdle=false i2cp.fastReceive=true "
-                    "i2p.streaming.profile=2 i2p.streaming.initialAckDelay=100",
+                    "i2p.streaming.profile=2 i2p.streaming.initialAckDelay=25",
                 )
                 _check(reply)
                 lookup = _check(_command(sock, "NAMING LOOKUP NAME=ME"))
@@ -152,35 +159,73 @@ class SamClient:
                     continue
                 raise
 
+    def warm(self, destination: str) -> None:
+        """Open and retain a peer stream without emitting an application frame."""
+        retried_stream = False
+        retried_session = False
+        while True:
+            self.start_session()
+            with self._session_lock:
+                generation = self._generation
+            try:
+                with self._peer_lock(destination):
+                    self._stream_locked(destination)
+                return
+            except SamError as exc:
+                if "INVALID_ID" in str(exc) and not retried_session:
+                    self.start_session(force=True, expected_generation=generation)
+                    retried_session = True
+                    retried_stream = False
+                    continue
+                raise
+            except OSError:
+                self._drop_outbound(destination)
+                if not retried_stream:
+                    retried_stream = True
+                    continue
+                raise
+
     def _send_once(self, destination: str, payload: bytes) -> None:
         peer_lock = self._peer_lock(destination)
         with peer_lock:
-            with self._streams_lock:
-                sock = self._outbound_sockets.get(destination)
-            if sock is not None and self._socket_closed(sock):
-                self._drop_outbound(destination, sock)
-                sock = None
-            if sock is None:
-                sock = self._connect()
-                try:
-                    sock.settimeout(120)
-                    _check(_command(
-                        sock,
-                        f"STREAM CONNECT ID={self.session_id} DESTINATION={destination} SILENT=false",
-                    ))
-                    sock.settimeout(None)
-                except Exception:
-                    sock.close()
-                    raise
-                with self._streams_lock:
-                    self._outbound_sockets[destination] = sock
+            sock = self._stream_locked(destination)
             try:
                 sock.sendall(len(payload).to_bytes(4, "big") + payload)
             except OSError:
                 self._drop_outbound(destination, sock)
                 raise
 
-    def listen(self, callback: Callable[[bytes], None]) -> None:
+    def _stream_locked(self, destination: str) -> socket.socket:
+        with self._streams_lock:
+            sock = self._outbound_sockets.get(destination)
+        if sock is not None and self._socket_closed(sock):
+            self._drop_outbound(destination, sock)
+            sock = None
+        if sock is None:
+            sock = self._connect()
+            try:
+                sock.settimeout(120)
+                _check(_command(
+                    sock,
+                    f"STREAM CONNECT ID={self.session_id} DESTINATION={destination} SILENT=false",
+                ))
+                sock.settimeout(None)
+            except Exception:
+                sock.close()
+                raise
+            with self._streams_lock:
+                self._outbound_sockets[destination] = sock
+            if self._receiver:
+                threading.Thread(
+                    target=self._read_outbound_stream,
+                    args=(destination, sock, self._receiver),
+                    daemon=True,
+                    name="sam-outbound-reader",
+                ).start()
+        return sock
+
+    def listen(self, callback: FrameReceiver) -> None:
+        self._receiver = callback
         self._stop.clear()
         while not self._stop.is_set():
             try:
@@ -231,7 +276,7 @@ class SamClient:
                     pass
                 self._stop.wait(1.5)
 
-    def _read_inbound_stream(self, sock: socket.socket, callback: Callable[[bytes], None]) -> None:
+    def _read_inbound_stream(self, sock: socket.socket, callback: FrameReceiver) -> None:
         try:
             sock.settimeout(180)
             while not self._stop.is_set():
@@ -240,7 +285,11 @@ class SamClient:
                     raise SamError("Frame troppo grande")
                 payload = self._read_exact(sock, size)
                 try:
-                    callback(payload)
+                    response = callback(payload)
+                    if response:
+                        if len(response) > 4_000_000:
+                            raise SamError("Risposta troppo grande")
+                        sock.sendall(len(response).to_bytes(4, "big") + response)
                 except Exception:
                     continue
         except (OSError, SamError, socket.timeout):
@@ -249,6 +298,25 @@ class SamClient:
             with self._streams_lock:
                 self._inbound_sockets.discard(sock)
             sock.close()
+
+    def _read_outbound_stream(self, destination: str, sock: socket.socket, callback: FrameReceiver) -> None:
+        try:
+            sock.settimeout(180)
+            while not self._stop.is_set():
+                size = int.from_bytes(self._read_exact(sock, 4), "big")
+                if size > 4_000_000:
+                    raise SamError("Frame troppo grande")
+                payload = self._read_exact(sock, size)
+                try:
+                    response = callback(payload)
+                    if response:
+                        sock.sendall(len(response).to_bytes(4, "big") + response)
+                except Exception:
+                    continue
+        except (OSError, SamError, socket.timeout):
+            pass
+        finally:
+            self._drop_outbound(destination, sock)
 
     def _monitor_control(self, sock: socket.socket, generation: int) -> None:
         try:

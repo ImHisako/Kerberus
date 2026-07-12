@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -20,11 +21,14 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPixmap,
     QResizeEvent,
+    QRegion,
 )
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -33,9 +37,8 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
-    QProgressDialog,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -65,6 +68,7 @@ COLORS = {
     "accent_hover": "#50ddb0",
     "accent_dark": "#174d3b",
     "cyan": "#4dbbd5",
+    "warning": "#f0b35a",
     "danger": "#ef6b73",
 }
 
@@ -124,7 +128,9 @@ STYLE = f"""
     font-size: 14px;
     color: {COLORS['text']};
 }}
-QMainWindow, QDialog {{ background: {COLORS['window']}; }}
+QMainWindow {{ background: transparent; }}
+QDialog {{ background: transparent; }}
+QFrame#appShell, QFrame#dialogShell {{ background: {COLORS['window']}; border: 1px solid {COLORS['border']}; border-radius: 12px; }}
 QFrame#titlebar {{ background: {COLORS['sidebar']}; border-bottom: 1px solid {COLORS['border']}; }}
 QFrame#sidebar {{ background: {COLORS['sidebar']}; border-right: 1px solid {COLORS['border']}; }}
 QFrame#topbar {{ background: {COLORS['window']}; border-bottom: 1px solid {COLORS['border']}; }}
@@ -164,6 +170,7 @@ QToolButton {{
 QToolButton:hover {{ background: {COLORS['surface_2']}; }}
 QToolButton#sendButton {{ background: {COLORS['accent']}; color: #07120e; }}
 QToolButton#sendButton:hover {{ background: {COLORS['accent_hover']}; }}
+QToolButton#timingButton {{ padding: 1px; border-radius: 4px; }}
 QToolButton#windowButton {{ border-radius: 0; padding: 0; }}
 QToolButton#windowButton:hover {{ background: {COLORS['surface_3']}; }}
 QToolButton#closeButton {{ border-radius: 0; padding: 0; }}
@@ -173,15 +180,18 @@ QListWidget::item {{ border: 0; padding: 0; }}
 QListWidget::item:selected {{ background: {COLORS['surface_2']}; border-radius: 6px; }}
 QListWidget::item:hover:!selected {{ background: #181e24; border-radius: 6px; }}
 QScrollArea {{ background: transparent; border: 0; }}
-QScrollBar:vertical {{ background: transparent; width: 9px; margin: 2px; }}
+QScrollBar:vertical {{ background: transparent; width: 12px; margin: 1px 2px 1px 0; }}
 QScrollBar::handle:vertical {{ background: #3a434e; border-radius: 4px; min-height: 32px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QProgressDialog {{ min-width: 430px; }}
+QProgressBar {{ background: {COLORS['surface_2']}; border: 0; border-radius: 5px; min-height: 10px; }}
+QProgressBar::chunk {{ background: {COLORS['accent']}; border-radius: 5px; }}
+QComboBox {{ background: {COLORS['surface_2']}; border: 1px solid {COLORS['border']}; border-radius: 7px; padding: 9px 12px; }}
+QCheckBox {{ spacing: 9px; }}
 """
 
 
 class AppSignals(QObject):
-    message_received = pyqtSignal()
+    message_received = pyqtSignal(str, str)
     contacts_changed = pyqtSignal(str)
     protocol_event = pyqtSignal(str, str)
     router_changed = pyqtSignal(bool, str)
@@ -190,12 +200,126 @@ class AppSignals(QObject):
     download_progress = pyqtSignal(int, int)
 
 
-class PasswordDialog(QDialog):
-    def __init__(self, create: bool, parent: QWidget | None = None):
+class DialogTitleBar(QFrame):
+    def __init__(self, dialog: QDialog, title: str):
+        super().__init__(dialog)
+        self.dialog = dialog
+        self.setObjectName("titlebar")
+        self.setFixedHeight(42)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 0, 0, 0)
+        mark = QLabel("K")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(24, 24)
+        mark.setStyleSheet(f"background: {COLORS['accent_dark']}; color: {COLORS['accent']}; border-radius: 5px; font-weight: 800;")
+        caption = QLabel(title)
+        caption.setStyleSheet("font-weight: 650;")
+        close = QToolButton()
+        close.setObjectName("closeButton")
+        close.setIcon(lucide_icon("x"))
+        close.setIconSize(QSize(14, 14))
+        close.setFixedSize(46, 41)
+        close.setToolTip("Chiudi")
+        close.clicked.connect(dialog.reject)
+        layout.addWidget(mark)
+        layout.addSpacing(8)
+        layout.addWidget(caption)
+        layout.addStretch()
+        layout.addWidget(close)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.dialog.windowHandle():
+            self.dialog.windowHandle().startSystemMove()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class KerberusDialog(QDialog):
+    def __init__(self, title: str, parent: QWidget | None = None, width: int = 520):
         super().__init__(parent)
-        self.setWindowTitle("Crea vault" if create else "Sblocca Kerberus")
-        self.setFixedWidth(440)
-        layout = QVBoxLayout(self)
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(width)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        shell = QFrame()
+        shell.setObjectName("dialogShell")
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(DialogTitleBar(self, title))
+        body = QWidget()
+        self.body_layout = QVBoxLayout(body)
+        self.body_layout.setContentsMargins(28, 26, 28, 26)
+        self.body_layout.setSpacing(12)
+        shell_layout.addWidget(body)
+        root.addWidget(shell)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(8, 8, max(0, self.width() - 16), max(0, self.height() - 16), 12, 12)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        super().resizeEvent(event)
+
+
+class KerberusMessageDialog(KerberusDialog):
+    def __init__(self, title: str, message: str, parent: QWidget | None = None, confirm: bool = False):
+        super().__init__(title, parent, 500)
+        row = QHBoxLayout()
+        icon = QLabel()
+        icon.setPixmap(lucide_icon("info", COLORS["accent"], 28).pixmap(28, 28))
+        text = QLabel(message)
+        text.setWordWrap(True)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(icon, alignment=Qt.AlignmentFlag.AlignTop)
+        row.addWidget(text, 1)
+        self.body_layout.addLayout(row)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        if confirm:
+            cancel = QPushButton("Annulla")
+            cancel.setObjectName("ghost")
+            cancel.clicked.connect(self.reject)
+            actions.addWidget(cancel)
+        accept = QPushButton("Continua" if confirm else "Chiudi")
+        accept.setObjectName("primary")
+        accept.clicked.connect(self.accept)
+        actions.addWidget(accept)
+        self.body_layout.addLayout(actions)
+
+    @classmethod
+    def show_message(cls, parent: QWidget | None, title: str, message: str) -> None:
+        cls(title, message, parent).exec()
+
+    @classmethod
+    def ask(cls, parent: QWidget | None, title: str, message: str) -> bool:
+        return cls(title, message, parent, confirm=True).exec() == QDialog.DialogCode.Accepted
+
+
+class KerberusProgressDialog(KerberusDialog):
+    def __init__(self, title: str, message: str, parent: QWidget | None = None):
+        super().__init__(title, parent, 500)
+        label = QLabel(message)
+        label.setObjectName("muted")
+        self.body_layout.addWidget(label)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
+        self.body_layout.addWidget(self.progress)
+
+    def setMaximum(self, maximum: int) -> None:
+        self.progress.setMaximum(maximum)
+
+    def setValue(self, value: int) -> None:
+        self.progress.setValue(value)
+
+
+class PasswordDialog(KerberusDialog):
+    def __init__(self, create: bool, parent: QWidget | None = None):
+        super().__init__("Crea vault" if create else "Sblocca Kerberus", parent, 440)
+        layout = self.body_layout
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(12)
         title = QLabel("Proteggi il tuo spazio" if create else "Bentornato")
@@ -233,17 +357,15 @@ class PasswordDialog(QDialog):
 
     def _submit(self) -> None:
         if self.confirm is not None and self.password.text() != self.confirm.text():
-            QMessageBox.warning(self, "Vault", "Le password non coincidono.")
+            KerberusMessageDialog.show_message(self, "Vault", "Le password non coincidono.")
             return
         self.accept()
 
 
-class ContactDialog(QDialog):
+class ContactDialog(KerberusDialog):
     def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("Nuovo contatto")
-        self.setFixedWidth(600)
-        layout = QVBoxLayout(self)
+        super().__init__("Nuovo contatto", parent, 600)
+        layout = self.body_layout
         layout.setContentsMargins(28, 26, 28, 26)
         layout.setSpacing(12)
         eyebrow = QLabel("CONNESSIONE PRIVATA")
@@ -307,7 +429,15 @@ class ContactRow(QWidget):
 
 
 class MessageBubble(QWidget):
-    def __init__(self, text: str, timestamp: int, outgoing: bool, status: str = ""):
+    def __init__(
+        self,
+        text: str,
+        timestamp: int,
+        outgoing: bool,
+        status: str = "",
+        timing: dict | None = None,
+        on_timing: Callable[[dict], None] | None = None,
+    ):
         super().__init__()
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 4, 20, 4)
@@ -338,7 +468,23 @@ class MessageBubble(QWidget):
         time_label.setObjectName("timestamp")
         time_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         time_label.setStyleSheet("border: 0; background: transparent; font-size: 11px;")
-        content.addWidget(time_label)
+        metadata = QHBoxLayout()
+        metadata.setContentsMargins(0, 0, 0, 0)
+        metadata.setSpacing(4)
+        metadata.addStretch()
+        metadata.addWidget(time_label)
+        timing_button = QToolButton()
+        timing_button.setObjectName("timingButton")
+        timing_button.setIcon(lucide_icon("clock", COLORS["muted"], 13))
+        timing_button.setIconSize(QSize(13, 13))
+        timing_button.setFixedSize(20, 20)
+        timing_button.setToolTip("Dettagli di invio e ritardo")
+        if timing is not None and on_timing is not None:
+            timing_button.clicked.connect(lambda: on_timing(timing))
+        else:
+            timing_button.setEnabled(False)
+        metadata.addWidget(timing_button)
+        content.addLayout(metadata)
         outer.addWidget(bubble)
         if not outgoing:
             outer.addStretch(1)
@@ -444,10 +590,14 @@ class KerberusWindow(QMainWindow):
         self._router_connected = False
         self._router_detail = "Verifica non ancora completata"
         self._workers: list[threading.Thread] = []
-        self._download_dialog: QProgressDialog | None = None
-        self._resize_margin = 7
+        self._download_dialog: KerberusProgressDialog | None = None
+        # Il bordo resta ridimensionabile, ma non copre la scrollbar della chat.
+        self._resize_margin = 2
         self._allow_close = False
+        self._ui_events: list[str] = []
+        self._open_dialogs: set[QDialog] = set()
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Kerberus")
         self.setMinimumSize(900, 620)
         self.resize(1180, 760)
@@ -471,11 +621,11 @@ class KerberusWindow(QMainWindow):
             else:
                 self.service.vault.unlock(password.password.text())
         except Exception as exc:
-            QMessageBox.critical(self, "Vault", str(exc))
+            KerberusMessageDialog.show_message(self, "Vault", str(exc))
             return self.initialize()
         if not self.service.identity():
             if not pq_available():
-                QMessageBox.critical(self, "Post-quantum", "Il backend ML-KEM-768 non è disponibile.")
+                KerberusMessageDialog.show_message(self, "Post-quantum", "Il backend ML-KEM-768 non è disponibile.")
                 return False
             name, ok = self._ask_name()
             if not ok:
@@ -487,10 +637,8 @@ class KerberusWindow(QMainWindow):
         return True
 
     def _ask_name(self) -> tuple[str, bool]:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Nuovo profilo")
-        dialog.setFixedWidth(430)
-        layout = QVBoxLayout(dialog)
+        dialog = KerberusDialog("Nuovo profilo", self, 430)
+        layout = dialog.body_layout
         layout.setContentsMargins(28, 26, 28, 26)
         title = QLabel("Crea il tuo profilo")
         title.setObjectName("dialogTitle")
@@ -507,7 +655,8 @@ class KerberusWindow(QMainWindow):
         return field.text().strip(), accepted
 
     def _build_ui(self) -> None:
-        root = QWidget()
+        root = QFrame()
+        root.setObjectName("appShell")
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
@@ -522,6 +671,7 @@ class KerberusWindow(QMainWindow):
         root_layout.addWidget(body, 1)
         self.setCentralWidget(root)
         self._create_resize_handles()
+        self._log_action("UI pronta")
 
     def _create_resize_handles(self) -> None:
         edge_sets = (
@@ -559,6 +709,12 @@ class KerberusWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         self._position_resize_handles()
+        if self.isMaximized():
+            self.clearMask()
+        else:
+            path = QPainterPath()
+            path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+            self.setMask(QRegion(path.toFillPolygon().toPolygon()))
         super().resizeEvent(event)
 
     def toggle_maximize(self) -> None:
@@ -663,12 +819,19 @@ class KerberusWindow(QMainWindow):
         self.router_dot.setFixedSize(9, 9)
         self.router_text = QLabel("I2P: verifica...")
         self.router_text.setObjectName("muted")
+        status_text = QVBoxLayout()
+        status_text.setSpacing(1)
+        self.router_meta = QLabel("Controllo bridge SAM")
+        self.router_meta.setObjectName("muted")
+        self.router_meta.setStyleSheet("font-size: 11px;")
+        status_text.addWidget(self.router_text)
+        status_text.addWidget(self.router_meta)
         configure = QToolButton()
         configure.setIcon(lucide_icon("network"))
         configure.setToolTip("Configura I2P")
         configure.clicked.connect(self.router_setup)
         status_layout.addWidget(self.router_dot)
-        status_layout.addWidget(self.router_text, 1)
+        status_layout.addLayout(status_text, 1)
         status_layout.addWidget(configure)
         layout.addWidget(status_row)
 
@@ -681,8 +844,15 @@ class KerberusWindow(QMainWindow):
         import_button.setObjectName("ghost")
         import_button.setIcon(lucide_icon("upload"))
         import_button.clicked.connect(self.import_contact)
+        settings = QToolButton()
+        settings.setIcon(lucide_icon("settings-2"))
+        settings.setIconSize(QSize(20, 20))
+        settings.setFixedSize(42, 42)
+        settings.setToolTip("Impostazioni")
+        settings.clicked.connect(self.show_settings)
         utility.addWidget(profile)
         utility.addWidget(import_button)
+        utility.addWidget(settings)
         layout.addLayout(utility)
         return sidebar
 
@@ -790,15 +960,21 @@ class KerberusWindow(QMainWindow):
         if not contact:
             return
         self.selected_contact = contact_id
+        self.service.warm_contact(contact_id)
         set_avatar(self.chat_avatar, contact, 44)
         self.chat_name.setText(contact.name)
         self.content_stack.setCurrentIndex(1)
         self.refresh_messages()
         self.composer.setFocus()
 
-    def refresh_messages(self) -> None:
+    def refresh_messages(self, reason: str = "new", contact_id: str = "") -> None:
         if not self.selected_contact or not hasattr(self, "message_layout"):
             return
+        if contact_id and contact_id != self.selected_contact:
+            self.refresh_contacts()
+            return
+        scrollbar = self.message_scroll.verticalScrollBar()
+        distance_from_bottom = max(0, scrollbar.maximum() - scrollbar.value())
         while self.message_layout.count() > 1:
             item = self.message_layout.takeAt(0)
             if item.widget():
@@ -808,18 +984,99 @@ class KerberusWindow(QMainWindow):
                 self.message_layout.count() - 1,
                 MessageBubble(
                     message["text"],
-                    message["time"],
+                    int(message.get("sent_at", message["time"])),
                     message["direction"] == "out",
                     message.get("status", ""),
+                    timing=message,
+                    on_timing=self.show_message_timing,
                 ),
             )
         self.refresh_contacts()
-        QTimer.singleShot(20, lambda: self.message_scroll.verticalScrollBar().setValue(self.message_scroll.verticalScrollBar().maximum()))
+        self.message_layout.invalidate()
+        self.message_container.adjustSize()
+
+        def restore_scroll() -> None:
+            if reason == "new":
+                scrollbar.setValue(scrollbar.maximum())
+            else:
+                scrollbar.setValue(max(scrollbar.minimum(), scrollbar.maximum() - distance_from_bottom))
+
+        QTimer.singleShot(0, restore_scroll)
+        QTimer.singleShot(60, restore_scroll)
+
+    def show_message_timing(self, message: dict) -> None:
+        dialog = KerberusDialog("Tempi del messaggio", self, 570)
+        layout = dialog.body_layout
+        eyebrow = QLabel("DIAGNOSTICA DI CONSEGNA")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Invio e ricezione")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+
+        def format_time(value: object) -> str:
+            if not isinstance(value, int):
+                return "Non ancora disponibile"
+            return datetime.fromtimestamp(value).strftime("%d/%m/%Y · %H:%M:%S")
+
+        def format_delay(seconds: int) -> str:
+            if seconds < 0:
+                return "Non calcolabile: gli orologi dei dispositivi non sono sincronizzati"
+            if seconds < 60:
+                return f"{seconds} secondi"
+            minutes, remainder = divmod(seconds, 60)
+            return f"{minutes} min {remainder} s"
+
+        sent_at = message.get("sent_at", message.get("time"))
+        outgoing = message.get("direction") == "out"
+        received_at = message.get("recipient_received_at") if outgoing else message.get("received_at")
+        delivered_at = message.get("delivered_at")
+        rows = [
+            ("Inviato dal mittente", format_time(sent_at)),
+            ("Ricevuto dal destinatario", format_time(received_at)),
+        ]
+        if isinstance(sent_at, int) and isinstance(received_at, int):
+            rows.append(("Ritardo indicato", format_delay(received_at - sent_at)))
+        else:
+            rows.append(("Ritardo indicato", "In attesa della conferma"))
+        if outgoing:
+            rows.append(("ACK ricevuto sul mittente", format_time(delivered_at)))
+            if isinstance(sent_at, int) and isinstance(delivered_at, int):
+                rows.append(("Tempo totale andata/ritorno", format_delay(delivered_at - sent_at)))
+
+        for label, value in rows:
+            row = QFrame()
+            row.setStyleSheet(
+                f"background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 7px;"
+            )
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(12, 9, 12, 9)
+            key = QLabel(label.upper())
+            key.setObjectName("eyebrow")
+            data = QLabel(value)
+            data.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row_layout.addWidget(key)
+            row_layout.addWidget(data)
+            layout.addWidget(row)
+
+        note = QLabel(
+            "L’orario di invio è autenticato nel messaggio cifrato. Il ritardo a senso unico dipende anche dalla "
+            "sincronizzazione degli orologi; il tempo andata/ritorno usa invece l’orologio del mittente."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        close = QPushButton("Chiudi")
+        close.setObjectName("primary")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+        self._show_modeless(dialog)
 
     def send_message(self) -> None:
         text = self.composer.toPlainText().strip()
         if not text or not self.selected_contact:
             return
+        self._log_action("Invio messaggio richiesto")
         self.composer.clear()
         self._run_task(
             lambda: self.service.send_message(self.selected_contact, text),
@@ -828,7 +1085,7 @@ class KerberusWindow(QMainWindow):
         )
 
     def _message_send_result(self, value: object) -> None:
-        self.refresh_messages()
+        self.refresh_messages("new", self.selected_contact)
         if value == "queued":
             self.statusBar().showMessage(
                 "Destinatario temporaneamente non raggiungibile: messaggio cifrato in coda con retry automatico",
@@ -836,14 +1093,22 @@ class KerberusWindow(QMainWindow):
             )
 
     def add_contact(self) -> None:
+        self._log_action("Apertura Nuovo contatto")
         dialog = ContactDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.code.text().strip():
-            return
-        self._run_task(
-            lambda: self.service.request_contact(dialog.code.text(), dialog.first_message.toPlainText()),
-            self._contact_request_result,
-            lambda error: self._error("Nuovo contatto", error),
-        )
+
+        def submit() -> None:
+            if not dialog.code.text().strip():
+                return
+            code = dialog.code.text()
+            first_message = dialog.first_message.toPlainText()
+            self._run_task(
+                lambda: self.service.request_contact(code, first_message),
+                self._contact_request_result,
+                lambda error: self._error("Nuovo contatto", error),
+            )
+
+        dialog.accepted.connect(submit)
+        self._show_modeless(dialog)
 
     def _contact_request_result(self, value: object) -> None:
         message = "Richiesta inviata: attendo la conferma firmata"
@@ -852,19 +1117,123 @@ class KerberusWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
 
     def _protocol_event(self, kind: str, detail: str) -> None:
+        self._log_action(f"Evento protocollo: {kind}")
         if kind == "contact_reject_received":
-            QMessageBox.warning(self, "Richiesta contatto rifiutata", detail)
+            KerberusMessageDialog.show_message(self, "Richiesta contatto rifiutata", detail)
             return
         self.statusBar().showMessage(detail, 8000)
 
+    def _log_action(self, action: str) -> None:
+        safe = action.replace("\r", " ").replace("\n", " ")[:180]
+        self._ui_events.append(f"{datetime.now().strftime('%H:%M:%S')}  {safe}")
+        self._ui_events = self._ui_events[-1000:]
+
+    def _show_modeless(self, dialog: QDialog) -> None:
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._open_dialogs.add(dialog)
+        dialog.destroyed.connect(lambda: self._open_dialogs.discard(dialog))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def show_ui_console(self) -> None:
+        self._log_action("Apertura Console UI")
+        dialog = KerberusDialog("Console UI", self, 760)
+        dialog.setMinimumHeight(500)
+        layout = dialog.body_layout
+        eyebrow = QLabel("EVENTI LOCALI · NESSUN CONTENUTO DEI MESSAGGI")
+        eyebrow.setObjectName("eyebrow")
+        layout.addWidget(eyebrow)
+        title = QLabel("Attività dell’app")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        console = QPlainTextEdit()
+        console.setReadOnly(True)
+        console.setStyleSheet("font-family: Consolas; font-size: 12px;")
+        console.setPlainText("\n".join(self._ui_events))
+        layout.addWidget(console, 1)
+        buttons = QHBoxLayout()
+        clear = QPushButton("Pulisci")
+        clear.clicked.connect(lambda: (self._ui_events.clear(), console.clear()))
+        close = QPushButton("Chiudi")
+        close.setObjectName("primary")
+        close.clicked.connect(dialog.accept)
+        buttons.addWidget(clear)
+        buttons.addStretch()
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self._show_modeless(dialog)
+
+    def show_settings(self) -> None:
+        self._log_action("Apertura Impostazioni")
+        current = self.service.settings()
+        dialog = KerberusDialog("Impostazioni", self, 590)
+        layout = dialog.body_layout
+        eyebrow = QLabel("PRIVACY E INVITI")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Codice contatto")
+        title.setObjectName("dialogTitle")
+        description = QLabel(
+            "Scegli per quanto tempo resta stabile il codice. La destination I2P non cambia; "
+            "cambia soltanto il token di invito autenticato."
+        )
+        description.setObjectName("muted")
+        description.setWordWrap(True)
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        interval_label = QLabel("INTERVALLO DI ROTAZIONE")
+        interval_label.setObjectName("eyebrow")
+        interval = QComboBox()
+        for minutes, label in ((1, "Ogni minuto"), (5, "Ogni 5 minuti"), (15, "Ogni 15 minuti"), (60, "Ogni ora")):
+            interval.addItem(label, minutes)
+            if minutes == current["contact_code_period_minutes"]:
+                interval.setCurrentIndex(interval.count() - 1)
+        single_use = QCheckBox("Ruota immediatamente dopo il primo utilizzo")
+        single_use.setChecked(current["contact_code_single_use"])
+        hint = QLabel("Consigliato: limita il riutilizzo accidentale di un invito condiviso.")
+        hint.setObjectName("muted")
+        layout.addSpacing(8)
+        layout.addWidget(interval_label)
+        layout.addWidget(interval)
+        layout.addWidget(single_use)
+        layout.addWidget(hint)
+        layout.addSpacing(10)
+        diagnostics_label = QLabel("DIAGNOSTICA LOCALE")
+        diagnostics_label.setObjectName("eyebrow")
+        console_button = QPushButton("Apri Console UI")
+        console_button.setIcon(lucide_icon("terminal"))
+        console_button.clicked.connect(self.show_ui_console)
+        layout.addWidget(diagnostics_label)
+        layout.addWidget(console_button)
+        actions = QHBoxLayout()
+        cancel = QPushButton("Annulla")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(dialog.reject)
+        save = QPushButton("Salva impostazioni")
+        save.setObjectName("primary")
+        save.clicked.connect(dialog.accept)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+        def save_settings() -> None:
+            self.service.update_settings(int(interval.currentData()), single_use.isChecked())
+            self._log_action("Impostazioni privacy salvate")
+            self.statusBar().showMessage("Impostazioni salvate · codice contatto aggiornato", 5000)
+
+        dialog.accepted.connect(save_settings)
+        self._show_modeless(dialog)
+
     def show_profile(self) -> None:
+        self._log_action("Apertura Profilo")
         identity = self.service.identity()
         if not identity:
             return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Il mio profilo")
-        dialog.setFixedWidth(720)
-        layout = QVBoxLayout(dialog)
+        dialog = KerberusDialog("Il mio profilo", self, 720)
+        layout = dialog.body_layout
         layout.setContentsMargins(30, 28, 30, 28)
         layout.setSpacing(12)
         eyebrow = QLabel("PROFILO KERBERUS")
@@ -923,11 +1292,35 @@ class KerberusWindow(QMainWindow):
 
         choose_photo.clicked.connect(choose_avatar)
         remove_photo.clicked.connect(remove_avatar)
-        crypto_id = QLabel(f"ID crittografico  {identity.identity_id}")
+        crypto_row = QHBoxLayout()
+        crypto_id = QLabel()
         crypto_id.setObjectName("muted")
         crypto_id.setWordWrap(True)
-        crypto_id.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(crypto_id)
+        reveal_id = QToolButton()
+        reveal_id.setIcon(lucide_icon("eye"))
+        reveal_id.setIconSize(QSize(17, 17))
+        reveal_id.setFixedSize(34, 34)
+        identity_visible = True
+
+        def toggle_identity() -> None:
+            nonlocal identity_visible
+            identity_visible = not identity_visible
+            if identity_visible:
+                crypto_id.setText(f"ID crittografico  {identity.identity_id}")
+                crypto_id.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                reveal_id.setIcon(lucide_icon("eye-off"))
+                reveal_id.setToolTip("Nascondi ID crittografico")
+            else:
+                crypto_id.setText("ID crittografico  " + "*" * 32)
+                crypto_id.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+                reveal_id.setIcon(lucide_icon("eye"))
+                reveal_id.setToolTip("Mostra ID crittografico")
+
+        reveal_id.clicked.connect(toggle_identity)
+        toggle_identity()
+        crypto_row.addWidget(crypto_id, 1)
+        crypto_row.addWidget(reveal_id, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(crypto_row)
         layout.addSpacing(14)
         code_label = QLabel("CODICE CONTATTO")
         code_label.setObjectName("eyebrow")
@@ -971,8 +1364,12 @@ class KerberusWindow(QMainWindow):
                 if code.toPlainText() != current:
                     code.setPlainText(current)
                     copy.setText("Copia codice")
-                seconds = 60 - int(time.time() % 60)
-                expiry.setText(f"Monouso · nuovo codice tra {seconds} secondi")
+                settings = self.service.settings()
+                period_seconds = settings["contact_code_period_minutes"] * 60
+                elapsed = max(0, int(time.time()) - settings["contact_code_anchor_time"])
+                seconds = period_seconds - (elapsed % period_seconds)
+                policy = "Monouso" if settings["contact_code_single_use"] else "Riutilizzabile nel periodo"
+                expiry.setText(f"{policy} · nuovo codice tra {seconds} secondi")
             except Exception:
                 code.setPlainText("In attesa della connessione I2P")
                 expiry.setText("Codice non disponibile")
@@ -980,12 +1377,15 @@ class KerberusWindow(QMainWindow):
         timer.timeout.connect(refresh_code)
         timer.start(1000)
         refresh_code()
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        def save_profile() -> None:
             self._run_task(
                 lambda: self.service.update_profile(username.text(), avatar_data),
                 self._profile_saved,
                 lambda error: self._error("Profilo", error),
             )
+
+        dialog.accepted.connect(save_profile)
+        self._show_modeless(dialog)
 
     @staticmethod
     def _normalize_avatar(path: Path) -> str:
@@ -1018,6 +1418,7 @@ class KerberusWindow(QMainWindow):
         self.statusBar().showMessage("Profilo firmato e aggiornato", 5000)
 
     def import_contact(self) -> None:
+        self._log_action("Importazione profilo richiesta")
         path, _ = QFileDialog.getOpenFileName(self, "Importa profilo", "", "Profilo Kerberus (*.kbid *.json);;Tutti i file (*.*)")
         if not path:
             return
@@ -1029,6 +1430,7 @@ class KerberusWindow(QMainWindow):
             self._error("Profilo non valido", str(exc))
 
     def export_identity(self, parent: QWidget | None = None) -> None:
+        self._log_action("Esportazione profilo richiesta")
         identity = self.service.identity()
         if not identity:
             return
@@ -1040,6 +1442,11 @@ class KerberusWindow(QMainWindow):
         if self._connecting:
             return
         self._connecting = True
+        self._log_action("Connessione I2P avviata")
+        if hasattr(self, "router_dot"):
+            self.router_dot.setStyleSheet(f"background: {COLORS['warning']}; border-radius: 4px;")
+            self.router_text.setText("I2P: connessione...")
+            self.router_meta.setText("Avvio router e tunnel")
 
         def work() -> None:
             try:
@@ -1066,18 +1473,19 @@ class KerberusWindow(QMainWindow):
         color = COLORS["accent"] if connected else COLORS["danger"]
         self.router_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
         self.router_text.setText("I2P: connesso" if connected else "I2P: non connesso")
+        self.router_meta.setText("Tunnel pronto · SAM locale" if connected else "Nuovo tentativo tra 10 s")
         self.router_text.setToolTip(detail)
+        self._log_action("I2P connesso" if connected else "Connessione I2P non riuscita")
         if connected:
             self.statusBar().showMessage("Canale I2P pronto", 3500)
         else:
             QTimer.singleShot(10000, self.connect_router)
 
     def show_i2p_info(self) -> None:
+        self._log_action("Apertura Stato I2P")
         identity = self.service.identity()
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Stato I2P")
-        dialog.setFixedWidth(620)
-        layout = QVBoxLayout(dialog)
+        dialog = KerberusDialog("Stato I2P", self, 620)
+        layout = dialog.body_layout
         layout.setContentsMargins(28, 26, 28, 26)
         layout.setSpacing(12)
         header = QHBoxLayout()
@@ -1093,10 +1501,18 @@ class KerberusWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header.addWidget(icon, alignment=Qt.AlignmentFlag.AlignTop)
         header.addLayout(title_box, 1)
+        state_badge = QLabel("ONLINE" if self._router_connected else "OFFLINE")
+        state_badge.setStyleSheet(
+            f"background: {COLORS['accent_dark'] if self._router_connected else '#552a30'}; "
+            f"color: {COLORS['accent'] if self._router_connected else COLORS['danger']}; "
+            "border-radius: 7px; padding: 5px 9px; font-size: 11px; font-weight: 800;"
+        )
+        header.addWidget(state_badge, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
         layout.addSpacing(8)
 
         destination = "Non disponibile"
+        queues = self.service.queue_status()
         if identity and identity.destination:
             try:
                 destination = destination_b32(identity.destination)
@@ -1110,6 +1526,10 @@ class KerberusWindow(QMainWindow):
             ("Messaggi", "X25519 + ML-KEM-768 · XChaCha20-Poly1305"),
             ("Identità", "Ed25519 · profili firmati"),
             ("Metadati", "Padding a bucket · anti-replay · timestamp cifrati"),
+            (
+                "Code locali",
+                f"{queues['messages']} messaggi · {queues['contacts']} contatti · {queues['control']} conferme",
+            ),
             ("Ultimo evento", self.service.last_protocol_event),
         )
         for label, value in details:
@@ -1130,29 +1550,49 @@ class KerberusWindow(QMainWindow):
         reconnect = QPushButton("Riconnetti")
         reconnect.setIcon(lucide_icon("refresh-cw"))
         reconnect.clicked.connect(lambda: (dialog.accept(), self.connect_router()))
+        retry = QPushButton("Riprova code")
+        retry.clicked.connect(lambda: (dialog.accept(), self._retry_queues()))
         close = QPushButton("Chiudi")
         close.setObjectName("primary")
         close.clicked.connect(dialog.accept)
         actions.addWidget(reconnect)
+        actions.addWidget(retry)
         actions.addStretch()
         actions.addWidget(close)
         layout.addLayout(actions)
-        dialog.exec()
+        self._show_modeless(dialog)
+
+    def _retry_queues(self) -> None:
+        status = self.service.retry_all_now()
+        self._log_action("Retry manuale delle code I2P")
+        self.statusBar().showMessage(
+            f"Retry avviato: {status['messages']} messaggi, {status['contacts']} contatti, {status['control']} conferme",
+            8000,
+        )
 
     def router_setup(self) -> None:
         if self.service.sam.available():
             self.connect_router()
             return
-        answer = QMessageBox.question(
-            self,
-            "Installa I2P",
-            f"Scaricare l'installer ufficiale I2P {I2P_VERSION} e verificarne la checksum SHA-256?",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        if os.name != "nt":
+            RouterInstaller.ensure_sam_enabled()
+            if RouterInstaller.start_installed():
+                self.statusBar().showMessage("Router I2P avviato · attendo il bridge SAM", 8000)
+                QTimer.singleShot(1500, self.connect_router)
+                return
+            KerberusMessageDialog.show_message(
+                self,
+                "Configura I2P su Linux",
+                "Installa I2P dal repository ufficiale della distribuzione, avvialo con “i2prouter start” "
+                "e verifica che SAM ascolti soltanto su 127.0.0.1:7656. Kerberus ha già preparato la "
+                "configurazione utente in ~/.i2p/clients.config.d/.",
+            )
             return
-        self._download_dialog = QProgressDialog("Download e verifica I2P...", "Annulla", 0, 100, self)
-        self._download_dialog.setWindowTitle("Configurazione I2P")
-        self._download_dialog.setAutoClose(False)
+        if not KerberusMessageDialog.ask(
+            self, "Installa I2P", f"Scaricare l'installer ufficiale I2P {I2P_VERSION} e verificarne la checksum SHA-256?"
+        ):
+            return
+        self._download_dialog = KerberusProgressDialog("Configurazione I2P", "Download e verifica I2P...", self)
         self._download_dialog.show()
 
         def download() -> Path:
@@ -1172,7 +1612,7 @@ class KerberusWindow(QMainWindow):
             self._download_dialog.close()
             self._download_dialog = None
         path = Path(value)
-        if QMessageBox.question(self, "I2P verificato", "Checksum valida. Avviare l'installer?") == QMessageBox.StandardButton.Yes:
+        if KerberusMessageDialog.ask(self, "I2P verificato", "Checksum valida. Avviare l'installer?"):
             RouterInstaller.launch_installer(path)
 
     def _download_failed(self, error: str) -> None:
@@ -1210,18 +1650,16 @@ class KerberusWindow(QMainWindow):
         thread.start()
 
     def _error(self, title: str, message: str) -> None:
-        QMessageBox.critical(self, title, message)
+        self._log_action(f"Errore UI: {title}")
+        KerberusMessageDialog.show_message(self, title, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._allow_close:
-            answer = QMessageBox.question(
+            if not KerberusMessageDialog.ask(
                 self,
                 "Chiudi Kerberus",
                 "Chiudere Kerberus e arrestare anche il router I2P? Tutte le comunicazioni I2P verranno interrotte.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+            ):
                 event.ignore()
                 return
             self._allow_close = True

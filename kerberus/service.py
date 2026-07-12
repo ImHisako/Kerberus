@@ -13,7 +13,7 @@ from .crypto import (
     IdentityBundle,
     IdentitySecrets,
     generate_identity,
-    open_message,
+    open_message_payload,
     profile_destination,
     rotating_contact_code,
     seal_message,
@@ -31,7 +31,7 @@ class MessengerService:
         self.config = config
         self.vault = Vault(config.vault_path)
         self.sam = SamClient(config.sam_host, config.sam_port, config.sam_keys_path)
-        self.on_message: Callable[[], None] | None = None
+        self.on_message: Callable[[str, str], None] | None = None
         self.on_contacts_changed: Callable[[str], None] | None = None
         self.on_protocol_event: Callable[[str, str], None] | None = None
         self.last_protocol_event = "Nessuna richiesta elaborata in questa sessione"
@@ -69,14 +69,79 @@ class MessengerService:
             update_destination(identity, self.secrets(), active)
             self.vault.state["identity"] = identity.to_dict()
             self.vault.save()
+        self.sam.set_receiver(self._receive_safely)
         if self._listener is None or not self._listener.is_alive():
-            self._listener = threading.Thread(target=self.sam.listen, args=(self._receive,), daemon=True)
+            self._listener = threading.Thread(target=self.sam.listen, args=(self._receive_safely,), daemon=True)
             self._listener.start()
         if self._delivery_thread is None or not self._delivery_thread.is_alive():
             self._stop_delivery.clear()
             self._delivery_thread = threading.Thread(target=self._delivery_loop, daemon=True)
             self._delivery_thread.start()
+        self.retry_all_now()
+        self.warm_recent_contacts()
         return active
+
+    def _receive_safely(self, payload: bytes) -> bytes | None:
+        try:
+            return self._receive(payload, inline_reply=True)
+        except Exception as exc:
+            self._emit_protocol_event("receive_error", f"Frame I2P ricevuto ma rifiutato: {type(exc).__name__}")
+            return None
+
+    def queue_status(self) -> dict[str, int]:
+        with self._state_lock:
+            return {
+                "messages": len(self.vault.state.get("outbox", [])),
+                "contacts": len(self.vault.state.get("pending", {})),
+                "control": len(self.vault.state.get("control_outbox", [])),
+            }
+
+    def retry_all_now(self) -> dict[str, int]:
+        with self._state_lock:
+            for entry in self.vault.state.get("outbox", []):
+                entry["last_attempt"] = 0
+            for entry in self.vault.state.get("pending", {}).values():
+                entry["last_attempt"] = 0
+            for entry in self.vault.state.get("control_outbox", []):
+                entry["last_attempt"] = 0
+            status = self.queue_status()
+            self.vault.save()
+        self.flush_control_outbox(background=True)
+        self.flush_pending_contacts(background=True)
+        self.flush_outbox(background=True)
+        self._emit_protocol_event(
+            "queues_retried",
+            f"Retry immediato: {status['messages']} messaggi, {status['contacts']} contatti, {status['control']} conferme",
+        )
+        return status
+
+    def warm_contact(self, contact_id: str) -> None:
+        contact = self.vault.state.get("contacts", {}).get(contact_id)
+        if not contact or not hasattr(self.sam, "warm"):
+            return
+        destination = contact.get("destination", "")
+        if destination:
+            self._submit_delivery("warm", contact_id, self._warm_destination, destination)
+
+    def warm_recent_contacts(self, limit: int = 8) -> None:
+        recent_ids: list[str] = []
+        for message in reversed(self.vault.state.get("messages", [])):
+            contact_id = message.get("contact_id", "")
+            if contact_id and contact_id not in recent_ids:
+                recent_ids.append(contact_id)
+            if len(recent_ids) >= limit:
+                break
+        for contact_id in recent_ids:
+            self.warm_contact(contact_id)
+
+    def _warm_destination(self, destination: str) -> bool:
+        try:
+            self.sam.warm(destination)
+            return True
+        except Exception:
+            # Il warm-up è solo un'ottimizzazione. SAM può non essere ancora
+            # pronto durante l'avvio e il normale invio aprirà lo stream dopo.
+            return False
 
     def import_contact(self, raw: str) -> IdentityBundle:
         if len(raw.encode("utf-8")) > 300_000:
@@ -102,7 +167,38 @@ class MessengerService:
         identity = self.identity()
         if not identity:
             raise RuntimeError("Identità non configurata")
-        return rotating_contact_code(identity, self.secrets())
+        settings = self.settings()
+        return rotating_contact_code(
+            identity,
+            self.secrets(),
+            period_minutes=settings["contact_code_period_minutes"],
+            generation=settings["contact_code_generation"],
+            anchor_time=settings["contact_code_anchor_time"],
+        )
+
+    def settings(self) -> dict:
+        settings = self.vault.state.setdefault("settings", {})
+        settings.setdefault("contact_code_period_minutes", 1)
+        settings.setdefault("contact_code_single_use", True)
+        settings.setdefault("contact_code_generation", 0)
+        settings.setdefault("contact_code_anchor_time", int(time.time()))
+        return dict(settings)
+
+    def update_settings(self, period_minutes: int, single_use: bool) -> dict:
+        if period_minutes not in (1, 5, 15, 60):
+            raise ValueError("Intervallo codice non supportato")
+        with self._state_lock:
+            settings = self.vault.state.setdefault("settings", {})
+            if settings.get("contact_code_period_minutes", 1) != period_minutes:
+                settings["contact_code_generation"] = int(settings.get("contact_code_generation", 0)) + 1
+                settings["contact_code_anchor_time"] = int(time.time())
+            settings["contact_code_period_minutes"] = period_minutes
+            settings["contact_code_single_use"] = bool(single_use)
+            settings.setdefault("contact_code_generation", 0)
+            settings.setdefault("contact_code_anchor_time", int(time.time()))
+            self.vault.save()
+        self._emit_protocol_event("settings_updated", "Impostazioni privacy aggiornate")
+        return dict(settings)
 
     def update_profile(self, name: str, avatar_data: str) -> IdentityBundle:
         identity = self.identity()
@@ -167,6 +263,10 @@ class MessengerService:
                 "direction": "out",
                 "text": text,
                 "time": now,
+                "sent_at": now,
+                "received_at": None,
+                "delivered_at": None,
+                "recipient_received_at": None,
                 "status": "pending",
             })
             self.vault.state["outbox"].append({
@@ -181,11 +281,11 @@ class MessengerService:
             self.vault.state["outbox"] = self.vault.state["outbox"][-10_000:]
             self.vault.save()
         if self.on_message:
-            self.on_message()
+            self.on_message("new", contact_id)
         sent = self._attempt_outbox(message_id, force=True)
         return "sent" if sent else "queued"
 
-    def _receive(self, payload: bytes) -> None:
+    def _receive(self, payload: bytes, inline_reply: bool = False) -> bytes | None:
         envelope = json.loads(payload.decode("utf-8"))
         message_type = envelope.get("type")
         if message_type == "contact_request":
@@ -221,17 +321,36 @@ class MessengerService:
         with self._state_lock:
             duplicate = message_id in self.vault.state["seen"]
         if duplicate:
-            self._send_message_ack(sender, message_id)
-            return
-        text = open_message(identity, self.secrets(), sender, envelope)
+            stored = next(
+                (message for message in self.vault.state["messages"] if message.get("message_id") == message_id),
+                {},
+            )
+            received_at = int(stored.get("received_at") or time.time())
+            if inline_reply:
+                return self._message_ack_payload(sender, message_id, received_at)
+            self._send_message_ack(sender, message_id, received_at)
+            return None
+        clear = open_message_payload(identity, self.secrets(), sender, envelope)
+        received_at = int(time.time())
         with self._state_lock:
             self.vault.state["seen"].append(message_id)
             self.vault.state["seen"] = self.vault.state["seen"][-10000:]
-            self._store_message(sender_id, "in", text, message_id=message_id, status="received")
+            self._store_message(
+                sender_id,
+                "in",
+                clear["text"],
+                message_id=message_id,
+                status="received",
+                sent_at=clear["sent_at"],
+                received_at=received_at,
+            )
         self._emit_protocol_event("message_received", f"Messaggio cifrato ricevuto da {sender.name}")
-        self._send_message_ack(sender, message_id)
         if self.on_message:
-            self.on_message()
+            self.on_message("new", sender_id)
+        if inline_reply:
+            return self._message_ack_payload(sender, message_id, received_at)
+        self._send_message_ack(sender, message_id, received_at)
+        return None
 
     def _validated_contact(self, value: dict) -> IdentityBundle:
         contact = IdentityBundle.from_dict(value)
@@ -246,6 +365,7 @@ class MessengerService:
             self.vault.save()
         if self.on_contacts_changed:
             self.on_contacts_changed(contact.identity_id)
+        self.warm_contact(contact.identity_id)
 
     def _receive_contact_request(self, envelope: dict) -> None:
         sender = self._validated_contact(envelope["sender"])
@@ -312,10 +432,15 @@ class MessengerService:
             return
         self._save_contact(sender)
 
-    def _send_message_ack(self, sender: IdentityBundle, message_id: str) -> None:
+    def _send_message_ack(self, sender: IdentityBundle, message_id: str, received_at: int) -> None:
+        envelope = self._message_ack(sender, message_id, received_at)
+        if envelope:
+            self._queue_control(sender.destination, envelope, background=True)
+
+    def _message_ack(self, sender: IdentityBundle, message_id: str, received_at: int) -> dict | None:
         identity = self.identity()
         if not identity:
-            return
+            return None
         ack = {
             "version": 1,
             "type": "message_ack",
@@ -323,8 +448,16 @@ class MessengerService:
             "sender_id": identity.identity_id,
             "recipient_id": sender.identity_id,
         }
-        envelope = {**ack, "signature": sign_control(self.secrets(), ack)}
-        self._queue_control(sender.destination, envelope, background=True)
+        timing = {**ack, "received_at": received_at}
+        return {
+            **timing,
+            "signature": sign_control(self.secrets(), ack),
+            "timing_signature": sign_control(self.secrets(), timing),
+        }
+
+    def _message_ack_payload(self, sender: IdentityBundle, message_id: str, received_at: int) -> bytes | None:
+        envelope = self._message_ack(sender, message_id, received_at)
+        return json.dumps(envelope, separators=(",", ":")).encode("utf-8") if envelope else None
 
     def _receive_message_ack(self, envelope: dict) -> None:
         message_id = envelope.get("message_id", "")
@@ -335,8 +468,22 @@ class MessengerService:
         contact_data = self.vault.state["contacts"].get(sender_id)
         if not identity or not contact_data or envelope.get("recipient_id") != identity.identity_id:
             return
-        signed = {key: envelope[key] for key in ("version", "type", "message_id", "sender_id", "recipient_id")}
-        verify_control(IdentityBundle.from_dict(contact_data), signed, envelope.get("signature", ""))
+        signed_keys = ("version", "type", "message_id", "sender_id", "recipient_id")
+        signed = {key: envelope[key] for key in signed_keys}
+        contact = IdentityBundle.from_dict(contact_data)
+        verify_control(contact, signed, envelope.get("signature", ""))
+        verified_received_at = None
+        remote_received = envelope.get("received_at")
+        if isinstance(remote_received, int) and remote_received >= 0:
+            try:
+                verify_control(
+                    contact,
+                    {**signed, "received_at": remote_received},
+                    envelope.get("timing_signature", ""),
+                )
+                verified_received_at = remote_received
+            except Exception:
+                pass
         with self._state_lock:
             pending_ids = {item["message_id"] for item in self.vault.state["outbox"]}
             if message_id not in pending_ids:
@@ -347,10 +494,13 @@ class MessengerService:
             for message in self.vault.state["messages"]:
                 if message.get("message_id") == message_id and message.get("direction") == "out":
                     message["status"] = "delivered"
+                    message["delivered_at"] = int(time.time())
+                    if verified_received_at is not None:
+                        message["recipient_received_at"] = verified_received_at
                     break
             self.vault.save()
         if self.on_message:
-            self.on_message()
+            self.on_message("status", sender_id)
 
     def _delivery_loop(self) -> None:
         while not self._stop_delivery.is_set():
@@ -444,7 +594,7 @@ class MessengerService:
             if not entry:
                 return True
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
-            retry_after = min(300, 5 * (2 ** min(prior_attempts, 6)))
+            retry_after = min(60, 5 * (2 ** min(prior_attempts, 4)))
             if not force and now - entry.get("last_attempt", 0) < retry_after:
                 return False
             entry["last_attempt"] = now
@@ -505,7 +655,7 @@ class MessengerService:
             if not entry:
                 return True
             prior_attempts = max(entry.get("attempts", 0) - 1, 0)
-            retry_after = min(300, 5 * (2 ** min(prior_attempts, 6)))
+            retry_after = min(60, 5 * (2 ** min(prior_attempts, 4)))
             if not force and now - entry.get("last_attempt", 0) < retry_after:
                 return False
             entry["last_attempt"] = now
@@ -526,23 +676,19 @@ class MessengerService:
                         message["status"] = "sent"
                         break
                 self.vault.save()
-        self._emit_protocol_event("message_stream_sent", "Messaggio inviato allo stream I2P; attendo l'ACK firmato")
+        if still_pending:
+            self._emit_protocol_event("message_stream_sent", "Messaggio inviato; attendo conferma dal destinatario")
+        else:
+            self._emit_protocol_event("message_delivered", "Messaggio consegnato e confermato")
         if self.on_message:
-            self.on_message()
+            self.on_message("status", entry["contact_id"])
         return True
 
     def _consume_contact_code(self, supplied: str, sender_id: str = "") -> bool:
         normalized = supplied.strip().upper()
-        current_minute = int(time.time() // 60)
         identity = self.identity()
         if not identity:
             raise RuntimeError("Identità non configurata")
-        expected_codes = (
-            rotating_contact_code(identity, self.secrets(), current_minute - offset).upper()
-            for offset in range(10)
-        )
-        if not any(hmac.compare_digest(normalized, expected) for expected in expected_codes):
-            raise ValueError("Codice contatto scaduto o non valido")
         fingerprint = hashlib.sha256(normalized.encode("ascii")).hexdigest()
         with self._state_lock:
             used = self.vault.state["used_contact_codes"]
@@ -553,9 +699,30 @@ class MessengerService:
                     if sender_id and hmac.compare_digest(entry.get("sender_id", ""), sender_id):
                         return True
                     raise ValueError("Codice contatto già utilizzato")
-            used.append({"fingerprint": fingerprint, "sender_id": sender_id})
-            self.vault.state["used_contact_codes"] = used[-5000:]
-            self.vault.save()
+            settings = self.settings()
+            period = settings["contact_code_period_minutes"]
+            generation = settings["contact_code_generation"]
+            anchor_time = settings["contact_code_anchor_time"]
+            current_time = int(time.time())
+            expected_codes = (
+                rotating_contact_code(
+                    identity,
+                    self.secrets(),
+                    period_minutes=period,
+                    generation=generation,
+                    anchor_time=anchor_time,
+                    timestamp=current_time - offset * period * 60,
+                ).upper()
+                for offset in range(2)
+            )
+            if not any(hmac.compare_digest(normalized, expected) for expected in expected_codes):
+                raise ValueError("Codice contatto scaduto o non valido")
+            if settings["contact_code_single_use"]:
+                used.append({"fingerprint": fingerprint, "sender_id": sender_id})
+                self.vault.state["used_contact_codes"] = used[-5000:]
+                self.vault.state["settings"]["contact_code_generation"] = generation + 1
+                self.vault.state["settings"]["contact_code_anchor_time"] = current_time
+                self.vault.save()
         return False
 
     def _store_message(
@@ -565,6 +732,8 @@ class MessengerService:
         text: str,
         message_id: str = "",
         status: str = "received",
+        sent_at: int | None = None,
+        received_at: int | None = None,
     ) -> None:
         with self._state_lock:
             self.vault.state["messages"].append({
@@ -572,7 +741,11 @@ class MessengerService:
                 "contact_id": contact_id,
                 "direction": direction,
                 "text": text,
-                "time": int(time.time()),
+                "time": sent_at if sent_at is not None else int(time.time()),
+                "sent_at": sent_at if sent_at is not None else int(time.time()),
+                "received_at": received_at,
+                "delivered_at": None,
+                "recipient_received_at": None,
                 "status": status,
             })
             self.vault.save()
