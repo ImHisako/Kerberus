@@ -1,113 +1,313 @@
 # Kerberus
 
-Kerberus è un messenger desktop sperimentale che comunica attraverso I2P usando SAM v3. L'applicazione è scritta in Python con PyQt6 e conserva identità, contatti e cronologia in un vault locale cifrato.
+**Private, direct desktop messaging over I2P with hybrid post-quantum encryption.**
 
-> Kerberus è ancora un progetto in sviluppo e non è stato sottoposto a un audit di sicurezza indipendente. Non promette anonimato assoluto e non deve ancora essere usato per proteggere persone o dati ad alto rischio.
+[Italiano](README.it.md) · [Architecture decisions](docs/adr/) · [I2P SAM documentation](https://i2p.net/en/docs/api/samv3/)
 
-## Funzionalità
+Kerberus is an experimental peer-to-peer messenger for Windows and Linux. It combines I2P transport, self-sovereign signed identities, hybrid X25519 + ML-KEM-768 message encryption, a persistent Double Ratchet, and an encrypted local vault. There is no Kerberus account service, central contact directory, message database, analytics endpoint, or cloud mailbox.
 
-- Interfaccia desktop PyQt6 senza cornice di sistema su Windows e Linux.
-- Router I2P 2.12.0 tramite SAM v3 su `127.0.0.1:7656`.
-- Installazione automatica di I2P e, quando necessario, Azul Zulu JDK 26.
-- Identità self-sovereign firmate con Ed25519.
-- Cifratura messaggi ibrida X25519 + ML-KEM-768.
-- Payload protetti con XChaCha20-Poly1305.
-- Double Ratchet v2 persistente con ratchet DH X25519, cancellazione delle chiavi usate e supporto limitato ai messaggi fuori ordine.
-- Codici contatto con rotazione configurabile (1, 5, 15 o 60 minuti) e opzione monouso.
-- Impostazioni integrate e console UI locale con log delle azioni privo di contenuti dei messaggi.
-- Username e foto profilo firmati.
-- Cronologia e outbox salvate nel vault cifrato.
-- ACK firmati, anti-replay e retry automatici.
-- Ricevute di consegna e lettura cifrate end-to-end, disattivabili globalmente o per chat.
-- Spunte di stato, reazioni cifrate, selettore emoji, impostazioni per chat e tray desktop.
-- Esportazione diagnostica per chat in JSON con cronologia completa, timestamp, stati, reazioni e delay; chiavi e stato ratchet sono esclusi.
-- Anteprime link opzionali con metadata Open Graph, miniature e apertura esplicita; disattivate per impostazione predefinita.
-- Stream I2P persistenti e riutilizzati tra contatti per ridurre la latenza.
-- Helper nativo Go incluso nelle release per multiplexare invio, ricezione e ACK sugli stream SAM senza richiedere Go sul PC dell'utente.
-- Apertura stream 0-RTT: il primo frame può viaggiare nel SYN I2P Streaming.
-- Messaggi mostrati immediatamente nella UI prima della consegna di rete.
-- Controllo aggiornamenti GitHub Releases con anti-rollback e verifica SHA-256.
-- Menu contestuale dei messaggi per copiare, eliminare localmente o inoltrare con una nuova cifratura.
+> [!WARNING]
+> Kerberus is under active development and has not received an independent security audit. It is not a guarantee of anonymity and should not yet be relied upon to protect high-risk people, operations, or data. Read [Security boundaries and limitations](#security-boundaries-and-limitations) before using it.
 
-## Come funziona
+## Why Kerberus
+
+Kerberus is designed around a small set of principles:
+
+- **Direct communication:** messages travel between I2P destinations instead of through a Kerberus server.
+- **Local ownership:** identity keys, contacts, history, queues, preferences, and ratchet state stay in an encrypted vault on the device.
+- **Layered cryptography:** transport anonymity, hybrid per-message encryption, signatures, and ratcheting solve different parts of the problem.
+- **Privacy controls:** delivery receipts, read receipts, notifications, and link previews can be controlled globally or per conversation.
+- **Honest security claims:** Kerberus documents what it protects, what remains observable, and which components have not been independently reviewed.
+
+## Feature overview
+
+| Area | Capabilities |
+|---|---|
+| Messaging | Direct text messages, encrypted local outbox, automatic retry, forwarding with fresh encryption, local deletion, delivery and read states |
+| Identity | Ed25519-signed profiles, stable cryptographic identity ID, username, avatar, persistent I2P destination |
+| Contacts | Rotating contact codes, optional single use, signed request/accept/reject controls, pending-request cancellation |
+| Encryption | X25519 + ML-KEM-768 hybrid envelope, XChaCha20-Poly1305, Ed25519 authentication, Double Ratchet v3, bounded out-of-order support |
+| Privacy | No application telemetry, encrypted receipts and reactions, per-chat overrides, optional link previews, padded plaintext buckets |
+| Interface | PyQt6 desktop UI, Italian and English, searchable Unicode emoji picker, reactions, profile pictures and usernames on messages, system tray |
+| Diagnostics | Local UI event console, explicit connection errors, per-chat JSON export with timestamps and delay measurements |
+| Transport | I2P SAM v3, persistent session and streams, native Go multiplexer with Python fallback, full-duplex inline replies |
+| Platforms | Standalone Windows installer and Linux portable builds, source execution on Python 3.11+ |
+
+## Messaging experience
+
+### Reliable local outbox
+
+A message is written to the encrypted vault before network delivery is attempted. If the recipient, destination, or LeaseSet is temporarily unavailable, the ciphertext remains queued and Kerberus retries it with bounded backoff. A successful write to the local SAM socket is shown as **Sent**, not **Delivered**; only an authenticated end-to-end receipt can mark it as delivered.
+
+Message states are:
+
+- **Pending** — safely stored in the vault and waiting for a send attempt or ratchet handshake.
+- **Sent** — handed to the I2P stream; no recipient receipt has arrived yet.
+- **Delivered** — the recipient returned an encrypted delivery receipt.
+- **Read** — the recipient returned an encrypted read receipt; the double ticks turn blue.
+
+Delivery and read receipts can be disabled globally or for an individual conversation.
+
+### Reactions and emoji
+
+Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Reactions are encrypted inside the ratchet channel. Selecting the same reaction again removes the local user's reaction and sends an authenticated removal event to the peer.
+
+### Message actions
+
+The context menu on a message supports:
+
+- copying plaintext to the system clipboard;
+- forwarding it as a completely new encrypted message without original-sender metadata;
+- deleting the local copy and any unsent outbox entry;
+- adding or removing an encrypted reaction;
+- inspecting send, receive, delivery, and read timing.
+
+Deleting a delivered message cannot erase the peer's copy. Clipboard contents are outside the vault and may be visible to the operating system or other local applications.
+
+### Profiles and conversation UI
+
+Every message displays the sender's signed username and avatar. Avatars are signed as part of the public profile and limited to a small PNG payload. Long conversations initially render the newest 160 messages; older history can be loaded incrementally to keep the UI responsive.
+
+The application supports Italian and English. The selected language is stored in the vault and applied on the next launch.
+
+## Contacts and identity verification
+
+Each installation creates a self-sovereign identity containing:
+
+- an Ed25519 signing public key;
+- an X25519 static exchange public key;
+- an ML-KEM-768 public key;
+- a persistent I2P destination;
+- a display name and optional PNG avatar;
+- an Ed25519 signature over the complete public profile.
+
+The identity ID is the SHA-256 digest of the Ed25519 public key. A profile cannot silently replace its signing key while retaining the same identity ID.
+
+### Contact codes
+
+A contact code binds a temporary authenticated token to the profile's `.b32.i2p` destination. The user can choose a rotation period of 1, 5, 15, or 60 minutes and can require immediate rotation after first use.
+
+The contact exchange provides the following controls:
+
+1. The requester signs the complete request, including a random request ID and target code.
+2. The recipient verifies the profile signature, rotating code, request signature, and remote I2P destination.
+3. Accept and reject controls are signed and bound to the original request ID.
+4. An acceptance is valid only while the matching local request is pending.
+5. The remote destination reported by SAM is matched against the signed profile destination.
+6. Replays are handled idempotently and cannot create an unsolicited accepted contact.
+
+Pending requests can be cancelled from the conversation list.
+
+## Architecture
 
 ```text
-PyQt6 UI
-   |
-MessengerService
-   |-- Vault cifrato (Argon2id + XChaCha20-Poly1305)
-   |-- Identità e protocollo E2EE
-   `-- SamClient
-          |-- helper Go nativo (CONNECT, ACCEPT, frame e ACK)
-          |-- listener Python avviato solo come fallback automatico
-          |
-          `-- I2P Router 2.12.0 / SAM 127.0.0.1:7656
+┌──────────────────────────────────────────────────────────────┐
+│ PyQt6 desktop interface                                     │
+│ conversations · profiles · privacy settings · diagnostics   │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+┌──────────────────────────────▼───────────────────────────────┐
+│ MessengerService                                             │
+│ contacts · ratchets · receipts · reactions · outbox · retry │
+├──────────────────────────────┬───────────────────────────────┤
+│ Encrypted vault              │ Application E2EE              │
+│ Argon2id                      │ Ed25519                        │
+│ XChaCha20-Poly1305            │ X25519 + ML-KEM-768           │
+│                               │ Double Ratchet v3             │
+└──────────────────────────────┴───────────────┬───────────────┘
+                                               │ encrypted frames
+┌──────────────────────────────────────────────▼───────────────┐
+│ SAM transport                                                 │
+│ native Go stream multiplexer · automatic Python fallback     │
+└──────────────────────────────────────────────┬───────────────┘
+                                               │ 127.0.0.1:7656
+┌──────────────────────────────────────────────▼───────────────┐
+│ I2P router · tunnels · LeaseSets · Streaming                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Kerberus mantiene una destination I2P persistente per profilo. Il codice contatto contiene l'indirizzo `.b32.i2p` derivato dalla destination, più un token temporaneo verificabile soltanto dal proprietario. Quando la richiesta viene accettata, i due client si scambiano i profili pubblici firmati e creano la conversazione.
+Kerberus maintains one long-lived SAM session for the local profile. The release build includes a dependency-free Go helper that keeps multiple accepts pending, multiplexes framed traffic, reuses streams, and permits replies on the same full-duplex stream. If the helper cannot start or exits, the Python transport takes over using the same application protocol and encrypted queues.
 
-Ogni messaggio viene cifrato per il destinatario e salvato localmente prima dell'invio. Se il peer o la sua LeaseSet non sono raggiungibili, il messaggio resta nella outbox cifrata e viene ritentato con backoff breve. Una ricevuta cifrata e autenticata lo marca come consegnato.
+## Cryptography and security design
 
-Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i contatti rimangono attivi. `SILENT=true` e un breve `connectDelay` permettono al primo frame di essere incluso nel SYN, evitando un round-trip applicativo. Kerberus usa tre tunnel in ingresso e uscita, un tunnel di backup e il profilo streaming interattivo. Non riduce la lunghezza dei tunnel per guadagnare velocità, perché cambierebbe il compromesso di anonimato. Queste impostazioni seguono le indicazioni delle documentazioni ufficiali [SAM v3](https://i2p.net/en/docs/api/samv3/), [I2CP](https://i2p.net/en/docs/specs/i2cp-overview/) e [Streaming](https://i2p.net/en/docs/api/streaming/).
+Kerberus deliberately uses multiple layers. They are complementary, not interchangeable.
 
-## Requisiti
+### 1. I2P transport layer
 
-- Windows 10/11 a 64 bit oppure Linux x86_64/aarch64 con ambiente desktop.
-- Connessione Internet.
-- Per lo sviluppo: Python 3.11 o successivo.
-- Solo per creare gli artefatti di release: Go 1.24 o successivo.
-- Per il router I2P standard: Java 17 o successivo. Kerberus non usa direttamente Java e l'installer lo aggiunge solo quando deve installare o aggiornare quel router.
+I2P provides destination addressing and routed tunnels intended to hide the participants' direct network locations from each other and from ordinary network observers. Kerberus connects to SAM v3 only on `127.0.0.1:7656`.
 
-## Installazione per utenti
+Transport settings include:
 
-### Windows
+- persistent I2P destination and long-lived SAM session;
+- three inbound and three outbound tunnels, plus one backup each;
+- default tunnel length retained — Kerberus does not enable zero-hop tunnels for lower latency;
+- `i2cp.leaseSetEncType=6,4` for ML-KEM-768/ECIES-X25519 LeaseSet compatibility in supported I2P versions;
+- interactive streaming profile, persistent peer streams, TCP no-delay, and keepalive;
+- `SILENT=true` with a short `connectDelay`, allowing the first frame to accompany stream establishment;
+- application receipts as the only authoritative delivery signal.
 
-1. Chiudi eventuali versioni precedenti di Kerberus.
-2. Avvia `KerberusInstaller.exe`.
-3. Accetta l'installazione di I2P e, solo se necessario al router standard, di Java.
-4. Avvia Kerberus dal desktop o dal menu Start.
-5. Crea il vault e attendi lo stato **I2P: connesso**.
+I2P protects the network route; it does not replace application-layer end-to-end encryption or endpoint security.
 
-`Kerberus.exe` e `KerberusInstaller.exe` includono Python, dipendenze native e helper Go: l'utente non deve installare Python o Go.
+### 2. Signed identities and controls
 
-L'installer scarica I2P 2.12.0 dal sito ufficiale e verifica la SHA-256 fissata nel codice. SAM viene configurato soltanto su loopback.
+Public profiles are signed with Ed25519. Contact requests, acceptances, rejections, legacy acknowledgements, and profile changes are authenticated before they affect local state. Message envelopes are also signed, binding the sender, recipient, random message ID, ephemeral key, ML-KEM ciphertext, nonce, and encrypted payload.
 
-La documentazione I2P distingue il pacchetto Windows standard, che richiede Java, dall'Easy Install Bundle che include un runtime privato. Questa release usa il pacchetto standard per mantenere l'integrazione con `I2Psvc.exe`; se I2P 2.12.0 è già presente, non scarica né installa Java.
+Ed25519 provides classical authentication. It is **not** a post-quantum signature scheme.
 
-### Linux
+### 3. Hybrid per-message envelope
 
-1. Installa I2P dal repository ufficiale della distribuzione e avvialo come utente con `i2prouter start`.
-2. Scarica `Kerberus-linux-<arch>` e `install-linux.sh` nella stessa cartella.
-3. Esegui `bash install-linux.sh`.
-4. Avvia Kerberus dal menu applicazioni o con `~/.local/bin/kerberus`.
+Every application message, receipt, reaction, or ratchet control is wrapped for the recipient using two key-agreement components:
 
-Kerberus configura SAM in `~/.i2p/clients.config.d/` e lo mantiene su `127.0.0.1:7656`. Per installazioni I2P gestite come servizio di sistema potrebbe essere necessario abilitare SAM dalla console router o nella directory configurata dalla distribuzione.
+1. a fresh ephemeral X25519 key exchange with the recipient's static X25519 public key;
+2. a fresh ML-KEM-768 encapsulation to the recipient's ML-KEM public key.
 
-## Build automatica
+Both shared secrets are combined with HKDF-SHA-512. The envelope payload is encrypted with XChaCha20-Poly1305, and the complete envelope is signed with Ed25519. A random 24-byte nonce is generated for every encryption.
 
-Il workflow GitHub Actions `.github/workflows/build.yml` esegue test e build sia su Windows sia su Linux. Produce installer Windows, binario Linux standalone, installer utente Linux e checksum; sui tag `v*` pubblica gli artefatti nella GitHub Release.
+The hybrid construction is intended to retain confidentiality if either X25519 or ML-KEM remains secure. This has not been formally verified as a complete protocol construction.
 
-All'avvio Kerberus controlla in background la release stabile più recente. Non accetta downgrade, scarica l'artefatto specifico della piattaforma e lo rende disponibile soltanto se la SHA-256 coincide con il manifest della stessa release. L'installazione richiede sempre una conferma esplicita; le release non hanno ancora una firma di code signing indipendente, quindi una compromissione dell'account o del workflow GitHub resta nel modello di minaccia.
+### 4. Double Ratchet v3
 
-## Avvio dal sorgente
+The encrypted envelope carries an inner persistent Double Ratchet channel:
 
-Apri PowerShell nella cartella del progetto:
+- X25519 DH ratchet keys;
+- HKDF-SHA-256 root-key updates;
+- independent HMAC-SHA-256 sending and receiving chains;
+- per-message keys used with XChaCha20-Poly1305;
+- authenticated ratchet headers as AEAD associated data;
+- transactional receive-state updates — failed authentication does not advance state;
+- at most 256 skipped message keys for bounded out-of-order delivery;
+- consumed message keys removed from the current state.
+
+Before the first user payload is encrypted, Kerberus completes a content-free authenticated handshake in which both peers contribute fresh ephemeral X25519 keys. User content remains queued in the vault until that handshake completes. This prevents the first application payload from being protected only by reconstructable long-term-key material.
+
+The ratchet is designed to provide classical forward secrecy and post-compromise recovery after subsequent honest DH steps. The ratchet itself is X25519-based and therefore **not post-quantum**. Kerberus should not be described as providing post-quantum forward secrecy.
+
+### 5. Padding and replay protection
+
+Clear payloads are padded into coarse size classes based on 512, 2,048, 8,192, or 32,768-byte buckets before envelope encryption. Padding reduces exact-length leakage but does not hide the existence, timing, direction, or approximate class of traffic.
+
+Message IDs are random 128-bit values. The vault keeps a bounded set of previously processed IDs, and ratchet counters plus AEAD authentication prevent a replay from being accepted as new content.
+
+### 6. Encrypted local vault
+
+The vault stores the identity secret keys, contacts, messages, outbox, control queues, preferences, and ratchet state.
+
+- A random salt and Argon2id derive a 256-bit vault key from the password.
+- The current implementation uses the PyNaCl `MODERATE` Argon2id operations and memory limits.
+- The full serialized state is encrypted with XChaCha20-Poly1305.
+- `KBV1` and the salt are authenticated as associated data.
+- Every write uses a fresh random nonce and atomic temporary-file replacement.
+- A minimum password length of 10 characters is enforced.
+
+The persistent private I2P destination is stored separately because SAM requires it when creating the transport session. Kerberus writes it atomically and restricts it to mode `0600` on POSIX; Windows relies on the user's profile-directory ACL. It is not encrypted by the vault password.
+
+Python does not guarantee secure zeroization of immutable key objects, so secrets may remain in process memory until reclaimed by the runtime.
+
+## Metadata and privacy
+
+Kerberus does not intentionally send telemetry, crash reports, analytics, address books, message history, or key material to a Kerberus-operated service. No such service exists in the current architecture.
+
+Application-level metadata reductions include:
+
+- random message and request identifiers;
+- padded plaintext size classes;
+- encrypted delivery receipts, read receipts, and reactions;
+- fresh hybrid encapsulation and nonce per envelope;
+- forwarding without original-sender or source-conversation metadata;
+- local-only UI diagnostics that exclude message bodies unless the user explicitly exports a chat.
+
+These measures do not make metadata disappear. The local I2P router, operating system, contacted peer, and a sufficiently capable traffic observer may still learn or infer timing, volume, online periods, destination reuse, and communication relationships.
+
+## Privacy controls
+
+Global and per-chat settings cover:
+
+- delivery receipts;
+- read receipts;
+- desktop notifications;
+- external link previews;
+- contact-code lifetime and single-use behavior.
+
+### Link previews
+
+Link previews are disabled by default. When enabled, Kerberus may contact a clearnet website directly to obtain HTML/Open Graph metadata and a limited-size image. The implementation:
+
+- accepts only HTTP and HTTPS;
+- rejects credentials embedded in URLs;
+- blocks localhost, `.local`, `.internal`, `.i2p`, private, loopback, link-local, and reserved addresses;
+- pins the actual connection to the already validated public IP to resist DNS rebinding;
+- revalidates every redirect;
+- limits redirect count, response size, and request time;
+- limits preview concurrency to three workers.
+
+The destination website can still observe the device's clearnet IP address and request timing. Link previews are not routed through I2P and should remain disabled when that disclosure is unacceptable.
+
+## Diagnostics and delay measurement
+
+The local UI console records protocol and interface events without intentionally recording message bodies. Connection failures are surfaced with the exception type and context.
+
+Each conversation can be exported to a user-selected JSON file containing:
+
+- plaintext message history;
+- direction and delivery state;
+- message IDs and reactions;
+- send, local receive, peer receive, delivery, and read timestamps;
+- one-way, round-trip, and read-delay calculations;
+- queue diagnostics.
+
+Private keys, ratchet state, encrypted payloads, and the contact's I2P destination are excluded. The exported file is intentionally plaintext and must be protected by the user. One-way delay is clock-dependent; round-trip delay uses the sender's local clock and is generally more reliable.
+
+## Installation
+
+### Requirements
+
+- Windows 10/11 x64, or Linux x86_64/aarch64 with a desktop environment;
+- an Internet connection and a compatible I2P router;
+- Python 3.11+ only when running from source;
+- Go 1.24+ only when building release artifacts;
+- Java 17+ for the standard Java I2P router. Kerberus itself does not use Java.
+
+### Windows release
+
+1. Download `KerberusInstaller.exe` from the intended release.
+2. Close any older Kerberus process.
+3. Run the installer and approve I2P/Java installation only if required.
+4. Launch Kerberus, create the encrypted vault, and wait for **I2P: connected**.
+
+The installer includes the application and native helper. It can download the pinned I2P 2.12.0 installer and Azul Zulu JDK when needed, verifies fixed SHA-256 values, verifies the Azul Authenticode publisher, and configures SAM on loopback only.
+
+### Linux release
+
+1. Install and start I2P from the distribution or official repository.
+2. Place `Kerberus-linux-<arch>` and `install-linux.sh` in the same directory.
+3. Run:
+
+```bash
+bash install-linux.sh
+```
+
+4. Start Kerberus from the application menu or with `~/.local/bin/kerberus`.
+
+Kerberus writes its user SAM configuration under `~/.i2p/clients.config.d/`. System-service I2P installations may require SAM to be enabled through the router console or distribution-specific configuration directory.
+
+### Run from source
+
+Windows PowerShell:
 
 ```powershell
 .\setup.ps1
 .\start.ps1
 ```
 
-Su Linux:
+Linux:
 
 ```bash
-# Debian/Ubuntu, solo per l'avvio dal sorgente:
 sudo apt install python3-venv
 bash setup.sh
 bash start.sh
 ```
 
-In alternativa:
+Manual virtual environment:
 
 ```powershell
 py -3 -m venv .venv
@@ -115,114 +315,103 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m kerberus.main
 ```
 
-## Aggiungere un contatto
+## Basic use
 
-1. Entrambi gli utenti devono attendere **I2P: connesso**.
-2. Il destinatario apre il proprio profilo e genera il codice contatto.
-3. Il mittente inserisce il codice tramite il pulsante per aggiungere un contatto.
-4. Il codice visualizzato cambia ogni minuto ed è monouso; le ritrasmissioni tecniche dello stesso mittente restano idempotenti.
-5. La richiesta appare come **Richiesta in attesa**. La conferma firmata torna sullo stesso stream I2P full-duplex e, solo dopo la verifica, la chat diventa utilizzabile su entrambi i client.
+### Add a contact
 
-Mittente e destinatario devono essere online contemporaneamente per la consegna. L'attuale outbox è locale: non esiste ancora una mailbox I2P esterna sempre attiva.
+1. Both users wait for the I2P status to become connected.
+2. The recipient opens **Profile** and shares the current contact code.
+3. The requester opens **New contact**, enters the code, and optionally writes a first message.
+4. The request remains visible as pending until the signed acceptance is verified.
+5. After the initial ratchet handshake, queued user content is encrypted and sent.
 
-## Stati dei messaggi
+The current mailbox is local only. Both peers generally need to be online at the same time for delivery; there is no always-on Kerberus relay storing offline messages.
 
-- **In attesa**: salvato nel vault, ancora da inviare.
-- **Inviato**: scritto nello stream I2P, ricevuta non ancora ricevuta.
-- **Consegnato**: ricevuta cifrata ricevuta dal destinatario.
-- **Letto**: ricevuta cifrata di lettura ricevuta; le doppie spunte diventano azzurre.
+### Connection errors
 
-Un errore `CANT_REACH_PEER` non distrugge la sessione SAM: viene riaperto soltanto lo stream del contatto e il messaggio resta in coda. Un errore `INVALID_ID` causa una sola ricostruzione coordinata della sessione se la sua generazione è ancora quella guasta.
+- **CANT_REACH_PEER** — the peer may be offline or its LeaseSet may be unavailable. Kerberus drops only that peer stream and keeps the message in the encrypted outbox.
+- **INVALID_ID** — the router no longer recognizes the SAM session. Kerberus performs one coordinated session rebuild for the affected generation.
+- **SAM unavailable** — verify that the I2P router is running and `127.0.0.1:7656` is reachable.
 
-Con il tasto destro su una bolla è possibile copiare il testo, cancellare la sola copia locale oppure inoltrarlo. L'inoltro crea un nuovo messaggio cifrato senza allegare l'identità del mittente originale. La cancellazione non può rimuovere copie già consegnate all'altro dispositivo.
+The first I2P startup may take several minutes while the router integrates and builds tunnels.
 
-## Test
+## Testing
 
-Suite completa:
+Run the complete local suite:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Test end-to-end con due destination reali sul router I2P locale:
+Run the native transport checks:
+
+```powershell
+cd native
+go test ./...
+go vet ./...
+```
+
+Run the opt-in end-to-end test with two real destinations on a local I2P router:
 
 ```powershell
 $env:KERBERUS_LIVE_I2P = "1"
 .\.venv\Scripts\python.exe -m unittest tests.test_live_i2p -v
 ```
 
-## Creare la release Windows
+The live test performs contact exchange, sends a ten-message burst, verifies delivery and ordering, and reports latency statistics.
+
+## Building releases
+
+Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[build]"
 .\.venv\Scripts\python.exe .\build_release.py
 ```
 
-Gli artefatti vengono prodotti in `release/`:
-
-- `Kerberus.exe`: applicazione standalone.
-- `KerberusInstaller.exe`: installer con applicazione inclusa.
-- `SHA256SUMS.txt`: impronte degli eseguibili generate per la release locale.
-
-## Creare la release Linux
+Linux:
 
 ```bash
 .venv/bin/python -m pip install -e '.[build]'
 .venv/bin/python build_release.py
 ```
 
-Produce `Kerberus-linux-<arch>`, `install-linux.sh` e `SHA256SUMS-linux.txt`.
+Artifacts are written to `release/`. GitHub Actions tests and builds Windows and Linux artifacts and publishes tagged releases.
 
-Durante la build viene compilato `native/kerberus-native`; il binario è poi incorporato nell'eseguibile PyInstaller. Go mantiene tre `STREAM ACCEPT` pendenti, riusa gli stream in uscita e registra anche gli stream ricevuti come canali full-duplex per le risposte, evitando un secondo handshake nella direzione opposta. I callback applicativi passano attraverso una coda ordinata separata, così un messaggio ricevuto può causare immediatamente un nuovo invio senza bloccare il lettore IPC. Se l'helper non può essere avviato o termina, Kerberus avvia automaticamente il trasporto Python mantenendo lo stesso protocollo e la stessa outbox.
-
-## Struttura del repository
+## Repository layout
 
 ```text
 kerberus/
-  crypto.py       identità, firme e cifratura ibrida
-  sam.py          sessione SAM, stream persistenti e recovery
-  service.py      contatti, messaggi, ACK, outbox e retry
-  vault.py        persistenza locale cifrata
-  router.py       avvio, arresto e bootstrap I2P
-  ui.py           interfaccia PyQt6
-  updates.py      update check, download e verifica GitHub Releases
-native/            multiplexer SAM persistente in Go
-installer.py      installer Windows
-build_release.py  build PyInstaller
-tests/            test unitari, UI e integrazione I2P
+  crypto.py        identities, signatures, hybrid envelope encryption
+  ratchet.py       Double Ratchet state and message-key handling
+  service.py       contacts, messaging, receipts, reactions, queues, retry
+  vault.py         encrypted local persistence
+  sam.py           SAM session, streams, native-helper IPC, Python fallback
+  link_preview.py  metadata parsing and SSRF-resistant preview fetching
+  router.py        I2P bootstrap, configuration, start and stop
+  updates.py       GitHub release check and SHA-256 verification
+  ui.py            PyQt6 desktop interface and localization
+native/             Go SAM stream multiplexer
+installer.py        Windows installer
+build_release.py    PyInstaller release build
+tests/              crypto, service, UI, transport, updater and live tests
+docs/adr/           architecture decision records
 ```
 
-## Risoluzione problemi
+## Security boundaries and limitations
 
-### I2P non connesso
+- **Experimental protocol:** Kerberus and its Double Ratchet implementation have not been independently audited or formally verified.
+- **No absolute anonymity:** I2P reduces network exposure but cannot eliminate endpoint compromise, behavioral correlation, timing analysis, or global-observer risk.
+- **Hybrid does not mean fully post-quantum:** ML-KEM contributes to envelope confidentiality. Ed25519 signatures and the X25519 Double Ratchet remain classical.
+- **Endpoint compromise wins:** malware, screen capture, clipboard monitoring, memory inspection, or access to an unlocked vault can expose plaintext and keys.
+- **No secure deletion guarantee:** filesystem snapshots, backups, SSD behavior, swap, and Python memory management may preserve old data.
+- **Separate I2P destination key:** the SAM private destination is permission-restricted but not encrypted by the vault password.
+- **Direct availability:** there is no external offline mailbox. Delivery depends on both peers and the I2P network being reachable.
+- **Link-preview disclosure:** enabled previews contact clearnet websites and reveal the device's clearnet IP to those sites.
+- **Plaintext exports:** debug exports and clipboard operations intentionally move plaintext outside the vault.
+- **Release trust:** updates require matching SHA-256 manifests and reject rollback, but the artifact and checksum come from the same GitHub release. There is no independent offline signature or project code-signing certificate yet.
+- **Missing product areas:** groups, multi-device synchronization, attachments, voice/video, key backup, and distributed mailboxes are not implemented.
 
-- Verifica che I2P 2.12.0 sia avviato.
-- Verifica che `127.0.0.1:7656` sia raggiungibile.
-- Apri lo stato I2P nell'app e usa **Riconnetti**.
-- Il primo avvio può richiedere alcuni minuti per integrare il router e costruire i tunnel.
+## Licensing
 
-### CANT_REACH_PEER
-
-Il peer può essere offline, avere tunnel non ancora pubblicati oppure aver appena riavviato I2P. Il messaggio rimane cifrato nella outbox e viene ritentato automaticamente senza abbattere la sessione principale.
-
-### INVALID_ID
-
-Indica che SAM non riconosce più la sessione. Kerberus coordina una singola ricostruzione della sessione e chiude gli stream appartenenti alla vecchia generazione. Errori ripetuti possono indicare un riavvio del router o SAM non stabile.
-
-### La chat mostra anteprime ma non bolle
-
-Aggiorna entrambi i client alla stessa versione indicata nella finestra **Stato I2P**. La cronologia è nel vault e viene renderizzata nuovamente dopo l'aggiornamento.
-
-## Sicurezza e limiti
-
-- La destination privata SAM è persistente e salvata separatamente dal vault perché serve per creare la sessione prima del traffico applicativo.
-- Il Double Ratchet cancella le chiavi consumate e rinnova le catene dopo i cambi DH. Il protocollo è nuovo, non interoperabile con la 0.3 per i nuovi messaggi e non è stato sottoposto a audit indipendente.
-- Non sono ancora implementati gruppi, multi-device, allegati o mailbox distribuite.
-- La protezione dei metadati dipende anche dal router I2P, dal sistema operativo e dal comportamento dell'utente.
-- Kerberus non raccoglie telemetria. Padding a bucket, identificatori casuali, chiavi effimere e ricevute cifrate riducono i metadati applicativi, ma non possono nascondere ogni correlazione temporale a un avversario globale.
-- Le anteprime link contattano il sito solo quando la relativa opzione è attiva. Download limitati, timeout, controllo dei redirect e blocco di host locali/privati riducono i rischi SSRF, ma il sito può osservare l'indirizzo IP del dispositivo. Kerberus non offre configurazioni DNS proprie.
-- Le release non sono ancora firmate con un certificato di code signing.
-
-## Licenze
-
-Le icone Lucide incluse in `kerberus/assets/lucide/` mantengono la loro licenza originale, disponibile nello stesso percorso. Le altre dipendenze conservano le rispettive licenze upstream.
+The Lucide icons under `kerberus/assets/lucide/` retain their upstream license in that directory. Third-party dependencies retain their respective upstream licenses. This repository currently does not contain a project-wide `LICENSE` file; do not assume an open-source license for the remaining code until one is added.
