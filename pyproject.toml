@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kerberus-i2p"
+version = "0.2.0"
+description = "Private hybrid post-quantum messenger over I2P SAM"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=48.0.1,<49",
+  "PyNaCl>=1.6,<2",
+  "pqcrypto>=0.4,<0.5",
+  "PyQt6>=6.8,<7",
+]
+
+[project.scripts]
+kerberus = "kerberus.main:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.21,<7"]
+
+[tool.setuptools.packages.find]
+include = ["kerberus*"]
+
+[tool.setuptools.package-data]
+kerberus = ["assets/lucide/*.svg", "assets/lucide/LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import queue
 import re
@@ -134,21 +136,33 @@ class InstallerEngine:
 
     @staticmethod
     def _verify_azul_signature(path: Path) -> None:
-        escaped = str(path).replace("'", "''")
         script = (
-            f"$s=Get-AuthenticodeSignature -LiteralPath '{escaped}';"
-            "Write-Output ($s.Status.ToString() + '|' + $s.SignerCertificate.Subject)"
+            "$m=Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1';"
+            "Import-Module $m -Force -ErrorAction Stop;"
+            "$s=Get-AuthenticodeSignature -LiteralPath $env:KERBERUS_SIGNATURE_PATH;"
+            "$o=[PSCustomObject]@{Status=$s.Status.ToString();"
+            "Subject=if($s.SignerCertificate){$s.SignerCertificate.Subject}else{''}};"
+            "$o|ConvertTo-Json -Compress"
         )
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
             capture_output=True,
             text=True,
             timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env={**os.environ, "KERBERUS_SIGNATURE_PATH": str(path.resolve())},
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.startswith("Valid|") or "Azul Systems, Inc." not in result.stdout:
-            raise RuntimeError("Firma Authenticode del pacchetto Azul non valida")
+        try:
+            signature = json.loads(result.stdout.strip().lstrip("\ufeff"))
+        except (json.JSONDecodeError, AttributeError):
+            signature = {}
+        valid_status = str(signature.get("Status", "")).casefold() == "valid"
+        allowed_publisher = "Azul Systems, Inc." in str(signature.get("Subject", ""))
+        if result.returncode != 0 or not valid_status or not allowed_publisher:
+            detail = signature.get("Status") or result.stderr.strip().splitlines()[-1:] or "output non valido"
+            raise RuntimeError(f"Firma Authenticode del pacchetto Azul non valida ({detail})")
 
     def ensure_java(self) -> Path:
         existing = self._system_java()
@@ -200,13 +214,15 @@ class InstallerEngine:
     def i2p_installed() -> bool:
         return bool(InstallerEngine.installed_i2p_version())
 
-    def ensure_i2p(self, java: Path) -> None:
+    def ensure_i2p(self, java: Path | None = None) -> None:
         installed_version = self.installed_i2p_version()
         if installed_version == I2P_VERSION:
             self.log(f"I2P {I2P_VERSION} è già installato.")
             self.notify("progress", 78)
             self.ensure_sam_config()
             return
+        if java is None:
+            raise RuntimeError("Il router I2P standard richiede Java 17 o successivo")
         self.log("Download e verifica dell'installer ufficiale I2P...")
         installer = self.download_dir / f"i2pinstall_{I2P_VERSION}_windows.exe"
         if not installer.exists() or sha256_file(installer).lower() != I2P_SHA256:
@@ -275,8 +291,12 @@ clientApp.0.startOnLoad=true
     def install(self) -> Path:
         self.notify("progress", 3)
         executable = self.install_application()
-        java = self.ensure_java()
-        self.ensure_i2p(java)
+        if self.installed_i2p_version() == I2P_VERSION:
+            self.ensure_i2p()
+        else:
+            # Kerberus.exe non usa Java. Il runtime serve soltanto al router I2P
+            # standard scaricato da questo installer.
+            self.ensure_i2p(self.ensure_java())
         self.create_shortcuts(executable)
         self.log("Installazione completata.")
         self.notify("progress", 100)
@@ -307,7 +327,7 @@ class InstallerWindow:
         Label(body, text="Comunicazione privata, pronta all'uso", bg="#0c0f13", fg="#f2f5f7", font=("Segoe UI", 20, "bold"), anchor="w").pack(fill=X)
         Label(
             body,
-            text="Installa Kerberus, il runtime necessario e I2P. I download vengono verificati prima dell'esecuzione.",
+            text="Installa Kerberus e I2P. Java viene aggiunto solo se il router I2P standard ne ha bisogno; ogni download viene verificato.",
             bg="#0c0f13",
             fg="#909aa6",
             font=("Segoe UI", 10),

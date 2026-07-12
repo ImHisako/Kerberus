@@ -59,6 +59,23 @@ class CryptoTests(unittest.TestCase):
         self.assertEqual(profile_destination(first), profile_destination(second))
         self.assertRegex(first, r"^[A-Z2-9]{4}-KERBERUS-[A-Z2-9]{16}-[a-z2-7]{52}$")
 
+    def test_contact_code_period_starts_when_policy_is_saved(self):
+        identity, secrets = generate_identity("Alice")
+        standard = base64.b64encode(os.urandom(400)).decode("ascii")
+        update_destination(identity, secrets, standard.replace("+", "-").replace("/", "~"))
+        anchor = 10_000
+        first = rotating_contact_code(
+            identity, secrets, period_minutes=5, anchor_time=anchor, timestamp=anchor
+        )
+        before_expiry = rotating_contact_code(
+            identity, secrets, period_minutes=5, anchor_time=anchor, timestamp=anchor + 299
+        )
+        after_expiry = rotating_contact_code(
+            identity, secrets, period_minutes=5, anchor_time=anchor, timestamp=anchor + 300
+        )
+        self.assertEqual(first, before_expiry)
+        self.assertNotEqual(first, after_expiry)
+
 
 if __name__ == "__main__":
     unittest.main()

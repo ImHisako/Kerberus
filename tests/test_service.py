@@ -37,7 +37,53 @@ class ServiceTests(unittest.TestCase):
             service._receive(raw)
             service._receive(raw)
             self.assertEqual(len(service.messages_for(alice.identity_id)), 1)
+            stored = service.messages_for(alice.identity_id)[0]
+            self.assertIsInstance(stored["sent_at"], int)
+            self.assertIsInstance(stored["received_at"], int)
             service.close(wait=True)
+
+    def test_signed_ack_can_return_on_same_full_duplex_stream(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice = alice_service.identity()
+            bob = bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+
+            captured = []
+
+            class Endpoint:
+                def send(self, _destination, payload):
+                    captured.append(payload)
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            alice_service.send_message(bob.identity_id, "ACK inline")
+            reply = bob_service._receive(captured[0], inline_reply=True)
+            self.assertIsNotNone(reply)
+            self.assertEqual(bob_service.vault.state["control_outbox"], [])
+            alice_service._receive(reply)
+            delivered = alice_service.messages_for(bob.identity_id)[0]
+            self.assertEqual(delivered["status"], "delivered")
+            self.assertIsInstance(delivered["recipient_received_at"], int)
+            self.assertIsInstance(delivered["delivered_at"], int)
+
+            alice_service.send_message(bob.identity_id, "Timing alterato")
+            tampered_reply = bob_service._receive(captured[1], inline_reply=True)
+            tampered = json.loads(tampered_reply)
+            tampered["received_at"] += 10_000
+            alice_service._receive(json.dumps(tampered).encode("utf-8"))
+            second = alice_service.messages_for(bob.identity_id)[1]
+            self.assertEqual(second["status"], "delivered")
+            self.assertIsNone(second["recipient_received_at"])
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
 
     def test_code_request_creates_both_chats_and_delivers_first_message(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -119,6 +165,59 @@ class ServiceTests(unittest.TestCase):
             alice_service.close(wait=True)
             bob_service.close(wait=True)
 
+    def test_manual_retry_delivers_queued_message_immediately(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice = alice_service.identity()
+            bob = bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            routes = {}
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    if destination not in routes:
+                        raise ConnectionError("offline")
+                    routes[destination]._receive(payload)
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            bob_service.sam = Endpoint()
+            self.assertEqual(alice_service.send_message(bob.identity_id, "Retry ora"), "queued")
+            routes[bob.destination] = bob_service
+            routes[destination_b32(bob.destination)] = bob_service
+            routes[alice.destination] = alice_service
+            routes[destination_b32(alice.destination)] = alice_service
+            status = alice_service.retry_all_now()
+            self.assertEqual(status["messages"], 1)
+            self.assertTrue(self._wait_for(lambda: not alice_service.vault.state["outbox"]))
+            self.assertEqual(bob_service.messages_for(alice.identity_id)[0]["text"], "Retry ora")
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_optional_warm_failure_does_not_replace_protocol_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self._service(Path(folder) / "alice", "Alice")
+
+            class UnavailableSam:
+                def warm(self, _destination):
+                    raise ConnectionRefusedError(10061, "SAM non ancora pronto")
+
+                def stop(self):
+                    pass
+
+            service.sam = UnavailableSam()
+            service.last_protocol_event = "Connessione I2P in preparazione"
+            self.assertFalse(service._warm_destination("peer"))
+            self.assertEqual(service.last_protocol_event, "Connessione I2P in preparazione")
+            service.close(wait=True)
+
     def test_contact_accept_is_retried_when_requester_is_temporarily_unreachable(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -162,10 +261,32 @@ class ServiceTests(unittest.TestCase):
             identity = service.identity()
             from kerberus.crypto import rotating_contact_code
 
-            previous = rotating_contact_code(identity, service.secrets(), int(time.time() // 60) - 1)
+            now = int(time.time())
+            settings = service.vault.state["settings"]
+            settings["contact_code_anchor_time"] = now - 120
+            service.vault.save()
+            previous = rotating_contact_code(
+                identity,
+                service.secrets(),
+                period_minutes=1,
+                generation=settings["contact_code_generation"],
+                anchor_time=settings["contact_code_anchor_time"],
+                timestamp=now - 60,
+            )
             service._consume_contact_code(previous)
             with self.assertRaises(ValueError):
                 service._consume_contact_code(previous)
+            service.close(wait=True)
+
+    def test_contact_code_policy_is_persisted_and_rotates_after_use(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self._service(Path(folder) / "bob", "Bob")
+            service.update_settings(5, True)
+            first = service.contact_code()
+            service._consume_contact_code(first, "alice")
+            second = service.contact_code()
+            self.assertNotEqual(first, second)
+            self.assertEqual(service.settings()["contact_code_period_minutes"], 5)
             service.close(wait=True)
 
     @staticmethod

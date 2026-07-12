@@ -6,13 +6,14 @@ Kerberus è un messenger desktop sperimentale che comunica attraverso I2P usando
 
 ## Funzionalità
 
-- Interfaccia desktop PyQt6 senza cornice Windows standard.
+- Interfaccia desktop PyQt6 senza cornice di sistema su Windows e Linux.
 - Router I2P 2.12.0 tramite SAM v3 su `127.0.0.1:7656`.
 - Installazione automatica di I2P e, quando necessario, Azul Zulu JDK 26.
 - Identità self-sovereign firmate con Ed25519.
 - Cifratura messaggi ibrida X25519 + ML-KEM-768.
 - Payload protetti con XChaCha20-Poly1305.
-- Codici contatto monouso che cambiano ogni minuto.
+- Codici contatto con rotazione configurabile (1, 5, 15 o 60 minuti) e opzione monouso.
+- Impostazioni integrate e console UI locale con log delle azioni privo di contenuti dei messaggi.
 - Username e foto profilo firmati.
 - Cronologia e outbox salvate nel vault cifrato.
 - ACK firmati, anti-replay e retry automatici.
@@ -40,20 +41,37 @@ Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i conta
 
 ## Requisiti
 
-- Windows 10 o Windows 11 a 64 bit.
+- Windows 10/11 a 64 bit oppure Linux x86_64/aarch64 con ambiente desktop.
 - Connessione Internet.
 - Per lo sviluppo: Python 3.11 o successivo.
-- Per I2P: Java 17 o successivo. L'installer può installare Azul Zulu JDK 26.0.1+8.
+- Per il router I2P standard: Java 17 o successivo. Kerberus non usa direttamente Java e l'installer lo aggiunge solo quando deve installare o aggiornare quel router.
 
 ## Installazione per utenti
 
+### Windows
+
 1. Chiudi eventuali versioni precedenti di Kerberus.
 2. Avvia `KerberusInstaller.exe`.
-3. Accetta l'installazione di Java o I2P quando richiesta.
+3. Accetta l'installazione di I2P e, solo se necessario al router standard, di Java.
 4. Avvia Kerberus dal desktop o dal menu Start.
 5. Crea il vault e attendi lo stato **I2P: connesso**.
 
 L'installer scarica I2P 2.12.0 dal sito ufficiale e verifica la SHA-256 fissata nel codice. SAM viene configurato soltanto su loopback.
+
+La documentazione I2P distingue il pacchetto Windows standard, che richiede Java, dall'Easy Install Bundle che include un runtime privato. Questa release usa il pacchetto standard per mantenere l'integrazione con `I2Psvc.exe`; se I2P 2.12.0 è già presente, non scarica né installa Java.
+
+### Linux
+
+1. Installa I2P dal repository ufficiale della distribuzione e avvialo come utente con `i2prouter start`.
+2. Scarica `Kerberus-linux-<arch>` e `install-linux.sh` nella stessa cartella.
+3. Esegui `bash install-linux.sh`.
+4. Avvia Kerberus dal menu applicazioni o con `~/.local/bin/kerberus`.
+
+Kerberus configura SAM in `~/.i2p/clients.config.d/` e lo mantiene su `127.0.0.1:7656`. Per installazioni I2P gestite come servizio di sistema potrebbe essere necessario abilitare SAM dalla console router o nella directory configurata dalla distribuzione.
+
+## Build automatica
+
+Il workflow GitHub Actions `.github/workflows/build.yml` esegue test e build sia su Windows sia su Linux. Produce installer Windows, binario Linux standalone, installer utente Linux e checksum; sui tag `v*` pubblica gli artefatti nella GitHub Release.
 
 ## Avvio dal sorgente
 
@@ -62,6 +80,15 @@ Apri PowerShell nella cartella del progetto:
 ```powershell
 .\setup.ps1
 .\start.ps1
+```
+
+Su Linux:
+
+```bash
+# Debian/Ubuntu, solo per l'avvio dal sorgente:
+sudo apt install python3-venv
+bash setup.sh
+bash start.sh
 ```
 
 In alternativa:
@@ -117,6 +144,15 @@ Gli artefatti vengono prodotti in `release/`:
 - `Kerberus.exe`: applicazione standalone.
 - `KerberusInstaller.exe`: installer con applicazione inclusa.
 - `SHA256SUMS.txt`: impronte degli eseguibili generate per la release locale.
+
+## Creare la release Linux
+
+```bash
+.venv/bin/python -m pip install -e '.[build]'
+.venv/bin/python build_release.py
+```
+
+Produce `Kerberus-linux-<arch>`, `install-linux.sh` e `SHA256SUMS-linux.txt`.
 
 ## Struttura del repository
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -20,8 +21,8 @@ def run_pyinstaller(arguments: list[str]) -> None:
 
 
 def main() -> int:
-    if os.name != "nt":
-        raise RuntimeError("La release Windows deve essere compilata su Windows")
+    if os.name not in ("nt", "posix"):
+        raise RuntimeError("Sistema operativo non supportato")
     installer_only = "--installer-only" in sys.argv
     if not installer_only:
         run_pyinstaller([
@@ -39,9 +40,23 @@ def main() -> int:
             f"--workpath={ROOT / 'build' / 'app'}",
             f"--specpath={ROOT / 'build' / 'spec'}",
         ])
-    app = DIST / "Kerberus.exe"
+    app = DIST / ("Kerberus.exe" if os.name == "nt" else "Kerberus")
     if not app.exists():
-        raise RuntimeError("La build di Kerberus.exe non è stata prodotta")
+        raise RuntimeError("La build di Kerberus non è stata prodotta")
+    RELEASE.mkdir(exist_ok=True)
+    if os.name != "nt":
+        architecture = platform.machine().lower().replace("amd64", "x86_64")
+        portable = RELEASE / f"Kerberus-linux-{architecture}"
+        shutil.copy2(app, portable)
+        portable.chmod(0o755)
+        install_script = ROOT / "install-linux.sh"
+        shutil.copy2(install_script, RELEASE / install_script.name)
+        (RELEASE / install_script.name).chmod(0o755)
+        artifacts = (portable, RELEASE / install_script.name)
+        checksums = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}" for path in artifacts]
+        (RELEASE / "SHA256SUMS-linux.txt").write_text("\n".join(checksums) + "\n", encoding="ascii")
+        print(f"Release Linux pronta in {RELEASE}")
+        return 0
     run_pyinstaller([
         str(ROOT / "installer.py"),
         "--name=KerberusInstaller",
@@ -60,7 +75,6 @@ def main() -> int:
     result = subprocess.run([str(installer), "--self-test"], timeout=60, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"Self-test installer fallito: {result.returncode}")
-    RELEASE.mkdir(exist_ok=True)
     for artifact in (app, installer):
         shutil.copy2(artifact, RELEASE / artifact.name)
     checksums = []
