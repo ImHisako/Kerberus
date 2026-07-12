@@ -45,6 +45,11 @@ class SamTests(unittest.TestCase):
         self.assertEqual(client._send_once.call_count, 2)
         self.assertFalse(any(kwargs.get("force") for _args, kwargs in client.start_session.call_args_list))
 
+    def test_destination_command_injection_is_rejected(self):
+        client = SamClient("127.0.0.1", 7656, Path("unused"))
+        with self.assertRaises(ValueError):
+            client.send("peer\nSTREAM ACCEPT ID=stolen", b"payload")
+
     @patch("kerberus.sam.select.select", return_value=([], [], []))
     @patch("kerberus.sam._command", return_value="STREAM STATUS RESULT=OK")
     def test_messages_reuse_outbound_stream(self, _command, _select):

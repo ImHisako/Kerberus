@@ -63,14 +63,14 @@ class MessengerService:
             destination = self.sam.generate_persistent_destination()
         else:
             destination = ""
+        self.sam.set_receiver(self._receive_safely)
         active = self.sam.start_session() or destination
         identity = self.identity()
         if identity and active:
             update_destination(identity, self.secrets(), active)
             self.vault.state["identity"] = identity.to_dict()
             self.vault.save()
-        self.sam.set_receiver(self._receive_safely)
-        if self._listener is None or not self._listener.is_alive():
+        if not self.sam.native_active and (self._listener is None or not self._listener.is_alive()):
             self._listener = threading.Thread(target=self.sam.listen, args=(self._receive_safely,), daemon=True)
             self._listener.start()
         if self._delivery_thread is None or not self._delivery_thread.is_alive():
@@ -246,6 +246,32 @@ class MessengerService:
 
     def messages_for(self, contact_id: str) -> list[dict]:
         return [m for m in self.vault.state["messages"] if m["contact_id"] == contact_id]
+
+    def delete_message(self, message_id: str) -> bool:
+        """Delete one local copy and cancel its pending delivery, if any."""
+        if not message_id:
+            return False
+        with self._state_lock:
+            before = len(self.vault.state["messages"])
+            self.vault.state["messages"] = [
+                message for message in self.vault.state["messages"]
+                if message.get("message_id") != message_id
+            ]
+            self.vault.state["outbox"] = [
+                entry for entry in self.vault.state["outbox"]
+                if entry.get("message_id") != message_id
+            ]
+            changed = len(self.vault.state["messages"]) != before
+            if changed:
+                self.vault.save()
+        return changed
+
+    def forward_message(self, contact_id: str, text: str) -> str:
+        # Forwarding creates a fresh envelope, message id, KEM secret and nonce.
+        # No original sender or conversation metadata is attached.
+        if not text.strip():
+            raise ValueError("Messaggio vuoto")
+        return self.send_message(contact_id, text)
 
     def send_message(self, contact_id: str, text: str) -> str:
         identity = self.identity()

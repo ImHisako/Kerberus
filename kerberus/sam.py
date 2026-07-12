@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-import socket
+import base64
+import json
+import os
+import queue
+import re
 import secrets
 import select
+import socket
+import subprocess
+import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -13,6 +21,171 @@ FrameReceiver = Callable[[bytes], bytes | None]
 
 class SamError(RuntimeError):
     pass
+
+
+def _validate_destination(destination: str) -> str:
+    if not isinstance(destination, str) or not re.fullmatch(r"[A-Za-z0-9=._~-]{1,4096}", destination):
+        raise ValueError("Destination I2P non valida")
+    return destination
+
+
+def _native_helper_path() -> Path | None:
+    """Find the optional Go transport bundled by the release build."""
+    executable = "kerberus-native.exe" if os.name == "nt" else "kerberus-native"
+    candidates = []
+    override = os.environ.get("KERBERUS_NATIVE_HELPER")
+    if override:
+        candidates.append(Path(override))
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.append(Path(bundle_root) / executable)
+    root = Path(__file__).resolve().parents[1]
+    candidates.extend((root / "build" / "native" / executable, root / executable))
+    return next((path for path in candidates if path.is_file()), None)
+
+
+class NativeSamTransport:
+    """Small JSON-lines adapter for the bundled Go SAM stream multiplexer.
+
+    Only already-encrypted application frames cross this process boundary. The
+    identity, vault password and private message keys remain in the Python client.
+    """
+
+    def __init__(
+        self,
+        executable: Path,
+        host: str,
+        port: int,
+        session_id: str,
+        receiver: FrameReceiver | None,
+        on_exit: Callable[[], None] | None = None,
+    ):
+        self._receiver = receiver
+        self._on_exit = on_exit
+        self._closing = False
+        self.frames_received = 0
+        self.last_accept_error = ""
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending: dict[str, tuple[threading.Event, dict]] = {}
+        self._frames: queue.Queue[dict | None] = queue.Queue(maxsize=1024)
+        self._process = subprocess.Popen(
+            [str(executable), "--host", host, "--port", str(port), "--session", session_id],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self._reader = threading.Thread(target=self._read_loop, daemon=True, name="kerberus-native-reader")
+        self._frame_worker = threading.Thread(
+            target=self._frame_loop,
+            daemon=True,
+            name="kerberus-native-frames",
+        )
+        self._reader.start()
+        self._frame_worker.start()
+
+    def request(self, operation: str, destination: str, payload: bytes | None = None, timeout: float = 20) -> None:
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        result: dict = {}
+        with self._pending_lock:
+            self._pending[request_id] = (event, result)
+        command = {"id": request_id, "op": operation, "destination": destination}
+        if payload is not None:
+            command["payload"] = base64.b64encode(payload).decode("ascii")
+        try:
+            self._write(command)
+            if not event.wait(timeout):
+                raise TimeoutError("Timeout helper SAM nativo")
+            if not result.get("ok"):
+                raise SamError(str(result.get("error") or "Errore helper SAM nativo"))
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+
+    def _write(self, command: dict) -> None:
+        process_input = self._process.stdin
+        if self._process.poll() is not None or process_input is None:
+            raise SamError("Helper SAM nativo non disponibile")
+        encoded = json.dumps(command, separators=(",", ":")) + "\n"
+        with self._write_lock:
+            process_input.write(encoded)
+            process_input.flush()
+
+    def _read_loop(self) -> None:
+        output = self._process.stdout
+        if output is None:
+            return
+        try:
+            for line in output:
+                try:
+                    message = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if message.get("event") == "frame":
+                    # Keep the stdout reader free for request responses. Protocol
+                    # callbacks may synchronously send another frame.
+                    self._frames.put(message)
+                    continue
+                if message.get("event") == "accept_error":
+                    self.last_accept_error = str(message.get("error", ""))
+                    continue
+                request_id = message.get("id")
+                with self._pending_lock:
+                    pending = self._pending.get(request_id)
+                if pending:
+                    pending[1].update(message)
+                    pending[0].set()
+        finally:
+            with self._pending_lock:
+                pending = list(self._pending.values())
+            for event, result in pending:
+                result.update({"ok": False, "error": "Helper SAM nativo terminato"})
+                event.set()
+            if not self._closing and self._on_exit:
+                self._on_exit()
+
+    def _frame_loop(self) -> None:
+        while True:
+            message = self._frames.get()
+            if message is None:
+                return
+            self._handle_frame(message)
+
+    def _handle_frame(self, message: dict) -> None:
+        if not self._receiver:
+            return
+        try:
+            payload = base64.b64decode(message["payload"], validate=True)
+            self.frames_received += 1
+            response = self._receiver(payload)
+            if response:
+                self._write({
+                    "op": "reply",
+                    "stream": str(message.get("stream", "")),
+                    "payload": base64.b64encode(response).decode("ascii"),
+                })
+        except Exception:
+            return
+
+    def close(self) -> None:
+        self._closing = True
+        try:
+            self._frames.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self._write({"op": "stop"})
+        except Exception:
+            pass
+        try:
+            self._process.terminate()
+        except OSError:
+            pass
 
 
 def _line(sock: socket.socket) -> str:
@@ -56,9 +229,34 @@ class SamClient:
         self._inbound_sockets: set[socket.socket] = set()
         self._generation = 0
         self._receiver: FrameReceiver | None = None
+        self._native: NativeSamTransport | None = None
+        self._fallback_listener: threading.Thread | None = None
 
     def set_receiver(self, receiver: FrameReceiver) -> None:
         self._receiver = receiver
+        if self._native is not None:
+            self._native._receiver = receiver
+
+    @property
+    def native_active(self) -> bool:
+        return self._native is not None and self._native._process.poll() is None
+
+    def ensure_fallback_listener(self) -> threading.Thread | None:
+        if self.native_active or self._receiver is None or self._stop.is_set():
+            return None
+        if self._fallback_listener is None or not self._fallback_listener.is_alive():
+            self._fallback_listener = threading.Thread(
+                target=self.listen,
+                args=(self._receiver,),
+                daemon=True,
+                name="sam-python-fallback",
+            )
+            self._fallback_listener.start()
+        return self._fallback_listener
+
+    def _native_exited(self) -> None:
+        self._native = None
+        self.ensure_fallback_listener()
 
     def available(self, timeout: float = 0.8) -> bool:
         try:
@@ -96,7 +294,8 @@ class SamClient:
                     "i2cp.leaseSetEncType=6,4 inbound.quantity=3 outbound.quantity=3 "
                     "inbound.backupQuantity=1 outbound.backupQuantity=1 "
                     "i2cp.reduceOnIdle=false i2cp.closeOnIdle=false i2cp.fastReceive=true "
-                    "i2p.streaming.profile=2 i2p.streaming.initialAckDelay=25",
+                    "i2p.streaming.profile=2 i2p.streaming.connectDelay=125 "
+                    "i2p.streaming.initialAckDelay=25 i2p.streaming.inactivityTimeout=30000",
                 )
                 _check(reply)
                 lookup = _check(_command(sock, "NAMING LOOKUP NAME=ME"))
@@ -108,6 +307,19 @@ class SamClient:
                 sock.settimeout(None)
                 self._control = sock
                 self._generation += 1
+                helper = _native_helper_path()
+                if helper:
+                    try:
+                        self._native = NativeSamTransport(
+                            helper,
+                            self.host,
+                            self.port,
+                            self.session_id,
+                            self._receiver,
+                            self._native_exited,
+                        )
+                    except (OSError, SamError):
+                        self._native = None
                 generation = self._generation
                 threading.Thread(
                     target=self._monitor_control,
@@ -133,6 +345,7 @@ class SamClient:
         return public
 
     def send(self, destination: str, payload: bytes) -> None:
+        _validate_destination(destination)
         if len(payload) > 4_000_000:
             raise ValueError("Messaggio troppo grande")
         retried_stream = False
@@ -161,6 +374,7 @@ class SamClient:
 
     def warm(self, destination: str) -> None:
         """Open and retain a peer stream without emitting an application frame."""
+        _validate_destination(destination)
         retried_stream = False
         retried_session = False
         while True:
@@ -168,6 +382,9 @@ class SamClient:
             with self._session_lock:
                 generation = self._generation
             try:
+                if self._native is not None:
+                    self._native.request("warm", destination)
+                    return
                 with self._peer_lock(destination):
                     self._stream_locked(destination)
                 return
@@ -186,6 +403,14 @@ class SamClient:
                 raise
 
     def _send_once(self, destination: str, payload: bytes) -> None:
+        if self._native is not None:
+            try:
+                self._native.request("send", destination, payload)
+                return
+            except (OSError, SamError, TimeoutError):
+                self._native.close()
+                self._native = None
+                self.ensure_fallback_listener()
         peer_lock = self._peer_lock(destination)
         with peer_lock:
             sock = self._stream_locked(destination)
@@ -205,10 +430,12 @@ class SamClient:
             sock = self._connect()
             try:
                 sock.settimeout(120)
-                _check(_command(
-                    sock,
-                    f"STREAM CONNECT ID={self.session_id} DESTINATION={destination} SILENT=false",
-                ))
+                # SILENT plus connectDelay allows the first application frame to
+                # ride in the streaming SYN (0-RTT). Delivery ACKs/outbox retries
+                # remain the authoritative success signal.
+                sock.sendall(
+                    f"STREAM CONNECT ID={self.session_id} DESTINATION={destination} SILENT=true\n".encode("ascii")
+                )
                 sock.settimeout(None)
             except Exception:
                 sock.close()
@@ -278,7 +505,7 @@ class SamClient:
 
     def _read_inbound_stream(self, sock: socket.socket, callback: FrameReceiver) -> None:
         try:
-            sock.settimeout(180)
+            sock.settimeout(None)
             while not self._stop.is_set():
                 size = int.from_bytes(self._read_exact(sock, 4), "big")
                 if size > 4_000_000:
@@ -301,7 +528,7 @@ class SamClient:
 
     def _read_outbound_stream(self, destination: str, sock: socket.socket, callback: FrameReceiver) -> None:
         try:
-            sock.settimeout(180)
+            sock.settimeout(None)
             while not self._stop.is_set():
                 size = int.from_bytes(self._read_exact(sock, 4), "big")
                 if size > 4_000_000:
@@ -379,6 +606,9 @@ class SamClient:
             self._control = None
 
     def _close_session_locked(self) -> None:
+        if self._native:
+            self._native.close()
+            self._native = None
         self._close_control()
         self._close_data_sockets()
 

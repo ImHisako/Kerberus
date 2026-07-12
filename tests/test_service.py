@@ -218,6 +218,56 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(service.last_protocol_event, "Connessione I2P in preparazione")
             service.close(wait=True)
 
+    def test_delete_pending_message_removes_local_copy_and_outbox(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            bob = bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            alice_service.vault.save()
+
+            class Offline:
+                def send(self, *_args):
+                    raise ConnectionError("offline")
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Offline()
+            alice_service.send_message(bob.identity_id, "da eliminare")
+            message_id = alice_service.messages_for(bob.identity_id)[0]["message_id"]
+            self.assertTrue(alice_service.delete_message(message_id))
+            self.assertEqual(alice_service.messages_for(bob.identity_id), [])
+            self.assertEqual(alice_service.vault.state["outbox"], [])
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_forward_creates_fresh_envelope_without_original_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            bob = bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            alice_service.vault.save()
+            captured = []
+
+            class Endpoint:
+                def send(self, _destination, payload):
+                    captured.append(json.loads(payload))
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            alice_service.forward_message(bob.identity_id, "testo inoltrato")
+            self.assertEqual(len(captured), 1)
+            self.assertNotIn("forwarded_from", captured[0])
+            self.assertEqual(captured[0]["type"], "message")
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
     def test_contact_accept_is_retried_when_requester_is_temporarily_unreachable(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

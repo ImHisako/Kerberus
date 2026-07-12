@@ -12,6 +12,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 RELEASE = ROOT / "release"
+NATIVE_DIR = ROOT / "native"
+
+
+def build_native_helper() -> Path:
+    executable = "kerberus-native.exe" if os.name == "nt" else "kerberus-native"
+    target = ROOT / "build" / "native" / executable
+    target.parent.mkdir(parents=True, exist_ok=True)
+    go = shutil.which("go")
+    if not go:
+        raise RuntimeError("Go è richiesto soltanto per creare la release; installa Go 1.24 o successivo")
+    subprocess.run(
+        [go, "build", "-trimpath", "-ldflags=-s -w", "-o", str(target), "."],
+        cwd=NATIVE_DIR,
+        check=True,
+    )
+    return target
 
 
 def run_pyinstaller(arguments: list[str]) -> None:
@@ -25,6 +41,7 @@ def main() -> int:
         raise RuntimeError("Sistema operativo non supportato")
     installer_only = "--installer-only" in sys.argv
     if not installer_only:
+        native_helper = build_native_helper()
         run_pyinstaller([
             str(ROOT / "kerberus_app.py"),
             "--name=Kerberus",
@@ -36,6 +53,7 @@ def main() -> int:
             "--collect-data=kerberus",
             "--hidden-import=pqcrypto.kem.ml_kem_768",
             "--hidden-import=nacl.bindings",
+            f"--add-binary={native_helper}{os.pathsep}.",
             f"--distpath={DIST}",
             f"--workpath={ROOT / 'build' / 'app'}",
             f"--specpath={ROOT / 'build' / 'spec'}",
@@ -43,6 +61,9 @@ def main() -> int:
     app = DIST / ("Kerberus.exe" if os.name == "nt" else "Kerberus")
     if not app.exists():
         raise RuntimeError("La build di Kerberus non è stata prodotta")
+    crypto_test = subprocess.run([str(app), "--crypto-self-test"], timeout=60, check=False)
+    if crypto_test.returncode != 0:
+        raise RuntimeError(f"Self-test ML-KEM della build fallito: {crypto_test.returncode}")
     RELEASE.mkdir(exist_ok=True)
     if os.name != "nt":
         architecture = platform.machine().lower().replace("amd64", "x86_64")

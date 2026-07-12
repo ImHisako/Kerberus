@@ -39,6 +39,8 @@ class LiveI2PTests(unittest.TestCase):
                 thread.join(180)
             self.assertFalse(errors)
             self.assertTrue(all(not thread.is_alive() for thread in threads))
+            if os.environ.get("KERBERUS_REQUIRE_NATIVE") == "1":
+                self.assertTrue(all(service.sam.native_active for service in services))
 
             alice, bob = services
             events = {"alice": [], "bob": []}
@@ -57,6 +59,11 @@ class LiveI2PTests(unittest.TestCase):
             )
             self.assertEqual(len(alice.contacts()), 1, diagnostics)
             self.assertEqual(len(bob.contacts()), 1, diagnostics)
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                if bob.messages_for(alice.identity().identity_id):
+                    break
+                time.sleep(1)
             self.assertEqual(bob.messages_for(alice.identity().identity_id)[0]["text"], "live hello")
             deadline = time.time() + 60
             while time.time() < deadline:
@@ -94,5 +101,25 @@ class LiveI2PTests(unittest.TestCase):
                 ),
                 f"reply ACK failed: events={events}",
             )
+            burst_started = time.perf_counter()
+            for index in range(5):
+                alice.send_message(bob.identity().identity_id, f"native burst {index}")
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                received = bob.messages_for(alice.identity().identity_id)
+                if sum(message["text"].startswith("native burst") for message in received) == 5:
+                    break
+                time.sleep(0.05)
+            burst_seconds = time.perf_counter() - burst_started
+            received = bob.messages_for(alice.identity().identity_id)
+            self.assertEqual(sum(message["text"].startswith("native burst") for message in received), 5)
+            self.assertLess(burst_seconds, 30)
+            print(f"native_hot_stream_5_messages={burst_seconds:.3f}s")
+            if os.environ.get("KERBERUS_REQUIRE_NATIVE") == "1":
+                self.assertGreater(
+                    sum(service.sam._native.frames_received for service in services if service.sam._native),
+                    0,
+                    "nessun frame è stato ricevuto dal percorso Go",
+                )
             for service in services:
                 service.close()

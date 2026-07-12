@@ -24,8 +24,10 @@ from nacl.pwhash import argon2id
 
 try:
     from pqcrypto.kem import ml_kem_768
-except (ImportError, OSError):
+    _mlkem_import_error = ""
+except (ImportError, OSError) as exc:
     ml_kem_768 = None
+    _mlkem_import_error = f"{type(exc).__name__}: {exc}"
 
 
 def b64(data: bytes) -> str:
@@ -53,6 +55,10 @@ def verify_control(identity: "IdentityBundle", payload: dict[str, Any], signatur
 
 def pq_available() -> bool:
     return ml_kem_768 is not None
+
+
+def pq_unavailable_reason() -> str:
+    return _mlkem_import_error or "modulo pqcrypto non caricato"
 
 
 @dataclass(slots=True)
@@ -265,7 +271,7 @@ def _message_key(classical: bytes, quantum: bytes, context: bytes) -> bytes:
 
 def seal_message(sender: IdentityBundle, secrets: IdentitySecrets, recipient: IdentityBundle, plaintext: str) -> dict[str, Any]:
     if not pq_available():
-        raise RuntimeError("ML-KEM-768 richiesto per inviare")
+        raise RuntimeError(f"ML-KEM-768 non disponibile: {pq_unavailable_reason()}")
     sent_at = int(time.time())
     unpadded = canonical({"text": plaintext, "sent_at": sent_at, "padding": ""})
     bucket = next((size for size in (512, 2048, 8192, 32768) if len(unpadded) <= size), None)
@@ -312,7 +318,7 @@ def open_message_payload(
     private = X25519PrivateKey.from_private_bytes(unb64(secrets.exchange_private))
     classical = private.exchange(X25519PublicKey.from_public_bytes(unb64(envelope["ephemeral"])))
     if not pq_available():
-        raise RuntimeError("ML-KEM-768 richiesto per ricevere")
+        raise RuntimeError(f"ML-KEM-768 non disponibile: {pq_unavailable_reason()}")
     quantum = ml_kem_768.decrypt(unb64(secrets.pq_private), unb64(envelope["pq_ciphertext"]))
     key = _message_key(classical, quantum, context)
     clear = crypto_aead_xchacha20poly1305_ietf_decrypt(unb64(envelope["ciphertext"]), context, unb64(envelope["nonce"]), key)

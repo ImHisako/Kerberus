@@ -1,0 +1,11 @@
+- Parte di codice in Golang per la connessione, crittografie e tutto il resto (Praticamente fai in golang le parti che possono diminuire i delay e migliorare la velocità del programma), e ottimizzazione generica su ogni cosa. (più possibilità di installazione di Kerberus senza dover per forza installare Python o Golang)
+- Nel ricevere i messaggi e inviarli cè troppo delay studiati, cerca e trova un modo per I2P secondo la loro documentazione anche di come ridurre il più possibile i delay e avere una chat di messaggistica fluente senza che bisogni aspettare 40 secondi o minuti per ricevere un solo messaggio.
+- Poi fai sistema di auto-updating e update check via le release's di GitHub ( https://github.com/ImHisako/Kerberus/releases ) 
+- Aggiungere un modo che facendo tasto destro sui messaggi si possono cancellare, copiare o inoltrare ad altre chat.
+- [x] Tasto impostazioni + console UI locale che registra le azioni senza contenuti o identificatori sensibili.
+- [x] Workflow GitHub per test, build Windows, artefatti e release sui tag.
+- [x] Finestre Profilo, Stato I2P, Nuovo Contatto, avvisi e verifica senza cornice Windows, con controlli Kerberus.
+- [x] UI dello stato I2P migliorata.
+- [x] Java verificato: serve al router I2P standard, non a Kerberus; ora viene installato soltanto se I2P manca o va aggiornato.
+- [x] Rotazione codice contatto configurabile e opzione di rotazione immediata dopo l'uso.
+- [x] Bordi arrotondati nell'applicazione e nelle finestre secondarie.

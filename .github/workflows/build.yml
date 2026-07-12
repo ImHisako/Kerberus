@@ -22,6 +22,11 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: native/go.mod
+
       - name: Install dependencies
         run: python -m pip install --upgrade pip ".[build]"
 
@@ -29,6 +34,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
+
+      - name: Test native transport
+        working-directory: native
+        run: go test ./...
 
       - name: Build signed-input artifacts
         run: python build_release.py
@@ -58,6 +67,11 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: native/go.mod
+
       - name: Install Linux runtime and build dependencies
         run: |
           sudo apt-get update
@@ -68,6 +82,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
+
+      - name: Test native transport
+        working-directory: native
+        run: go test ./...
 
       - name: Build Linux portable release
         run: python build_release.py

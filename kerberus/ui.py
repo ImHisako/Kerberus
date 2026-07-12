@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -49,9 +51,10 @@ from PyQt6.QtWidgets import (
 
 from .config import AppConfig
 from . import __version__
-from .crypto import IdentityBundle, b64, destination_b32, pq_available, unb64
+from .crypto import IdentityBundle, b64, destination_b32, pq_available, pq_unavailable_reason, unb64
 from .router import I2P_VERSION, RouterInstaller
 from .service import MessengerService
+from .updates import UpdateInfo, check_for_update, download_update
 
 
 COLORS = {
@@ -437,8 +440,13 @@ class MessageBubble(QWidget):
         status: str = "",
         timing: dict | None = None,
         on_timing: Callable[[dict], None] | None = None,
+        on_action: Callable[[str, dict], None] | None = None,
     ):
         super().__init__()
+        self.message = timing or {"text": text}
+        self.on_action = on_action
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 4, 20, 4)
         if outgoing:
@@ -488,6 +496,22 @@ class MessageBubble(QWidget):
         outer.addWidget(bubble)
         if not outgoing:
             outer.addStretch(1)
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        if self.on_action is None:
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copia")
+        forward_action = menu.addAction("Inoltra…")
+        menu.addSeparator()
+        delete_action = menu.addAction("Elimina da questo dispositivo")
+        selected = menu.exec(self.mapToGlobal(position))
+        if selected is copy_action:
+            self.on_action("copy", self.message)
+        elif selected is forward_action:
+            self.on_action("forward", self.message)
+        elif selected is delete_action:
+            self.on_action("delete", self.message)
 
 
 class ClickableFrame(QFrame):
@@ -623,10 +647,15 @@ class KerberusWindow(QMainWindow):
         except Exception as exc:
             KerberusMessageDialog.show_message(self, "Vault", str(exc))
             return self.initialize()
+        if not pq_available():
+            KerberusMessageDialog.show_message(
+                self,
+                "Post-quantum",
+                "Il backend ML-KEM-768 non può essere caricato. Reinstalla Kerberus con l'installer più recente.\n\n"
+                f"Dettaglio tecnico: {pq_unavailable_reason()}",
+            )
+            return False
         if not self.service.identity():
-            if not pq_available():
-                KerberusMessageDialog.show_message(self, "Post-quantum", "Il backend ML-KEM-768 non è disponibile.")
-                return False
             name, ok = self._ask_name()
             if not ok:
                 return False
@@ -634,6 +663,7 @@ class KerberusWindow(QMainWindow):
         self._build_ui()
         self.refresh_contacts()
         QTimer.singleShot(150, self.connect_router)
+        QTimer.singleShot(5000, self.check_updates)
         return True
 
     def _ask_name(self) -> tuple[str, bool]:
@@ -989,6 +1019,7 @@ class KerberusWindow(QMainWindow):
                     message.get("status", ""),
                     timing=message,
                     on_timing=self.show_message_timing,
+                    on_action=self.message_action,
                 ),
             )
         self.refresh_contacts()
@@ -1003,6 +1034,65 @@ class KerberusWindow(QMainWindow):
 
         QTimer.singleShot(0, restore_scroll)
         QTimer.singleShot(60, restore_scroll)
+
+    def message_action(self, action: str, message: dict) -> None:
+        if action == "copy":
+            QApplication.clipboard().setText(str(message.get("text", "")))
+            self.statusBar().showMessage("Messaggio copiato", 2500)
+            return
+        if action == "delete":
+            if KerberusMessageDialog.ask(
+                self,
+                "Elimina messaggio",
+                "Eliminare questo messaggio soltanto dal vault locale? Non verrà cancellato dal dispositivo del contatto.",
+            ):
+                self.service.delete_message(str(message.get("message_id", "")))
+                self.refresh_messages("delete", self.selected_contact)
+            return
+        if action == "forward":
+            self.forward_message(message)
+
+    def forward_message(self, message: dict) -> None:
+        contacts = self.service.contacts()
+        if not contacts:
+            return
+        dialog = KerberusDialog("Inoltra messaggio", self, 500)
+        layout = dialog.body_layout
+        title = QLabel("Scegli la chat")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        picker = QListWidget()
+        for contact in contacts:
+            item = QListWidgetItem(contact.name)
+            item.setData(Qt.ItemDataRole.UserRole, contact.identity_id)
+            picker.addItem(item)
+        layout.addWidget(picker)
+        actions = QHBoxLayout()
+        cancel = QPushButton("Annulla")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(dialog.reject)
+        send = QPushButton("Inoltra")
+        send.setObjectName("primary")
+        send.clicked.connect(dialog.accept)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(send)
+        layout.addLayout(actions)
+
+        def submit() -> None:
+            item = picker.currentItem()
+            if item is None:
+                return
+            contact_id = str(item.data(Qt.ItemDataRole.UserRole))
+            text = str(message.get("text", ""))
+            self._run_task(
+                lambda: self.service.forward_message(contact_id, text),
+                lambda _value: self.statusBar().showMessage("Messaggio inoltrato con nuova cifratura", 4000),
+                lambda error: self._error("Inoltro", error),
+            )
+
+        dialog.accepted.connect(submit)
+        self._show_modeless(dialog)
 
     def show_message_timing(self, message: dict) -> None:
         dialog = KerberusDialog("Tempi del messaggio", self, 570)
@@ -1206,8 +1296,12 @@ class KerberusWindow(QMainWindow):
         console_button = QPushButton("Apri Console UI")
         console_button.setIcon(lucide_icon("terminal"))
         console_button.clicked.connect(self.show_ui_console)
+        update_button = QPushButton("Controlla aggiornamenti")
+        update_button.setIcon(lucide_icon("refresh-cw"))
+        update_button.clicked.connect(lambda: self.check_updates(manual=True))
         layout.addWidget(diagnostics_label)
         layout.addWidget(console_button)
+        layout.addWidget(update_button)
         actions = QHBoxLayout()
         cancel = QPushButton("Annulla")
         cancel.setObjectName("ghost")
@@ -1226,6 +1320,58 @@ class KerberusWindow(QMainWindow):
 
         dialog.accepted.connect(save_settings)
         self._show_modeless(dialog)
+
+    def check_updates(self, manual: bool = False) -> None:
+        self._log_action("Controllo aggiornamenti GitHub")
+
+        def found(value: object) -> None:
+            info = value if isinstance(value, UpdateInfo) else None
+            if info is None:
+                if manual:
+                    KerberusMessageDialog.show_message(
+                        self, "Aggiornamenti", f"Kerberus {__version__} è la versione più recente."
+                    )
+                return
+            if KerberusMessageDialog.ask(
+                self,
+                "Aggiornamento disponibile",
+                f"È disponibile Kerberus {info.version}. Scaricare ora l'aggiornamento dalla release GitHub?",
+            ):
+                self._download_update(info)
+
+        def failed(error: str) -> None:
+            if manual:
+                self._error("Aggiornamenti", error)
+
+        self._run_task(lambda: check_for_update(__version__), found, failed)
+
+    def _download_update(self, info: UpdateInfo) -> None:
+        self.statusBar().showMessage(f"Download Kerberus {info.version}…", 10000)
+
+        def ready(value: object) -> None:
+            path = Path(str(value))
+            if os.name != "nt":
+                KerberusMessageDialog.show_message(
+                    self,
+                    "Aggiornamento verificato",
+                    f"SHA-256 valida. Il nuovo eseguibile è stato salvato in:\n{path}",
+                )
+                return
+            if not KerberusMessageDialog.ask(
+                self,
+                "Aggiornamento verificato",
+                "La checksum pubblicata nella release è valida. Chiudere Kerberus e avviare l'installer?",
+            ):
+                return
+            subprocess.Popen([str(path)], cwd=path.parent, close_fds=True)
+            self._allow_close = True
+            self.close()
+
+        self._run_task(
+            lambda: download_update(info, self.service.config.downloads_path / "updates"),
+            ready,
+            lambda error: self._error("Aggiornamenti", error),
+        )
 
     def show_profile(self) -> None:
         self._log_action("Apertura Profilo")

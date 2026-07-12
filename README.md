@@ -18,7 +18,11 @@ Kerberus è un messenger desktop sperimentale che comunica attraverso I2P usando
 - Cronologia e outbox salvate nel vault cifrato.
 - ACK firmati, anti-replay e retry automatici.
 - Stream I2P persistenti e riutilizzati tra contatti per ridurre la latenza.
+- Helper nativo Go incluso nelle release per multiplexare invio, ricezione e ACK sugli stream SAM senza richiedere Go sul PC dell'utente.
+- Apertura stream 0-RTT: il primo frame può viaggiare nel SYN I2P Streaming.
 - Messaggi mostrati immediatamente nella UI prima della consegna di rete.
+- Controllo aggiornamenti GitHub Releases con anti-rollback e verifica SHA-256.
+- Menu contestuale dei messaggi per copiare, eliminare localmente o inoltrare con una nuova cifratura.
 
 ## Come funziona
 
@@ -29,6 +33,8 @@ MessengerService
    |-- Vault cifrato (Argon2id + XChaCha20-Poly1305)
    |-- Identità e protocollo E2EE
    `-- SamClient
+          |-- helper Go nativo (CONNECT, ACCEPT, frame e ACK)
+          |-- listener Python avviato solo come fallback automatico
           |
           `-- I2P Router 2.12.0 / SAM 127.0.0.1:7656
 ```
@@ -37,13 +43,14 @@ Kerberus mantiene una destination I2P persistente per profilo. Il codice contatt
 
 Ogni messaggio viene cifrato per il destinatario e salvato localmente prima dell'invio. Se il peer o la sua LeaseSet non sono raggiungibili, il messaggio resta nella outbox cifrata e viene ritentato con backoff. Un ACK Ed25519 valido lo marca come consegnato.
 
-Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i contatti rimangono attivi. Kerberus usa tre tunnel in ingresso e uscita, un tunnel di backup e il profilo streaming interattivo. Queste impostazioni seguono le indicazioni delle documentazioni ufficiali [SAM v3](https://i2p.net/en/docs/api/samv3/), [I2CP](https://i2p.net/en/docs/specs/i2cp-overview/) e [Streaming](https://i2p.net/en/docs/api/streaming/).
+Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i contatti rimangono attivi. `SILENT=true` e un breve `connectDelay` permettono al primo frame di essere incluso nel SYN, evitando un round-trip applicativo. Kerberus usa tre tunnel in ingresso e uscita, un tunnel di backup e il profilo streaming interattivo. Non riduce la lunghezza dei tunnel per guadagnare velocità, perché cambierebbe il compromesso di anonimato. Queste impostazioni seguono le indicazioni delle documentazioni ufficiali [SAM v3](https://i2p.net/en/docs/api/samv3/), [I2CP](https://i2p.net/en/docs/specs/i2cp-overview/) e [Streaming](https://i2p.net/en/docs/api/streaming/).
 
 ## Requisiti
 
 - Windows 10/11 a 64 bit oppure Linux x86_64/aarch64 con ambiente desktop.
 - Connessione Internet.
 - Per lo sviluppo: Python 3.11 o successivo.
+- Solo per creare gli artefatti di release: Go 1.24 o successivo.
 - Per il router I2P standard: Java 17 o successivo. Kerberus non usa direttamente Java e l'installer lo aggiunge solo quando deve installare o aggiornare quel router.
 
 ## Installazione per utenti
@@ -55,6 +62,8 @@ Per diminuire la latenza, la sessione SAM e gli stream già aperti verso i conta
 3. Accetta l'installazione di I2P e, solo se necessario al router standard, di Java.
 4. Avvia Kerberus dal desktop o dal menu Start.
 5. Crea il vault e attendi lo stato **I2P: connesso**.
+
+`Kerberus.exe` e `KerberusInstaller.exe` includono Python, dipendenze native e helper Go: l'utente non deve installare Python o Go.
 
 L'installer scarica I2P 2.12.0 dal sito ufficiale e verifica la SHA-256 fissata nel codice. SAM viene configurato soltanto su loopback.
 
@@ -72,6 +81,8 @@ Kerberus configura SAM in `~/.i2p/clients.config.d/` e lo mantiene su `127.0.0.1
 ## Build automatica
 
 Il workflow GitHub Actions `.github/workflows/build.yml` esegue test e build sia su Windows sia su Linux. Produce installer Windows, binario Linux standalone, installer utente Linux e checksum; sui tag `v*` pubblica gli artefatti nella GitHub Release.
+
+All'avvio Kerberus controlla in background la release stabile più recente. Non accetta downgrade, scarica l'artefatto specifico della piattaforma e lo rende disponibile soltanto se la SHA-256 coincide con il manifest della stessa release. L'installazione richiede sempre una conferma esplicita; le release non hanno ancora una firma di code signing indipendente, quindi una compromissione dell'account o del workflow GitHub resta nel modello di minaccia.
 
 ## Avvio dal sorgente
 
@@ -117,6 +128,8 @@ Mittente e destinatario devono essere online contemporaneamente per la consegna.
 
 Un errore `CANT_REACH_PEER` non distrugge la sessione SAM: viene riaperto soltanto lo stream del contatto e il messaggio resta in coda. Un errore `INVALID_ID` causa una sola ricostruzione coordinata della sessione se la sua generazione è ancora quella guasta.
 
+Con il tasto destro su una bolla è possibile copiare il testo, cancellare la sola copia locale oppure inoltrarlo. L'inoltro crea un nuovo messaggio cifrato senza allegare l'identità del mittente originale. La cancellazione non può rimuovere copie già consegnate all'altro dispositivo.
+
 ## Test
 
 Suite completa:
@@ -154,6 +167,8 @@ Gli artefatti vengono prodotti in `release/`:
 
 Produce `Kerberus-linux-<arch>`, `install-linux.sh` e `SHA256SUMS-linux.txt`.
 
+Durante la build viene compilato `native/kerberus-native`; il binario è poi incorporato nell'eseguibile PyInstaller. Go mantiene tre `STREAM ACCEPT` pendenti, riusa gli stream in uscita e registra anche gli stream ricevuti come canali full-duplex per le risposte, evitando un secondo handshake nella direzione opposta. I callback applicativi passano attraverso una coda ordinata separata, così un messaggio ricevuto può causare immediatamente un nuovo invio senza bloccare il lettore IPC. Se l'helper non può essere avviato o termina, Kerberus avvia automaticamente il trasporto Python mantenendo lo stesso protocollo e la stessa outbox.
+
 ## Struttura del repository
 
 ```text
@@ -164,6 +179,8 @@ kerberus/
   vault.py        persistenza locale cifrata
   router.py       avvio, arresto e bootstrap I2P
   ui.py           interfaccia PyQt6
+  updates.py      update check, download e verifica GitHub Releases
+native/            multiplexer SAM persistente in Go
 installer.py      installer Windows
 build_release.py  build PyInstaller
 tests/            test unitari, UI e integrazione I2P
