@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kerberus-i2p"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Private hybrid post-quantum messenger over I2P SAM"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,13 +13,17 @@ dependencies = [
   "pqcrypto>=0.4,<0.5",
   "PyQt6>=6.8,<7",
   "emoji>=2.15,<3",
+  "psutil>=7.0,<8",
 ]
 
 [project.scripts]
 kerberus = "kerberus.main:main"
 
 [project.optional-dependencies]
-build = ["pyinstaller>=6.21,<7"]
+build = ["build>=1.2,<2", "pyinstaller>=6.21,<7"]
+
+[tool.setuptools.dynamic]
+version = {attr = "kerberus.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["kerberus*"]

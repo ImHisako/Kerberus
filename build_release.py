@@ -8,11 +8,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from kerberus import __version__
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 RELEASE = ROOT / "release"
 NATIVE_DIR = ROOT / "native"
+
+
+def validate_release_tag() -> None:
+    if os.environ.get("GITHUB_REF_TYPE") != "tag":
+        return
+    tag = os.environ.get("GITHUB_REF_NAME", "")
+    expected = f"v{__version__}"
+    if tag != expected:
+        raise RuntimeError(f"Il tag {tag or '(vuoto)'} non corrisponde alla versione {expected}")
 
 
 def build_native_helper() -> Path:
@@ -39,6 +49,7 @@ def run_pyinstaller(arguments: list[str]) -> None:
 def main() -> int:
     if os.name not in ("nt", "posix"):
         raise RuntimeError("Sistema operativo non supportato")
+    validate_release_tag()
     installer_only = "--installer-only" in sys.argv
     if not installer_only:
         native_helper = build_native_helper()

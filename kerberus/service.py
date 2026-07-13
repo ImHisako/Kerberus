@@ -231,8 +231,9 @@ class MessengerService:
         settings.setdefault("send_read_receipts", True)
         settings.setdefault("link_previews", False)
         settings.setdefault("clearnet_enabled", False)
+        settings.setdefault("stream_proof_enabled", False)
         settings.setdefault("language", "it")
-        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray"):
+        for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
         return dict(settings)
 
@@ -255,7 +256,7 @@ class MessengerService:
     def update_privacy_settings(self, **values: object) -> dict:
         allowed = {
             "send_delivery_receipts", "send_read_receipts", "link_previews",
-            "clearnet_enabled",
+            "clearnet_enabled", "stream_proof_enabled",
             "language",
         }
         unknown = set(values) - allowed
@@ -266,7 +267,7 @@ class MessengerService:
         with self._state_lock:
             settings = self.vault.state.setdefault("settings", {})
             settings.update(values)
-            for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray"):
+            for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
                 settings.pop(obsolete, None)
             self.vault.save()
         self._emit_protocol_event("privacy_settings_updated", "Policy rete e ricevute aggiornata")
@@ -279,19 +280,42 @@ class MessengerService:
             "send_read_receipts": stored.get("send_read_receipts"),
             "link_previews": stored.get("link_previews"),
             "notifications": bool(stored.get("notifications", True)),
+            "show_identity_id": bool(stored.get("show_identity_id", True)),
+            "remote_identity_id_visible": bool(stored.get("remote_identity_id_visible", True)),
         }
 
     def update_chat_settings(self, contact_id: str, **values: object) -> dict:
         if contact_id not in self.vault.state.get("contacts", {}):
             raise ValueError("Contatto non trovato")
-        allowed = {"send_delivery_receipts", "send_read_receipts", "link_previews", "notifications"}
+        allowed = {
+            "send_delivery_receipts", "send_read_receipts", "link_previews", "notifications",
+            "show_identity_id",
+        }
         if set(values) - allowed:
             raise ValueError("Impostazione chat non supportata")
         with self._state_lock:
             stored = self.vault.state.setdefault("chat_settings", {}).setdefault(contact_id, {})
+            visibility_changed = (
+                "show_identity_id" in values
+                and bool(stored.get("show_identity_id", True)) != bool(values["show_identity_id"])
+            )
             stored.update(values)
             self.vault.save()
+        if visibility_changed:
+            self._send_identity_visibility(contact_id, bool(values["show_identity_id"]))
         return self.chat_settings(contact_id)
+
+    def _send_identity_visibility(self, contact_id: str, visible: bool) -> None:
+        identity = self.identity()
+        contact_data = self.vault.state.get("contacts", {}).get(contact_id)
+        if not identity or not contact_data:
+            return
+        contact = IdentityBundle.from_dict(contact_data)
+        envelope = seal_payload(
+            identity, self.secrets(), contact,
+            {"kind": "identity_visibility", "visible": bool(visible)},
+        )
+        self._queue_control(contact.destination, envelope, background=True)
 
     def _privacy_enabled(self, contact_id: str, name: str) -> bool:
         override = self.chat_settings(contact_id).get(name)
@@ -746,6 +770,12 @@ class MessengerService:
                 self.vault.state["seen"] = self.vault.state["seen"][-10000:]
             self._receive_reaction(sender_id, clear)
             return None
+        if kind == "identity_visibility":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+            self._receive_identity_visibility(sender_id, clear)
+            return None
         if kind != "message":
             return None
         with self._state_lock:
@@ -797,6 +827,19 @@ class MessengerService:
                     break
         if self.on_message:
             self.on_message("status", sender_id)
+
+    def _receive_identity_visibility(self, sender_id: str, clear: dict) -> None:
+        visible = clear.get("visible")
+        if not isinstance(visible, bool):
+            return
+        with self._state_lock:
+            stored = self.vault.state.setdefault("chat_settings", {}).setdefault(sender_id, {})
+            stored["remote_identity_id_visible"] = visible
+            self.vault.save()
+        self._emit_protocol_event(
+            "identity_visibility_updated",
+            "Il contatto ha aggiornato la visibilità del proprio Identity ID",
+        )
 
     def _mark_outgoing_status(self, contact_id: str, message_ids: list[str], status: str, received_at: object = None) -> None:
         changed = False

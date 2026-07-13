@@ -27,9 +27,9 @@ Il progetto segue alcuni principi fondamentali:
 | Identità | Profili firmati Ed25519, ID crittografico stabile, username, avatar, destination I2P persistente |
 | Contatti | Codici a rotazione, uso singolo opzionale, request/accept/reject firmati, cancellazione delle richieste pendenti |
 | Cifratura | Envelope ibrido X25519 + ML-KEM-768, XChaCha20-Poly1305, autenticazione Ed25519, Double Ratchet v3, messaggi fuori ordine limitati |
-| Privacy | Nessuna telemetria applicativa, ricevute e reazioni cifrate, impostazioni per chat, anteprime opzionali, padding a classi di dimensione |
-| Interfaccia | Desktop PyQt6, italiano e inglese, selettore Unicode ricercabile, reazioni, avatar e username sui messaggi, system tray |
-| Diagnostica | Console eventi locale, errori di connessione espliciti, export JSON per chat con timestamp e misure dei ritardi |
+| Privacy | Nessuna telemetria applicativa, ricevute e reazioni cifrate, impostazioni per chat, anteprime opzionali, padding a classi di dimensione, esclusione Windows e privacy curtain Linux |
+| Interfaccia | Desktop PyQt6, italiano e inglese, pannelli interni per emoji e profili, reazioni, dropdown moderni, impostazioni organizzate, system tray |
+| Diagnostica | Console eventi locale, errori espliciti, peer di trasporto I2P con dettagli geografici automatici, export JSON per chat |
 | Trasporto | I2P SAM v3, sessione e stream persistenti, multiplexer Go nativo con fallback Python, risposte inline full-duplex |
 | Piattaforme | Installer standalone Windows, build portabili Linux, avvio dal sorgente con Python 3.11+ |
 
@@ -50,7 +50,7 @@ Le ricevute di consegna e lettura possono essere disabilitate globalmente o per 
 
 ### Reazioni ed emoji
 
-Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. Le reazioni sono cifrate nel canale ratchet. Se l’utente seleziona nuovamente la stessa reazione, Kerberus la rimuove localmente e invia al peer un evento di rimozione autenticato.
+Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. I messaggi brevi composti soltanto da emoji vengono riconosciuti come reazioni rapide e mostrati in una bolla compatta con emoji ingrandite; le reazioni applicate a un messaggio sono raccolte in un chip dedicato. Le reazioni sono cifrate nel canale ratchet. Se l’utente seleziona nuovamente la stessa reazione, Kerberus la rimuove localmente e invia al peer un evento di rimozione autenticato.
 
 ### Azioni sui messaggi
 
@@ -66,9 +66,11 @@ Eliminare un messaggio già consegnato non cancella la copia del peer. Gli appun
 
 ### Profili e interfaccia della chat
 
-Ogni messaggio mostra username e avatar firmati del mittente. L’avatar fa parte del profilo pubblico firmato ed è limitato a un piccolo PNG. Le conversazioni lunghe caricano inizialmente i 160 messaggi più recenti; la cronologia precedente viene caricata progressivamente per mantenere l’interfaccia reattiva.
+Ogni messaggio mostra username e avatar firmati del mittente. L’avatar fa parte del profilo pubblico firmato ed è limitato a un piccolo PNG. La larghezza della bolla segue il contenuto: resta compatta per testo breve e cresce fino a un limite leggibile per i messaggi lunghi. Le conversazioni usano un modello virtualizzato: l’intera cronologia appartiene a una sola scrollbar stabile, mentre vengono disegnate soltanto le righe visibili. Rotellina e trascinamento si muovono quindi in modo continuo, senza creare widget durante lo scroll o cambiare il range a blocchi. Le impostazioni della conversazione e il profilo del contatto si aprono nello stesso drawer laterale interno, non in finestre separate spostabili.
 
-L’app supporta italiano e inglese. La lingua scelta viene salvata nel vault e applicata al successivo avvio.
+Ogni utente può decidere per contatto se mostrare il proprio identity ID nell’interfaccia profilo del peer. La preferenza viene trasmessa cifrata e controlla soltanto la presentazione: l’identity ID stabile resta parte del protocollo autenticato ed è tecnicamente già noto a un contatto accettato.
+
+L’app supporta italiano e inglese. La lingua scelta viene salvata nel vault e applicata immediatamente.
 
 ## Contatti e verifica dell’identità
 
@@ -227,10 +229,22 @@ Le impostazioni globali e per chat comprendono:
 - notifiche desktop;
 - anteprime link esterne;
 - durata e uso singolo dei codici contatto.
+- protezione streaming su Windows e Linux;
+- ispezione dei peer di trasporto I2P con ricerca gratuita per singolo IP.
+
+### Protezione streaming
+
+Su Windows, l’opzione applica `WDA_EXCLUDEFROMCAPTURE` alla finestra principale e ai dialoghi appartenenti a Kerberus. Gli strumenti compatibili di cattura e condivisione schermo dovrebbero omettere l’app mentre la finestra resta visibile sul monitor locale.
+
+Linux non offre un opt-out universale mentre una finestra resta visibile. Kerberus usa quindi una privacy curtain: **Nascondi Kerberus ora** rimuove dal desktop la finestra principale e i dialoghi, lasciando l’icona nell’area di notifica per riaprire l’app. Questo tiene il contenuto nascosto fuori dalla condivisione dell’intero schermo, senza promettere un comportamento invisibile nello stream ma visibile localmente. Nessuna delle due modalità protegge da fotocamere, software con privilegi superiori o metodi di cattura non supportati.
+
+### Diagnostica rete e dettagli IP
+
+La pagina Rete legge automaticamente all’apertura, e poi ogni 30 secondi, le connessioni TCP pubbliche stabilite dal processo router I2P locale. Sono peer di trasporto osservati e non necessariamente gli hop esatti di uno specifico tunnel I2P. Paese, ASN e nome della rete vengono recuperati automaticamente per ciascun nuovo indirizzo tramite `ipwho.is` e conservati in cache durante la sessione. La lista può essere compressa con il controllo a chevron. Ogni ricerca comunica l’indirizzo del peer al servizio esterno.
 
 ### Anteprime link
 
-Le anteprime sono disattivate per impostazione predefinita. Quando abilitate, Kerberus può contattare direttamente un sito clearnet per scaricare metadata HTML/Open Graph e un’immagine di dimensione limitata. L’implementazione:
+Le anteprime sono disattivate per impostazione predefinita. Kerberus rende cliccabili e sottolineati tutti gli URL HTTP/HTTPS presenti nel testo anche senza anteprima. Prima di passare un collegamento al browser mostra sempre una conferma interna con dominio, URL completo e avviso di sicurezza; annullando, il browser non viene avviato. Quando le anteprime sono abilitate, la stessa conferma protegge anche il clic sull’intera card moderna con sito, titolo, autore, descrizione e immagine quando disponibili. I messaggi privi di URL non ricevono alcun indicatore di anteprima. Kerberus può contattare direttamente un sito clearnet per scaricare metadata HTML/Open Graph e un’immagine di dimensione limitata. L’implementazione:
 
 - accetta soltanto HTTP e HTTPS;
 - rifiuta credenziali incluse negli URL;
@@ -376,7 +390,13 @@ Linux:
 .venv/bin/python build_release.py
 ```
 
-Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test e build Windows/Linux e pubblica le release associate ai tag.
+Artefatti sorgente Python e archivio completo:
+
+```powershell
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.6.0
+```
+
+Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.6.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
 
 ## Struttura del repository
 
@@ -388,12 +408,14 @@ kerberus/
   vault.py         persistenza locale cifrata
   sam.py           sessione SAM, stream, IPC helper e fallback Python
   link_preview.py  parsing metadata e download resistente a SSRF
+  network_insights.py  peer I2P locali e ricerca IP gratuita esplicita
   router.py        bootstrap, configurazione, avvio e arresto I2P
   updates.py       controllo release GitHub e verifica SHA-256
   ui.py            interfaccia PyQt6 e localizzazione
 native/             multiplexer SAM in Go
 installer.py        installer Windows
 build_release.py    build PyInstaller
+build_source_release.py  wheel, sdist e archivio sorgente verificato
 tests/              test crypto, service, UI, trasporto, updater e live
 docs/adr/           decisioni architetturali
 ```

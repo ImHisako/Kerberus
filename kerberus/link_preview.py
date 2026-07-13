@@ -21,9 +21,16 @@ class LinkPreviewError(ValueError):
     pass
 
 
+def extract_urls(text: str) -> tuple[str, ...]:
+    return tuple(
+        value for match in URL_RE.finditer(text)
+        if (value := match.group(0).rstrip(".,;:!?)\"]}"))
+    )
+
+
 def extract_url(text: str) -> str:
-    match = URL_RE.search(text)
-    return match.group(0).rstrip(".,;:!?)\"]}") if match else ""
+    urls = extract_urls(text)
+    return urls[0] if urls else ""
 
 
 def _validate_url(url: str) -> urllib.parse.SplitResult:

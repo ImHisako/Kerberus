@@ -1,0 +1,14 @@
+include README.md
+include README.it.md
+include CHANGELOG.md
+include RELEASE.md
+include requirements.txt
+include kerberus_app.py
+include installer.py
+include build_release.py
+include build_source_release.py
+include install-linux.sh
+recursive-include kerberus/assets *.svg LICENSE
+recursive-include native *.go go.mod
+recursive-include docs *.md
+recursive-include tests *.py

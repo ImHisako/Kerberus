@@ -4,7 +4,7 @@ import unittest
 import urllib.parse
 from unittest.mock import patch
 
-from kerberus.link_preview import LinkPreviewError, _download, _validate_url, extract_url, fetch_link_preview
+from kerberus.link_preview import LinkPreviewError, _download, _validate_url, extract_url, extract_urls, fetch_link_preview
 
 
 class LinkPreviewTests(unittest.TestCase):
@@ -12,6 +12,12 @@ class LinkPreviewTests(unittest.TestCase):
         self.assertEqual(
             extract_url("guarda https://example.com/video?id=1, poi dimmi"),
             "https://example.com/video?id=1",
+        )
+
+    def test_extracts_every_http_url(self):
+        self.assertEqual(
+            extract_urls("Prima https://example.com/a, poi http://example.org/b!"),
+            ("https://example.com/a", "http://example.org/b"),
         )
 
     def test_blocks_loopback_and_private_addresses(self):

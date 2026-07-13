@@ -23,6 +23,58 @@ class ServiceTests(unittest.TestCase):
             time.sleep(0.01)
         return bool(predicate())
 
+    def test_stream_proof_preference_is_persisted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            self.assertFalse(service.settings()["stream_proof_enabled"])
+            service.update_privacy_settings(stream_proof_enabled=True)
+            self.assertTrue(service.settings()["stream_proof_enabled"])
+            service.close(wait=True)
+
+    def test_obsolete_ipinfo_token_is_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            service.vault.state["settings"]["ipinfo_token"] = "legacy-token"
+            self.assertNotIn("ipinfo_token", service.settings())
+            service.close(wait=True)
+
+    def test_identity_id_visibility_is_shared_with_the_contact(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            routes = {alice.destination: alice_service, bob.destination: bob_service}
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    routes[destination]._receive(payload)
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            bob_service.sam = Endpoint()
+            alice_service.update_chat_settings(bob.identity_id, show_identity_id=False)
+            self.assertTrue(self._wait_for(
+                lambda: not bob_service.chat_settings(alice.identity_id)["remote_identity_id_visible"]
+            ))
+            self.assertFalse(alice_service.chat_settings(bob.identity_id)["show_identity_id"])
+            alice_service.update_chat_settings(bob.identity_id, show_identity_id=True)
+            self.assertTrue(self._wait_for(
+                lambda: bob_service.chat_settings(alice.identity_id)["remote_identity_id_visible"]
+            ))
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
     def test_replayed_message_is_stored_once(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

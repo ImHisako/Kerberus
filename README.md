@@ -27,9 +27,9 @@ Kerberus is designed around a small set of principles:
 | Identity | Ed25519-signed profiles, stable cryptographic identity ID, username, avatar, persistent I2P destination |
 | Contacts | Rotating contact codes, optional single use, signed request/accept/reject controls, pending-request cancellation |
 | Encryption | X25519 + ML-KEM-768 hybrid envelope, XChaCha20-Poly1305, Ed25519 authentication, Double Ratchet v3, bounded out-of-order support |
-| Privacy | No application telemetry, encrypted receipts and reactions, per-chat overrides, optional link previews, padded plaintext buckets |
-| Interface | PyQt6 desktop UI, Italian and English, searchable Unicode emoji picker, reactions, profile pictures and usernames on messages, system tray |
-| Diagnostics | Local UI event console, explicit connection errors, per-chat JSON export with timestamps and delay measurements |
+| Privacy | No application telemetry, encrypted receipts and reactions, per-chat overrides, optional link previews, padded plaintext buckets, Windows capture exclusion and Linux privacy curtain |
+| Interface | PyQt6 desktop UI, Italian and English, embedded emoji and contact-profile panels, reactions, modern dropdowns, organized settings, system tray |
+| Diagnostics | Local UI event console, explicit connection errors, I2P transport peers with automatic geographic details, per-chat JSON export |
 | Transport | I2P SAM v3, persistent session and streams, native Go multiplexer with Python fallback, full-duplex inline replies |
 | Platforms | Standalone Windows installer and Linux portable builds, source execution on Python 3.11+ |
 
@@ -50,7 +50,7 @@ Delivery and read receipts can be disabled globally or for an individual convers
 
 ### Reactions and emoji
 
-Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Reactions are encrypted inside the ratchet channel. Selecting the same reaction again removes the local user's reaction and sends an authenticated removal event to the peer.
+Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Short emoji-only messages are recognized as quick reactions and displayed in a compact bubble with enlarged emoji; reactions attached to a message are grouped in a dedicated chip. Reactions are encrypted inside the ratchet channel. Selecting the same reaction again removes the local user's reaction and sends an authenticated removal event to the peer.
 
 ### Message actions
 
@@ -66,9 +66,11 @@ Deleting a delivered message cannot erase the peer's copy. Clipboard contents ar
 
 ### Profiles and conversation UI
 
-Every message displays the sender's signed username and avatar. Avatars are signed as part of the public profile and limited to a small PNG payload. Long conversations initially render the newest 160 messages; older history can be loaded incrementally to keep the UI responsive.
+Every message displays the sender's signed username and avatar. Avatars are signed as part of the public profile and limited to a small PNG payload. Bubble width follows its content: it remains compact for short text and grows up to a readable limit for long messages. Conversations use a virtualized model/view: the complete history is available to one stable scrollbar while only visible rows are painted. Dragging or using the wheel therefore moves continuously without creating message widgets or paginated range jumps. Conversation settings and contact profiles open in the same in-app side drawer rather than separate movable windows.
 
-The application supports Italian and English. The selected language is stored in the vault and applied on the next launch.
+Each user can choose per contact whether their identity ID is displayed in the peer's profile UI. This encrypted preference controls presentation only: the stable identity ID remains part of the authenticated protocol and is already technically known to an accepted contact.
+
+The application supports Italian and English. The selected language is stored in the vault and applied immediately.
 
 ## Contacts and identity verification
 
@@ -227,10 +229,22 @@ Global and per-chat settings cover:
 - desktop notifications;
 - external link previews;
 - contact-code lifetime and single-use behavior.
+- Windows/Linux streaming protection.
+- I2P transport-peer inspection with free, keyless per-IP lookup.
+
+### Streaming protection
+
+On Windows, the optional streaming-protection setting applies `WDA_EXCLUDEFROMCAPTURE` to the main window and owned dialogs. Compatible capture and screen-sharing tools should omit Kerberus while the window remains visible on the local monitor.
+
+Linux has no universal application opt-out while a window remains visible. Kerberus therefore provides a privacy curtain: **Hide Kerberus now** removes the main window and owned dialogs from the desktop while leaving the tray icon available for restoring the app. This reliably keeps the hidden content out of full-screen sharing, but does not claim invisible-while-locally-visible behavior. Neither platform mode protects against cameras, higher-privileged software, or unsupported capture paths.
+
+### Network insights and IP details
+
+The Network settings page automatically inspects public TCP connections owned by the local I2P router when opened and every 30 seconds afterward. These are observed transport peers and are not necessarily the exact hops of a particular I2P tunnel. Country, ASN, and network name are automatically retrieved for every new address through `ipwho.is` and cached for the session. The peer list can be collapsed with its chevron control. Each lookup discloses that peer address to the external service.
 
 ### Link previews
 
-Link previews are disabled by default. When enabled, Kerberus may contact a clearnet website directly to obtain HTML/Open Graph metadata and a limited-size image. The implementation:
+Link previews are disabled by default. Kerberus makes every HTTP/HTTPS URL in message text clickable and underlined even without a preview. Before handing a link to the browser, it always displays an in-app confirmation with the domain, complete URL, and a security warning; cancelling does not launch the browser. When previews are enabled, the same confirmation protects clicks anywhere on the modern card containing the site, title, author, description, and image when available. Messages without a URL receive no preview indicator. Kerberus may contact a clearnet website directly to obtain HTML/Open Graph metadata and a limited-size image. The implementation:
 
 - accepts only HTTP and HTTPS;
 - rejects credentials embedded in URLs;
@@ -376,7 +390,13 @@ Linux:
 .venv/bin/python build_release.py
 ```
 
-Artifacts are written to `release/`. GitHub Actions tests and builds Windows and Linux artifacts and publishes tagged releases.
+Python source artifacts and the complete source archive:
+
+```powershell
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.6.0
+```
+
+Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.6.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
 
 ## Repository layout
 
@@ -388,12 +408,14 @@ kerberus/
   vault.py         encrypted local persistence
   sam.py           SAM session, streams, native-helper IPC, Python fallback
   link_preview.py  metadata parsing and SSRF-resistant preview fetching
+  network_insights.py  local I2P peer discovery and explicit free IP lookup
   router.py        I2P bootstrap, configuration, start and stop
   updates.py       GitHub release check and SHA-256 verification
   ui.py            PyQt6 desktop interface and localization
 native/             Go SAM stream multiplexer
 installer.py        Windows installer
 build_release.py    PyInstaller release build
+build_source_release.py  verified wheel, sdist, and source archive
 tests/              crypto, service, UI, transport, updater and live tests
 docs/adr/           architecture decision records
 ```

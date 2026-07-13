@@ -14,8 +14,9 @@ import urllib.request
 from pathlib import Path
 from tkinter import BOTH, LEFT, RIGHT, X, Button, Frame, Label, StringVar, Tk, messagebox, ttk
 
+from kerberus import __version__
 
-APP_VERSION = "0.5.0"
+APP_VERSION = __version__
 I2P_VERSION = "2.12.0"
 I2P_URL = f"https://files.i2p.net/{I2P_VERSION}/i2pinstall_{I2P_VERSION}_windows.exe"
 I2P_SHA256 = "827daf222bfaee4e44c653702213d5c8e30cabd3e589dafe646c4d13c3692e5f"

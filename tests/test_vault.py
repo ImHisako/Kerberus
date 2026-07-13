@@ -17,10 +17,11 @@ class VaultTests(unittest.TestCase):
             reopened = Vault(path)
             reopened.unlock("password-lunga-di-test")
             self.assertEqual(reopened.state["messages"][0]["text"], "segreto")
+            self.assertFalse(reopened.state["settings"]["stream_proof_enabled"])
+            self.assertNotIn("ipinfo_token", reopened.state["settings"])
             with self.assertRaises(ValueError):
                 Vault(path).unlock("password-completamente-errata")
 
 
 if __name__ == "__main__":
     unittest.main()
-
