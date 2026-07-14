@@ -1,10 +1,11 @@
 import unittest
 import os
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
-from kerberus.sam import SamClient, SamError, _write_private_text
+from kerberus.sam import NativeSamTransport, SamClient, SamError, _write_private_text
 
 
 class FakeSocket:
@@ -16,6 +17,35 @@ class FakeSocket:
 
 
 class SamTests(unittest.TestCase):
+    def test_native_request_reports_python_and_go_stages_separately(self):
+        transport = object.__new__(NativeSamTransport)
+        transport._pending = {}
+        transport._pending_lock = threading.Lock()
+
+        def respond(command):
+            event, result = transport._pending[command["id"]]
+            result.update({
+                "ok": True,
+                "metrics": {
+                    "queue_wait_us": 1250,
+                    "handler_us": 1000,
+                    "sam_handshake_us": 2500,
+                    "i2p_stream_open_us": 3500,
+                    "cold_stream": True,
+                },
+            })
+            event.set()
+
+        transport._write = respond
+        metrics = transport.request("probe", "peer")
+        self.assertEqual(metrics["queue_wait_ms"], 1.25)
+        self.assertEqual(metrics["sam_handshake_ms"], 2.5)
+        self.assertEqual(metrics["i2p_stream_open_ms"], 3.5)
+        self.assertTrue(metrics["cold_stream"])
+        self.assertGreaterEqual(metrics["python_helper_roundtrip_ms"], 0)
+        self.assertGreaterEqual(metrics["python_helper_ipc_overhead_ms"], 0)
+        self.assertEqual(metrics["backend"], "go-native")
+
     def test_persistent_destination_is_written_as_a_private_file(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "sam-destination.txt"
@@ -59,6 +89,30 @@ class SamTests(unittest.TestCase):
         second = SamClient("127.0.0.1", 7656, Path("two"))
         self.assertNotEqual(first.session_id, second.session_id)
         self.assertTrue(first.session_id.startswith("kerberus-"))
+
+    def test_latency_profiles_keep_redundancy_and_never_allow_zero_hop(self):
+        client = SamClient("127.0.0.1", 7656, Path("unused"))
+        standard = client._session_options()
+        self.assertIn("inbound.length=3 outbound.length=3", standard)
+        self.assertIn("i2p.streaming.initialAckDelay=25", standard)
+        self.assertIn("inbound.quantity=3 outbound.quantity=3", standard)
+        self.assertIn("inbound.backupQuantity=1 outbound.backupQuantity=1", standard)
+        self.assertIn("inbound.allowZeroHop=false outbound.allowZeroHop=false", standard)
+
+        self.assertFalse(client.configure_low_latency(True, restart=False))
+        low_latency = client._session_options()
+        self.assertIn("inbound.length=2 outbound.length=2", low_latency)
+        self.assertIn("i2p.streaming.initialAckDelay=0", low_latency)
+        self.assertNotIn("length=1", low_latency)
+
+    def test_changing_latency_profile_restarts_only_an_active_session(self):
+        client = SamClient("127.0.0.1", 7656, Path("unused"))
+        client.start_session = Mock(return_value="destination")
+        self.assertFalse(client.configure_low_latency(True))
+        client.start_session.assert_not_called()
+        client._control = Mock()
+        self.assertTrue(client.configure_low_latency(False))
+        client.start_session.assert_called_once_with(force=True)
 
     def test_send_recreates_missing_session(self):
         client = SamClient("127.0.0.1", 7656, Path("unused"))

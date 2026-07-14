@@ -7,6 +7,7 @@ include kerberus_app.py
 include installer.py
 include build_release.py
 include build_source_release.py
+global-exclude *.pyc *.pyo
 include install-linux.sh
 recursive-include kerberus/assets *.svg LICENSE
 recursive-include native *.go go.mod

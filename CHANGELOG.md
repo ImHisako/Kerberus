@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0
+
+- Modalità I2P opzionale a bassa latenza con tunnel da 2 hop, ACK immediato, conferma incorporata e preparazione configurabile dei contatti recenti.
+- Dispatcher Go concorrente tra contatti e FIFO per singola destination, con benchmark e misure separate per IPC Python/Go, handshake SAM, apertura stream I2P e ricevuta cifrata.
+- Reazioni multiple per partecipante, chip aggregati e rimozione della propria reazione con clic sinistro; avvertenza esplicita sul compromesso privacy/prestazioni degli stream recenti preparati.
+- Mascheramento opzionale della recency nel warm-up: campionamento casuale di un massimo di 8 contatti reali, con avvertenza che non può falsificare le destination visibili a SAM.
+
 ## 0.6.0
 
 - Nuova cronologia chat virtualizzata con scrollbar stabile e scorrimento fluido su conversazioni lunghe.

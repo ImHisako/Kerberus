@@ -11,8 +11,9 @@ from PyQt6.QtTest import QSignalSpy, QTest
 
 from kerberus.crypto import generate_identity
 from kerberus.ui import (
-    STYLE, EmojiPanel, EmojiPicker, ExternalLinkDialog, KerberusWindow, MessageBubble, ModernComboBox,
-    NetworkInsightsPanel, ToggleSwitch, emoji_catalog, is_emoji_reaction, localize_widget,
+    STYLE, EmojiPanel, EmojiPicker, ExternalLinkDialog, InlineConfirmationPanel, KerberusWindow, MessageBubble, ModernComboBox,
+    NetworkInsightsPanel, SettingsToggleRow, ToggleSwitch, VirtualChatView, emoji_catalog, is_emoji_reaction,
+    localize_widget,
     open_external_link, set_language, set_window_capture_exclusion,
 )
 
@@ -67,6 +68,38 @@ class UiTests(unittest.TestCase):
         self.assertLess(geometry["bubble_width"], 180)
         self.assertEqual(geometry["reactions"], ("❤️",))
         window.service.close()
+
+    def test_multiple_reactions_render_as_clickable_owned_chips(self):
+        view = VirtualChatView()
+        view.resize(760, 260)
+        local, _local_secrets = generate_identity("Alice")
+        remote, _remote_secrets = generate_identity("Bob")
+        view.configure(local, remote, None, None, False)
+        message = {
+            "message_id": "a" * 32,
+            "direction": "out",
+            "text": "Più reazioni",
+            "sent_at": 1_700_000_000,
+            "status": "delivered",
+            "reactions": {
+                local.identity_id: ["👍", "❤️"],
+                remote.identity_id: ["👍"],
+            },
+        }
+        actions = []
+        view.on_action = lambda action, selected: actions.append((action, selected["message_id"]))
+        view.sync_messages([message])
+        view.show()
+        self.app.processEvents()
+        index = view.chat_model.index(0, 0)
+        regions = view.chat_delegate.reaction_regions(
+            message, view.visualRect(index), view.font()
+        )
+        self.assertEqual([(emoji, len(owners)) for emoji, owners, _rect in regions], [("👍", 2), ("❤️", 1)])
+        heart = next(rect for emoji, _owners, rect in regions if emoji == "❤️")
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=heart.center())
+        self.assertEqual(actions, [("react:❤️", "a" * 32)])
+        view.close()
 
     def test_virtual_link_previews_only_exist_for_messages_with_urls(self):
         window = KerberusWindow()
@@ -349,6 +382,36 @@ class UiTests(unittest.TestCase):
         dialog.close()
         window.service.close()
 
+    def test_low_latency_requires_non_movable_inline_confirmation(self):
+        window = KerberusWindow()
+        window._build_ui()
+        window.show_settings()
+        self.app.processEvents()
+        dialog = next(iter(window._open_dialogs))
+        navigation = [
+            button for button in dialog.findChildren(QPushButton)
+            if button.objectName() == "settingsNav"
+        ]
+        navigation[2].click()
+        self.app.processEvents()
+        row = dialog.findChild(SettingsToggleRow, "lowLatencySetting")
+        switch = row.findChild(ToggleSwitch)
+        confirmation = dialog.findChild(InlineConfirmationPanel)
+        self.assertIsNotNone(confirmation)
+        self.assertFalse(confirmation.isWindow())
+        self.assertFalse(switch.isChecked())
+        switch.click()
+        self.app.processEvents()
+        self.assertFalse(switch.isChecked())
+        self.assertTrue(confirmation.isVisible())
+        confirm = confirmation.findChild(QPushButton, "confirmLowLatency")
+        confirm.click()
+        self.app.processEvents()
+        self.assertTrue(switch.isChecked())
+        self.assertFalse(confirmation.isVisible())
+        dialog.close()
+        window.service.close()
+
     def test_network_insights_refresh_and_ip_details_are_automatic(self):
         peers = [{"ip": "8.8.8.8", "port": 443}]
         details = {"country": "United States", "country_code": "US", "as_name": "Google"}
@@ -364,7 +427,10 @@ class UiTests(unittest.TestCase):
             dialog = next(iter(window._open_dialogs))
             panel = dialog.findChild(NetworkInsightsPanel)
             collect.assert_called()
-            lookup.assert_called_with("8.8.8.8")
+            # A lookup started by a previous modeless settings dialog may
+            # complete while this patch is active; require the expected call
+            # without assuming it is globally the last background lookup.
+            lookup.assert_any_call("8.8.8.8")
             self.assertIn("Google", panel._detail_labels["8.8.8.8"].text())
             self.assertTrue(panel.auto_refresh.isActive())
             dialog.close()
@@ -422,6 +488,11 @@ class UiTests(unittest.TestCase):
             self.assertIn("Streaming protection", texts)
             self.assertIn("Hide Kerberus during streaming and screen sharing", texts)
             self.assertIn("I2P countries and peers", texts)
+            self.assertIn("Low-latency mode", texts)
+            self.assertIn("Keep recent contacts ready", texts)
+            self.assertTrue(any("Disable it for maximum privacy" in text for text in texts))
+            self.assertIn("Mask which contacts are recent", texts)
+            self.assertTrue(any("Does not spoof I2P" in text for text in texts))
             self.assertNotIn("Generali", texts)
             self.assertNotIn("Protezione streaming", texts)
             dialog.close()

@@ -72,6 +72,15 @@ def main() -> int:
     app = DIST / ("Kerberus.exe" if os.name == "nt" else "Kerberus")
     if not app.exists():
         raise RuntimeError("La build di Kerberus non è stata prodotta")
+    release_test = subprocess.run(
+        [str(app), "--release-self-test", __version__],
+        timeout=60,
+        check=False,
+    )
+    if release_test.returncode != 0:
+        raise RuntimeError(
+            f"Self-test versione/moduli della build fallito: {release_test.returncode}"
+        )
     crypto_test = subprocess.run([str(app), "--crypto-self-test"], timeout=60, check=False)
     if crypto_test.returncode != 0:
         raise RuntimeError(f"Self-test ML-KEM della build fallito: {crypto_test.returncode}")

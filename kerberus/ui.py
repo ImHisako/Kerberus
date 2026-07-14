@@ -127,7 +127,9 @@ _ENGLISH = {
     "La lingua selezionata verrà applicata al prossimo avvio.": "The selected language will be applied on next launch.",
     "Italiano": "Italian", "Inglese": "English", "Cerca emoji…": "Search emoji…",
     "Nessuna emoji trovata": "No emoji found", "Precedente": "Previous", "Successiva": "Next",
-    "Reazione": "Reaction", "Rimuovi la reazione scegliendola di nuovo": "Choose the same reaction again to remove it",
+    "Reazione": "Reaction",
+    "Puoi aggiungere più reazioni. Clicca con il tasto sinistro su una tua reazione per rimuoverla":
+        "You can add multiple reactions. Left-click one of your reactions to remove it",
     "Recenti": "Recent", "Persone": "People", "Animali e natura": "Animals and nature",
     "Cibo e bevande": "Food and drink", "Attività": "Activities", "Viaggi": "Travel",
     "Oggetti": "Objects", "Simboli": "Symbols", "Bandiere": "Flags",
@@ -264,6 +266,25 @@ _ENGLISH.update({
         "Allow explicit actions such as checking and downloading updates.",
     "Trasporto privato": "Private transport", "I messaggi continuano a viaggiare nel canale I2P cifrato end-to-end.":
         "Messages continue to travel through the end-to-end encrypted I2P channel.",
+    "Prestazioni I2P": "I2P performance", "Riduci la latenza senza limitare i peer scelti automaticamente dal router.":
+        "Reduce latency without limiting peers automatically selected by the router.",
+    "Modalità bassa latenza": "Low-latency mode",
+    "Usa tunnel da 2 hop e ACK iniziali immediati. Riduce l’anonimato rispetto ai 3 hop consigliati.":
+        "Uses 2-hop tunnels and immediate initial ACKs. Reduces anonymity compared with the recommended 3 hops.",
+    "Mantieni pronti i contatti recenti": "Keep recent contacts ready",
+    "Compromesso privacy/prestazioni: apre in anticipo fino a 8 stream recenti e velocizza il primo messaggio, ma genera traffico e metadati di connessione in background. Per la massima privacy disattivalo.":
+        "Privacy/performance trade-off: pre-opens up to 8 recent streams and speeds up the first message, but creates background traffic and connection metadata. Disable it for maximum privacy.",
+    "Maschera quali contatti sono recenti": "Mask which contacts are recent",
+    "Non falsifica I2P: seleziona casualmente fino a 8 contatti reali invece della cronologia recente. Riduce la correlazione con le chat recenti, ma il router SAM vede comunque le destination e anche un contatto non recente può osservare la connessione.":
+        "Does not spoof I2P: randomly selects up to 8 real contacts instead of recent history. This reduces correlation with recent chats, but the SAM router still sees destinations and a non-recent contact may observe the connection.",
+    "Conferma modalità bassa latenza": "Confirm low-latency mode",
+    "Kerberus ridurrà i tunnel I2P da 3 a 2 hop. Il percorso più corto può diminuire la latenza, ma rende più economici gli attacchi di correlazione e analisi statistica del traffico.":
+        "Kerberus will reduce I2P tunnels from 3 to 2 hops. The shorter path may reduce latency, but makes correlation and statistical traffic-analysis attacks less costly.",
+    "La cifratura end-to-end X25519 + ML-KEM-768 non cambia e non viene usato zero-hop. Per la protezione I2P più alta mantieni 3 hop.":
+        "End-to-end X25519 + ML-KEM-768 encryption is unchanged and zero-hop is never used. Keep 3 hops for the highest I2P protection.",
+    "Mantieni massima privacy": "Keep maximum privacy", "Capisco, usa 2 hop": "I understand, use 2 hops",
+    "Ottimizzazioni sempre attive: profilo interattivo, fast receive, primo frame nel SYN, stream persistenti e risposte full-duplex.":
+        "Always-on optimizations: interactive profile, fast receive, first frame in SYN, persistent streams, and full-duplex replies.",
     "Protezione streaming": "Streaming protection", "Mantieni la finestra fuori dalle catture schermo supportate.":
         "Keep the window out of supported screen captures.",
     "Nascondi Kerberus durante streaming e condivisione schermo":
@@ -329,6 +350,8 @@ _ENGLISH.update({
     "Ritardo indicato": "Reported delay", "ACK ricevuto sul mittente": "ACK received by sender",
     "Tempo totale andata/ritorno": "Total round-trip time", "Versione": "Version",
     "Destination": "Destination", "Trasporto": "Transport", "Messaggi": "Messages",
+    "Profilo tunnel": "Tunnel profile", "Bassa latenza · 2 hop": "Low latency · 2 hops",
+    "Massima privacy · 3 hop": "Maximum privacy · 3 hops",
     "Identità": "Identity", "Metadati": "Metadata", "Code locali": "Local queues",
     "ONLINE": "ONLINE", "OFFLINE": "OFFLINE", "Tunnel pronto · SAM locale": "Tunnel ready · local SAM",
     "I2P: connesso": "I2P: connected", "I2P: non connesso": "I2P: disconnected",
@@ -485,6 +508,13 @@ QFrame#emojiPanel {{ background: {COLORS['sidebar']}; border-top: 1px solid {COL
 QFrame#settingsSidebar {{ background: {COLORS['sidebar']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}
 QFrame#settingsCard {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}
 QFrame#settingsRow {{ background: transparent; border-top: 1px solid {COLORS['border']}; }}
+QFrame#inlineConfirmation {{
+    background: #2a2218;
+    border-top: 1px solid #6b512d;
+    border-bottom: 1px solid #6b512d;
+}}
+QPushButton#confirmLowLatency {{ background: {COLORS['warning']}; color: #20170b; font-weight: 700; }}
+QPushButton#confirmLowLatency:hover {{ background: #f6c574; }}
 QFrame#chatSettingsPanel {{ background: {COLORS['sidebar']}; border-left: 1px solid {COLORS['border']}; }}
 QLabel#brand {{ font-size: 20px; font-weight: 700; color: {COLORS['text']}; }}
 QLabel#pageTitle {{ font-size: 18px; font-weight: 650; }}
@@ -837,6 +867,29 @@ def is_emoji_reaction(text: str, maximum_emoji: int = 6) -> bool:
     return 1 <= len(emoji_items) <= maximum_emoji and emoji_data.purely_emoji(compact)
 
 
+def reaction_items(reactions: object) -> tuple[tuple[str, str], ...]:
+    """Flatten legacy strings and current per-user reaction lists for rendering."""
+    if not isinstance(reactions, dict):
+        return ()
+    items: list[tuple[str, str]] = []
+    for owner, stored in reactions.items():
+        values = stored if isinstance(stored, list) else [stored] if isinstance(stored, str) else []
+        seen: set[str] = set()
+        for value in values:
+            emoji = str(value)
+            if emoji_data.is_emoji(emoji) and emoji not in seen:
+                items.append((str(owner), emoji))
+                seen.add(emoji)
+    return tuple(items)
+
+
+def reaction_groups(reactions: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    grouped: dict[str, list[str]] = {}
+    for owner, emoji in reaction_items(reactions):
+        grouped.setdefault(emoji, []).append(owner)
+    return tuple((emoji, tuple(owners)) for emoji, owners in grouped.items())
+
+
 class ChatMessageDelegate(QStyledItemDelegate):
     def __init__(self, view: "VirtualChatView"):
         super().__init__(view)
@@ -1029,6 +1082,68 @@ class ChatMessageDelegate(QStyledItemDelegate):
                 return url
         return ""
 
+    @staticmethod
+    def _reaction_rows(
+        groups: tuple[tuple[str, tuple[str, ...]], ...],
+        font: QFont,
+        maximum_width: int,
+    ) -> tuple[tuple[tuple[str, tuple[str, ...], str, int], ...], ...]:
+        reaction_font = QFont(font)
+        reaction_font.setFamilies(["Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"])
+        metrics = QFontMetrics(reaction_font)
+        rows: list[list[tuple[str, tuple[str, ...], str, int]]] = []
+        current: list[tuple[str, tuple[str, ...], str, int]] = []
+        used = 0
+        for emoji, owners in groups:
+            text = f"{emoji} {len(owners)}" if len(owners) > 1 else emoji
+            width = min(maximum_width, metrics.horizontalAdvance(text) + 20)
+            required = width + (5 if current else 0)
+            if current and used + required > maximum_width:
+                rows.append(current)
+                current = []
+                used = 0
+                required = width
+            current.append((emoji, owners, text, width))
+            used += required
+        if current:
+            rows.append(current)
+        return tuple(tuple(row) for row in rows)
+
+    def reaction_regions(
+        self,
+        message: dict,
+        row_rect: QRect,
+        font: QFont,
+    ) -> list[tuple[str, tuple[str, ...], QRect]]:
+        geometry = self._layout(message, row_rect.width(), font)
+        rows = geometry.get("reaction_rows", ())
+        if not isinstance(rows, tuple) or not rows:
+            return []
+        bubble_rect = self._bubble_rect(row_rect, geometry)
+        x = bubble_rect.left() + 14
+        y = (
+            bubble_rect.top() + 10 + int(geometry["author_height"])
+            + int(geometry["body_height"]) + 5 + int(geometry["link_height"])
+        )
+        content_width = bubble_rect.width() - 28
+        regions: list[tuple[str, tuple[str, ...], QRect]] = []
+        for row in rows:
+            row_width = sum(chip[3] for chip in row) + max(0, len(row) - 1) * 5
+            cursor_x = x + content_width - row_width
+            for emoji, owners, _text, width in row:
+                rect = QRect(cursor_x, y, width, 22)
+                regions.append((emoji, owners, rect))
+                cursor_x += width + 5
+            y += 26
+        return regions
+
+    def reaction_at(self, message: dict, row_rect: QRect, font: QFont, position: QPoint) -> str:
+        local_id = self.local_identity.identity_id if self.local_identity is not None else ""
+        for emoji, owners, region in self.reaction_regions(message, row_rect, font):
+            if local_id in owners and region.contains(position):
+                return emoji
+        return ""
+
     def _layout(self, message: dict, width: int, font: QFont) -> dict[str, object]:
         outgoing = message.get("direction") == "out"
         identity = self.local_identity if outgoing else self.remote_identity
@@ -1058,9 +1173,13 @@ class ChatMessageDelegate(QStyledItemDelegate):
         link = urls[0] if self.link_previews and urls else ""
         preview = self.preview_cache.get(link) if link else None
         reactions = message.get("reactions", {})
-        reaction_values = tuple(str(value) for value in reactions.values()) if isinstance(reactions, dict) else ()
-        reaction_text = " ".join(reaction_values)
-        reaction_width = body_metrics.horizontalAdvance(reaction_text) + 18 if reaction_text else 0
+        reaction_values = tuple(emoji for _owner, emoji in reaction_items(reactions))
+        grouped_reactions = reaction_groups(reactions)
+        preliminary_rows = self._reaction_rows(grouped_reactions, font, max_text_width)
+        reaction_width = max(
+            (sum(chip[3] for chip in row) + max(0, len(row) - 1) * 5 for row in preliminary_rows),
+            default=0,
+        )
         minimum_content_width = 80 if emoji_reaction else 72
         natural_content_width = max(
             minimum_content_width,
@@ -1073,6 +1192,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
         text_width = min(max_text_width, natural_content_width)
         bubble_width = min(max_bubble_width, max(108 if emoji_reaction else 100, text_width + 28))
         text_width = bubble_width - 28
+        reaction_rows = self._reaction_rows(grouped_reactions, font, text_width)
         if emoji_reaction:
             body_height = body_metrics.height() + 4
         else:
@@ -1082,7 +1202,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
         author_height = 18 if identity is not None else 0
         preview_geometry = self._preview_layout(link, preview, text_width, font) if link else None
         link_height = int(preview_geometry["height"]) + 8 if preview_geometry is not None else 0
-        reaction_height = 26 if reaction_values else 0
+        reaction_height = len(reaction_rows) * 26
         bubble_height = 18 + author_height + body_height + link_height + reaction_height + 23
         row_height = max(54, bubble_height + 8)
         return {
@@ -1102,6 +1222,8 @@ class ChatMessageDelegate(QStyledItemDelegate):
             "preview": preview,
             "preview_geometry": preview_geometry,
             "reactions": reaction_values,
+            "reaction_groups": grouped_reactions,
+            "reaction_rows": reaction_rows,
             "reaction_height": reaction_height,
             "emoji_reaction": emoji_reaction,
             "metadata": metadata,
@@ -1191,19 +1313,28 @@ class ChatMessageDelegate(QStyledItemDelegate):
                 )
             y += int(geometry["link_height"])
 
-        reactions = geometry["reactions"]
-        if isinstance(reactions, tuple) and reactions:
+        reaction_regions = self.reaction_regions(message, option.rect, option.font)
+        if reaction_regions:
             reaction_font = QFont(option.font)
             reaction_font.setFamilies(["Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"])
             painter.setFont(reaction_font)
-            reaction_text = " ".join(reactions)
-            pill_width = min(content_width, QFontMetrics(reaction_font).horizontalAdvance(reaction_text) + 20)
-            reaction_rect = QRect(x + content_width - pill_width, y, pill_width, 22)
-            painter.setPen(QPen(QColor(COLORS["accent"]), 1))
-            painter.setBrush(QColor(COLORS["surface_3"]))
-            painter.drawRoundedRect(reaction_rect, 11, 11)
-            painter.setPen(QColor(COLORS["text"]))
-            painter.drawText(reaction_rect, int(Qt.AlignmentFlag.AlignCenter), reaction_text)
+            local_id = self.local_identity.identity_id if self.local_identity is not None else ""
+            group_by_emoji = {emoji: owners for emoji, owners in geometry.get("reaction_groups", ())}
+            text_by_emoji = {
+                emoji: f"{emoji} {len(owners)}" if len(owners) > 1 else emoji
+                for emoji, owners in group_by_emoji.items()
+            }
+            for emoji, owners, reaction_rect in reaction_regions:
+                owned = local_id in owners
+                painter.setPen(QPen(QColor(COLORS["accent"] if owned else COLORS["border"]), 1))
+                painter.setBrush(QColor(COLORS["accent_dark"] if owned else COLORS["surface_3"]))
+                painter.drawRoundedRect(reaction_rect, 11, 11)
+                painter.setPen(QColor(COLORS["text"]))
+                painter.drawText(
+                    reaction_rect,
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    text_by_emoji.get(emoji, emoji),
+                )
 
         metadata = str(geometry["metadata"])
         if outgoing:
@@ -1336,6 +1467,7 @@ class VirtualChatView(QListView):
         self.on_timing: Callable[[dict], None] | None = None
         self.on_open_link: Callable[[str], None] | None = None
         self._pressed_link = ""
+        self._pressed_reaction = ""
         self._pressed_position = QPoint()
 
     def configure(
@@ -1415,15 +1547,26 @@ class VirtualChatView(QListView):
             return ""
         return self.chat_delegate.link_at(message, self.visualRect(index), self.font(), position)
 
+    def _reaction_at_position(self, position: QPoint) -> str:
+        index = self.indexAt(position)
+        if not index.isValid():
+            return ""
+        message = index.data(ChatMessageModel.MessageRole)
+        if not isinstance(message, dict):
+            return ""
+        return self.chat_delegate.reaction_at(message, self.visualRect(index), self.font(), position)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._pressed_position = event.position().toPoint()
             self._pressed_link = self._link_at_position(self._pressed_position)
+            self._pressed_reaction = self._reaction_at_position(self._pressed_position)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         position = event.position().toPoint()
         link = self._link_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
+        reaction = self._reaction_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
         moved = (position - self._pressed_position).manhattanLength()
         if link and link == self._pressed_link and moved <= QApplication.startDragDistance():
             self._pressed_link = ""
@@ -1431,14 +1574,23 @@ class VirtualChatView(QListView):
                 self.on_open_link(link)
             event.accept()
             return
+        if reaction and reaction == self._pressed_reaction and moved <= QApplication.startDragDistance():
+            self._pressed_reaction = ""
+            index = self.indexAt(position)
+            message = index.data(ChatMessageModel.MessageRole) if index.isValid() else None
+            if self.on_action is not None and isinstance(message, dict):
+                self.on_action("react:" + reaction, message)
+            event.accept()
+            return
         self._pressed_link = ""
+        self._pressed_reaction = ""
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        position = event.position().toPoint()
+        interactive = self._link_at_position(position) or self._reaction_at_position(position)
         self.viewport().setCursor(
-            Qt.CursorShape.PointingHandCursor
-            if self._link_at_position(event.position().toPoint())
-            else Qt.CursorShape.ArrowCursor
+            Qt.CursorShape.PointingHandCursor if interactive else Qt.CursorShape.ArrowCursor
         )
         super().mouseMoveEvent(event)
 
@@ -1797,7 +1949,9 @@ class EmojiPicker(KerberusDialog):
         self.search.textChanged.connect(self._filter)
         self.body_layout.addWidget(self.search)
         if reaction:
-            hint = QLabel("Rimuovi la reazione scegliendola di nuovo")
+            hint = QLabel(
+                "Puoi aggiungere più reazioni. Clicca con il tasto sinistro su una tua reazione per rimuoverla"
+            )
             hint.setObjectName("muted")
             self.body_layout.addWidget(hint)
         scroll = QScrollArea()
@@ -1956,6 +2110,13 @@ class EmojiPanel(QFrame):
         self.search.addAction(lucide_icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self._filter)
         layout.addWidget(self.search)
+        self.reaction_hint = QLabel(
+            "Puoi aggiungere più reazioni. Clicca con il tasto sinistro su una tua reazione per rimuoverla"
+        )
+        self.reaction_hint.setObjectName("muted")
+        self.reaction_hint.setWordWrap(True)
+        self.reaction_hint.hide()
+        layout.addWidget(self.reaction_hint)
 
         categories = QHBoxLayout()
         categories.setSpacing(4)
@@ -2017,6 +2178,7 @@ class EmojiPanel(QFrame):
 
     def set_reaction_mode(self, enabled: bool) -> None:
         self._reaction_mode = enabled
+        self.reaction_hint.setVisible(enabled)
         self._render()
 
     def _update_category_buttons(self) -> None:
@@ -2353,7 +2515,7 @@ class MessageBubble(QWidget):
             self.time_label.setText(time_text)
             self._rendered_status = status
         reactions = message.get("reactions", {})
-        values = tuple(str(value) for value in reactions.values()) if isinstance(reactions, dict) else ()
+        values = tuple(emoji for _owner, emoji in reaction_items(reactions))
         if values != self._rendered_reactions:
             self.reactions_label.setText(" ".join(values))
             self.reactions_label.setVisible(bool(values))
@@ -2429,6 +2591,52 @@ class SettingsToggleRow(QFrame):
     def setEnabled(self, enabled: bool) -> None:
         super().setEnabled(enabled)
         self.switch.setEnabled(enabled)
+
+
+class InlineConfirmationPanel(QFrame):
+    confirmed = pyqtSignal()
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("inlineConfirmation")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 15, 16, 15)
+        layout.setSpacing(10)
+        heading_row = QHBoxLayout()
+        icon = QLabel()
+        icon.setPixmap(lucide_icon("info", COLORS["warning"], 24).pixmap(24, 24))
+        heading = QLabel("Conferma modalità bassa latenza")
+        heading.setStyleSheet(f"color: {COLORS['warning']}; font-size: 15px; font-weight: 750;")
+        heading.setWordWrap(True)
+        heading_row.addWidget(icon, alignment=Qt.AlignmentFlag.AlignTop)
+        heading_row.addWidget(heading, 1)
+        layout.addLayout(heading_row)
+        warning = QLabel(
+            "Kerberus ridurrà i tunnel I2P da 3 a 2 hop. Il percorso più corto può diminuire la latenza, "
+            "ma rende più economici gli attacchi di correlazione e analisi statistica del traffico."
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        unchanged = QLabel(
+            "La cifratura end-to-end X25519 + ML-KEM-768 non cambia e non viene usato zero-hop. "
+            "Per la protezione I2P più alta mantieni 3 hop."
+        )
+        unchanged.setObjectName("muted")
+        unchanged.setWordWrap(True)
+        layout.addWidget(unchanged)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Mantieni massima privacy")
+        cancel.setObjectName("cancelLowLatency")
+        cancel.clicked.connect(self.cancelled.emit)
+        confirm = QPushButton("Capisco, usa 2 hop")
+        confirm.setObjectName("confirmLowLatency")
+        confirm.clicked.connect(self.confirmed.emit)
+        actions.addWidget(cancel)
+        actions.addWidget(confirm)
+        layout.addLayout(actions)
+        self.hide()
 
 
 class SettingsCard(QFrame):
@@ -3646,8 +3854,8 @@ class KerberusWindow(QMainWindow):
     def _emoji_selected(self, value: str) -> None:
         reaction_message = self._emoji_reaction_message
         if reaction_message is not None:
-            self._emoji_reaction_message = None
-            self._set_emoji_panel_visible(False)
+            # Keep the embedded picker open so several reactions can be added
+            # to the same message without reopening the context menu.
             self.message_action("react:" + value, reaction_message)
             return
         self.composer.insertPlainText(value)
@@ -3884,6 +4092,11 @@ class KerberusWindow(QMainWindow):
             minutes, remainder = divmod(seconds, 60)
             return tr_format("{minutes} min {seconds} s", minutes=minutes, seconds=remainder)
 
+        def format_ms(value: object) -> str:
+            if not isinstance(value, (int, float)):
+                return tr("Non ancora disponibile")
+            return f"{value:.3f} ms"
+
         sent_at = message.get("sent_at", message.get("time"))
         outgoing = message.get("direction") == "out"
         received_at = message.get("recipient_received_at") if outgoing else message.get("received_at")
@@ -3898,6 +4111,16 @@ class KerberusWindow(QMainWindow):
             rows.append(("Ritardo indicato", tr("In attesa della conferma")))
         if outgoing:
             rows.append(("ACK ricevuto sul mittente", format_time(delivered_at)))
+            metrics = message.get("transport_metrics", {})
+            if isinstance(metrics, dict) and metrics:
+                rows.extend([
+                    ("Python ↔ helper: overhead IPC", format_ms(metrics.get("python_helper_ipc_overhead_ms"))),
+                    ("Python ↔ helper: richiesta completa", format_ms(metrics.get("python_helper_roundtrip_ms"))),
+                    ("Attesa coda del contatto", format_ms(metrics.get("queue_wait_ms"))),
+                    ("Handshake SAM locale", format_ms(metrics.get("sam_handshake_ms"))),
+                    ("Comando STREAM CONNECT locale", format_ms(metrics.get("sam_connect_command_ms"))),
+                ])
+            rows.append(("Ricevuta cifrata andata/ritorno", format_ms(message.get("encrypted_receipt_rtt_ms"))))
             if isinstance(sent_at, int) and isinstance(delivered_at, int):
                 rows.append(("Tempo totale andata/ritorno", format_delay(delivered_at - sent_at)))
 
@@ -4237,6 +4460,68 @@ class KerberusWindow(QMainWindow):
         transport_info.setContentsMargins(16, 14, 16, 16)
         transport_card.add_row(transport_info)
 
+        performance_card = add_card(
+            network_layout,
+            SettingsCard(
+                "clock", "Prestazioni I2P",
+                "Riduci la latenza senza limitare i peer scelti automaticamente dal router.",
+            ),
+        )
+        low_latency = SettingsToggleRow(
+            "Modalità bassa latenza",
+            "Usa tunnel da 2 hop e ACK iniziali immediati. Riduce l’anonimato rispetto ai 3 hop consigliati.",
+            bool(current.get("low_latency_mode", False)),
+        )
+        low_latency.setObjectName("lowLatencySetting")
+        warm_recent = SettingsToggleRow(
+            "Mantieni pronti i contatti recenti",
+            "Compromesso privacy/prestazioni: apre in anticipo fino a 8 stream recenti e velocizza il primo "
+            "messaggio, ma genera traffico e metadati di connessione in background. Per la massima privacy disattivalo.",
+            bool(current.get("warm_recent_contacts", True)),
+        )
+        mask_recent = SettingsToggleRow(
+            "Maschera quali contatti sono recenti",
+            "Non falsifica I2P: seleziona casualmente fino a 8 contatti reali invece della cronologia recente. "
+            "Riduce la correlazione con le chat recenti, ma il router SAM vede comunque le destination e anche "
+            "un contatto non recente può osservare la connessione.",
+            bool(current.get("mask_recent_contact_metadata", False)),
+        )
+        mask_recent.setEnabled(warm_recent.isChecked())
+        warm_recent.switch.toggled.connect(mask_recent.setEnabled)
+        performance_card.add_row(low_latency)
+        confirmation = InlineConfirmationPanel()
+        performance_card.add_row(confirmation)
+        performance_card.add_row(warm_recent)
+        performance_card.add_row(mask_recent)
+        active_optimizations = QLabel(
+            "Ottimizzazioni sempre attive: profilo interattivo, fast receive, primo frame nel SYN, "
+            "stream persistenti e risposte full-duplex."
+        )
+        active_optimizations.setObjectName("muted")
+        active_optimizations.setWordWrap(True)
+        active_optimizations.setContentsMargins(16, 13, 16, 15)
+        performance_card.add_row(active_optimizations)
+
+        def set_low_latency_checked(checked: bool) -> None:
+            low_latency.switch.blockSignals(True)
+            low_latency.switch.setChecked(checked)
+            low_latency.switch.blockSignals(False)
+            confirmation.hide()
+
+        def request_low_latency(enabled: bool) -> None:
+            if not enabled:
+                confirmation.hide()
+                return
+            low_latency.switch.blockSignals(True)
+            low_latency.switch.setChecked(False)
+            low_latency.switch.blockSignals(False)
+            confirmation.show()
+            confirmation.setFocus(Qt.FocusReason.OtherFocusReason)
+
+        low_latency.switch.toggled.connect(request_low_latency)
+        confirmation.confirmed.connect(lambda: set_low_latency_checked(True))
+        confirmation.cancelled.connect(lambda: set_low_latency_checked(False))
+
         peer_card = add_card(
             network_layout,
             SettingsCard(
@@ -4404,6 +4689,24 @@ class KerberusWindow(QMainWindow):
                 clearnet_enabled=clearnet.isChecked(),
                 stream_proof_enabled=stream_proof.isChecked(),
                 language=str(language.currentData()),
+            )
+            desired_low_latency = low_latency.isChecked()
+            desired_warm_recent = warm_recent.isChecked()
+            desired_mask_recent = mask_recent.isChecked()
+
+            def network_applied(value: object) -> None:
+                result = value if isinstance(value, dict) else {}
+                mode = "bassa latenza · 2 hop" if result.get("low_latency_mode") else "massima privacy · 3 hop"
+                self._log_action(f"Profilo I2P applicato · {mode}")
+
+            self._run_task(
+                lambda: self.service.update_network_settings(
+                    low_latency_mode=desired_low_latency,
+                    warm_recent_contacts=desired_warm_recent,
+                    mask_recent_contact_metadata=desired_mask_recent,
+                ),
+                network_applied,
+                lambda error: self._protocol_event("network_profile_error", error),
             )
             set_language(str(language.currentData()))
             localize_widget(self)
@@ -4788,6 +5091,11 @@ class KerberusWindow(QMainWindow):
             ("Bridge SAM", f"{self.service.config.sam_host}:{self.service.config.sam_port}"),
             ("Destination", destination),
             ("Trasporto", "I2P streaming · sessione persistente"),
+            (
+                "Profilo tunnel",
+                "Bassa latenza · 2 hop" if self.service.settings().get("low_latency_mode", False)
+                else "Massima privacy · 3 hop",
+            ),
             ("Messaggi", "X25519 + ML-KEM-768 · XChaCha20-Poly1305"),
             ("Identità", "Ed25519 · profili firmati"),
             ("Metadati", "Padding a bucket · anti-replay · timestamp cifrati"),

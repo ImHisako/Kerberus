@@ -104,6 +104,12 @@ class LiveI2PTests(unittest.TestCase):
                 ),
                 f"reply ACK failed: events={events}",
             )
+            stream_probe = None
+            if alice.sam.native_active:
+                # This opt-in probe uses SILENT=false on a disposable stream so
+                # STREAM STATUS measures the real I2P opening separately. The
+                # production send path remains SILENT=true/0-RTT.
+                stream_probe = alice.sam.probe_connect(bob.identity().destination)
             labels = [f"native burst {index}" for index in range(10)]
             sent_started = {}
             received_times = {}
@@ -144,10 +150,42 @@ class LiveI2PTests(unittest.TestCase):
 
             receive_delays = sorted(received_times[label] - sent_started[label] for label in labels)
             ack_delays = sorted(ack_times[label] - sent_started[label] for label in labels)
+            outgoing_burst = [
+                message for message in alice.messages_for(bob.identity().identity_id)
+                if message.get("text") in labels and message.get("direction") == "out"
+            ]
+            python_helper_delays = [
+                float(message["transport_metrics"]["python_helper_roundtrip_ms"])
+                for message in outgoing_burst
+                if isinstance(message.get("transport_metrics"), dict)
+                and isinstance(message["transport_metrics"].get("python_helper_roundtrip_ms"), (int, float))
+            ]
+            python_helper_ipc_delays = [
+                float(message["transport_metrics"]["python_helper_ipc_overhead_ms"])
+                for message in outgoing_burst
+                if isinstance(message.get("transport_metrics"), dict)
+                and isinstance(message["transport_metrics"].get("python_helper_ipc_overhead_ms"), (int, float))
+            ]
+            encrypted_receipt_delays = [
+                float(message["encrypted_receipt_rtt_ms"])
+                for message in outgoing_burst
+                if isinstance(message.get("encrypted_receipt_rtt_ms"), (int, float))
+            ]
 
             def percentile(values, ratio):
                 return values[min(len(values) - 1, max(0, int(len(values) * ratio + 0.999) - 1))]
 
+            helper_average = (
+                f"{statistics.fmean(python_helper_delays):.3f}" if python_helper_delays else "unavailable"
+            )
+            helper_ipc_average = (
+                f"{statistics.fmean(python_helper_ipc_delays):.3f}"
+                if python_helper_ipc_delays else "unavailable"
+            )
+            receipt_average = (
+                f"{statistics.fmean(encrypted_receipt_delays):.3f}"
+                if encrypted_receipt_delays else "unavailable"
+            )
             print(
                 "live_i2p_metrics "
                 f"contact={contact_seconds:.3f}s burst10={burst_seconds:.3f}s "
@@ -158,7 +196,15 @@ class LiveI2PTests(unittest.TestCase):
                 f"ack_avg={statistics.fmean(ack_delays):.3f}s "
                 f"ack_p50={statistics.median(ack_delays):.3f}s "
                 f"ack_p95={percentile(ack_delays, 0.95):.3f}s "
-                f"ack_max={max(ack_delays):.3f}s"
+                f"ack_max={max(ack_delays):.3f}s "
+                f"python_helper_roundtrip_avg_ms={helper_average} "
+                f"python_helper_ipc_overhead_avg_ms={helper_ipc_average}"
+            )
+            print(
+                "live_i2p_stages "
+                f"sam_handshake_local_ms={stream_probe.get('sam_handshake_ms', 'unavailable') if stream_probe else 'unavailable'} "
+                f"i2p_stream_open_ms={stream_probe.get('i2p_stream_open_ms', 'unavailable') if stream_probe else 'unavailable'} "
+                f"encrypted_receipt_avg_ms={receipt_average}"
             )
             if os.environ.get("KERBERUS_REQUIRE_NATIVE") == "1":
                 self.assertGreater(

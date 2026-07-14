@@ -50,7 +50,7 @@ Le ricevute di consegna e lettura possono essere disabilitate globalmente o per 
 
 ### Reazioni ed emoji
 
-Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. I messaggi brevi composti soltanto da emoji vengono riconosciuti come reazioni rapide e mostrati in una bolla compatta con emoji ingrandite; le reazioni applicate a un messaggio sono raccolte in un chip dedicato. Le reazioni sono cifrate nel canale ratchet. Se l’utente seleziona nuovamente la stessa reazione, Kerberus la rimuove localmente e invia al peer un evento di rimozione autenticato.
+Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. I messaggi brevi composti soltanto da emoji vengono riconosciuti come reazioni rapide e mostrati in una bolla compatta con emoji ingrandite; le reazioni applicate a un messaggio sono raccolte in chip dedicati. Ogni partecipante può aggiungere più reazioni allo stesso messaggio. Le reazioni sono cifrate nel canale ratchet; un clic sinistro su una propria reazione la rimuove e invia al peer un evento autenticato relativo soltanto a quell’emoji.
 
 ### Azioni sui messaggi
 
@@ -143,9 +143,11 @@ Le impostazioni comprendono:
 - destination I2P persistente e sessione SAM longeva;
 - tre tunnel in ingresso e tre in uscita, più un backup per direzione;
 - lunghezza dei tunnel predefinita: Kerberus non abilita tunnel zero-hop per ridurre la latenza;
+- modalità opzionale **Bassa latenza** con tunnel da due hop e ACK iniziale immediato, attivabile soltanto dopo un'avvertenza incorporata nell'interfaccia; riduce la resistenza alla correlazione del traffico ma non modifica la cifratura end-to-end;
 - `i2cp.leaseSetEncType=6,4` per compatibilità LeaseSet ML-KEM-768/ECIES-X25519 nelle versioni I2P supportate;
 - profilo streaming interattivo, stream persistenti, TCP no-delay e keepalive;
 - `SILENT=true` e breve `connectDelay`, per accompagnare l’apertura stream con il primo frame;
+- preparazione configurabile di un massimo di otto contatti per ridurre la latenza del primo messaggio, indicata esplicitamente come compromesso privacy/prestazioni perché genera traffico e metadati di connessione in background; per la massima privacy va disattivata. Una modalità opzionale può selezionare uniformemente contatti reali invece di usare la cronologia recente, riducendo la correlazione con le ultime chat senza fingere destination inesistenti. Il router SAM vede comunque le destination selezionate e i contatti possono osservare l’apertura;
 - ricevute applicative come unica conferma autorevole della consegna.
 
 I2P protegge il percorso di rete, ma non sostituisce la cifratura end-to-end applicativa o la sicurezza degli endpoint.
@@ -362,6 +364,7 @@ Trasporto nativo:
 ```powershell
 cd native
 go test ./...
+go test '-bench=Benchmark' '-run=^$' -benchmem ./...
 go vet ./...
 ```
 
@@ -372,7 +375,9 @@ $env:KERBERUS_LIVE_I2P = "1"
 .\.venv\Scripts\python.exe -m unittest tests.test_live_i2p -v
 ```
 
-Il test live esegue lo scambio contatti, invia una raffica di dieci messaggi, verifica consegna e ordine e stampa statistiche di latenza.
+Il test live esegue lo scambio contatti, invia una raffica di dieci messaggi, verifica consegna e ordine e stampa separatamente overhead IPC Python↔helper, handshake SAM locale, apertura reale dello stream I2P e andata/ritorno della ricevuta cifrata. La sonda di apertura usa un collegamento usa-e-getta con `SILENT=false`; gli invii normali conservano `SILENT=true` e il percorso 0-RTT.
+
+L'helper elabora in parallelo destinazioni diverse tramite code dinamiche indipendenti. Per una stessa destination l'ordine di arrivo dei comandi resta FIFO, quindi una `STREAM CONNECT` lenta per un contatto non sospende gli altri.
 
 ## Creazione delle release
 
@@ -393,10 +398,10 @@ Linux:
 Artefatti sorgente Python e archivio completo:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.6.0
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.7.0
 ```
 
-Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.6.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
+Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.7.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
 
 ## Struttura del repository
 

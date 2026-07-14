@@ -20,7 +20,10 @@ Accettato per Kerberus 0.4.
 - `STREAM CONNECT SILENT=true` consente di scrivere subito il primo frame. Questo non costituisce una conferma di connessione o consegna: Kerberus considera autorevoli solo le risposte applicative cifrate.
 - La conferma di un contatto torna sullo stesso stream bidirezionale. La coda su un secondo stream resta solo come fallback per chiamate non-inline.
 - `connectDelay=125` permette il payload nel SYN; `initialAckDelay=25`, profilo interattivo e keepalive a 30 secondi privilegiano la latenza senza ridurre lunghezza o anonimato dei tunnel.
-- Quantità 3 e backup 1 sono nei range raccomandati. Le lunghezze restano al default 3 e non sono impostati zero-hop o peer espliciti.
+- Quantità 3 e backup 1 sono nei range raccomandati. Il profilo standard usa 3 hop; zero-hop è vietato e non sono selezionati peer espliciti.
+- La modalità opzionale a bassa latenza ricrea la stessa sessione persistente con tunnel in ingresso e uscita da 2 hop, varianza 0 e ACK iniziale immediato. Quantità 3 e backup 1 restano invariati e zero-hop è sempre vietato. L'interfaccia richiede una conferma incorporata che avverte esplicitamente della minore resistenza alla correlazione del traffico.
+- SAM richiede una destination reale per `STREAM CONNECT`, quindi Kerberus non dichiara di falsificare questi metadati. L'opzione di mascheramento del warm-up campiona casualmente fino a 8 contatti reali al posto della cronologia recente: nasconde la recency semplice, ma non la destination al router locale e può rendere visibile una connessione ai contatti campionati.
+- La preparazione anticipata di un massimo di otto contatti recenti è configurabile. Riduce il tempo del primo invio riutilizzando stream persistenti, al costo di traffico e metadati di connessione in background.
 - SAM rimane esclusivamente su loopback. L'assenza di TLS/autenticazione SAM non è accettabile se il bridge viene esposto su rete.
 
 ## Compatibilità e limiti

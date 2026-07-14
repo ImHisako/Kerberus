@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import copy
+import secrets
 import threading
 import time
 import uuid
@@ -39,6 +40,17 @@ from .ratchet import (
 from .vault import Vault
 
 
+def _reaction_values(value: object) -> list[str]:
+    """Normalize legacy single reactions and the current multi-reaction format."""
+    candidates = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    normalized: list[str] = []
+    for candidate in candidates:
+        emoji = str(candidate)
+        if emoji_data.is_emoji(emoji) and len(emoji) <= 32 and emoji not in normalized:
+            normalized.append(emoji)
+    return normalized[:12]
+
+
 class MessengerService:
     _MESSAGE_RETRY_SECONDS = (2, 3, 5, 8, 12, 20)
     _CONTROL_RETRY_SECONDS = (2, 3, 5, 8, 12)
@@ -57,6 +69,9 @@ class MessengerService:
         self._state_lock = threading.RLock()
         self._delivery_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="kerberus-delivery")
         self._inflight: set[tuple[str, str]] = set()
+        # Monotonic timestamps are session-local by design: wall-clock changes
+        # cannot corrupt encrypted receipt round-trip measurements.
+        self._receipt_started_ns: dict[str, int] = {}
 
     def identity(self) -> IdentityBundle | None:
         value = self.vault.state.get("identity")
@@ -80,6 +95,7 @@ class MessengerService:
         else:
             destination = ""
         self.sam.set_receiver(self._receive_safely)
+        self.sam.configure_low_latency(bool(self.settings().get("low_latency_mode", False)), restart=False)
         active = self.sam.start_session() or destination
         identity = self.identity()
         if identity and active:
@@ -94,7 +110,8 @@ class MessengerService:
             self._delivery_thread = threading.Thread(target=self._delivery_loop, daemon=True)
             self._delivery_thread.start()
         self.retry_all_now()
-        self.warm_recent_contacts()
+        if self.settings().get("warm_recent_contacts", True):
+            self.warm_recent_contacts()
         return active
 
     def _receive_safely(self, payload: bytes, remote_destination: str = "") -> bytes | None:
@@ -169,6 +186,19 @@ class MessengerService:
             self._submit_delivery("warm", contact_id, self._warm_destination, destination)
 
     def warm_recent_contacts(self, limit: int = 8) -> None:
+        if self.settings().get("mask_recent_contact_metadata", False):
+            # SAM CONNECT cannot use a fake destination. Randomly selecting
+            # real contacts hides which conversations were most recent without
+            # creating unsolicited streams to arbitrary third parties.
+            candidates = [
+                str(contact_id)
+                for contact_id, contact in self.vault.state.get("contacts", {}).items()
+                if isinstance(contact, dict) and contact.get("destination")
+            ]
+            selected = secrets.SystemRandom().sample(candidates, min(limit, len(candidates)))
+            for contact_id in selected:
+                self.warm_contact(contact_id)
+            return
         recent_ids: list[str] = []
         for message in reversed(self.vault.state.get("messages", [])):
             contact_id = message.get("contact_id", "")
@@ -232,10 +262,46 @@ class MessengerService:
         settings.setdefault("link_previews", False)
         settings.setdefault("clearnet_enabled", False)
         settings.setdefault("stream_proof_enabled", False)
+        settings.setdefault("low_latency_mode", False)
+        settings.setdefault("warm_recent_contacts", True)
+        settings.setdefault("mask_recent_contact_metadata", False)
         settings.setdefault("language", "it")
         for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
         return dict(settings)
+
+    def update_network_settings(
+        self,
+        *,
+        low_latency_mode: bool,
+        warm_recent_contacts: bool,
+        mask_recent_contact_metadata: bool | None = None,
+    ) -> dict:
+        """Persist and apply the Kerberus-specific I2P transport profile."""
+        enabled = bool(low_latency_mode)
+        keep_warm = bool(warm_recent_contacts)
+        with self._state_lock:
+            settings = self.vault.state.setdefault("settings", {})
+            was_warm = bool(settings.get("warm_recent_contacts", True))
+            was_masked = bool(settings.get("mask_recent_contact_metadata", False))
+            mask_metadata = was_masked if mask_recent_contact_metadata is None else bool(mask_recent_contact_metadata)
+            settings["low_latency_mode"] = enabled
+            settings["warm_recent_contacts"] = keep_warm
+            settings["mask_recent_contact_metadata"] = mask_metadata
+            self.vault.save()
+        restarted = self.sam.configure_low_latency(enabled)
+        if restarted:
+            self.retry_all_now()
+        if keep_warm and (restarted or not was_warm or mask_metadata != was_masked) and self.sam.destination:
+            self.warm_recent_contacts()
+        mode = "bassa latenza · 2 hop" if enabled else "massima privacy · 3 hop"
+        self._emit_protocol_event("network_profile_updated", f"Profilo I2P applicato: {mode}")
+        return {
+            "low_latency_mode": enabled,
+            "warm_recent_contacts": keep_warm,
+            "mask_recent_contact_metadata": mask_metadata,
+            "session_restarted": restarted,
+        }
 
     def update_settings(self, period_minutes: int, single_use: bool) -> dict:
         if period_minutes not in (1, 5, 15, 60):
@@ -451,6 +517,9 @@ class MessengerService:
                         "round_trip_local_clock": delay(delivered_at, sent_at) if outgoing else None,
                         "read_after_send": delay(read_at, sent_at) if outgoing else None,
                     },
+                    "transport_timings_ms": copy.deepcopy(message.get("transport_metrics", {}))
+                    if isinstance(message.get("transport_metrics"), dict) else {},
+                    "encrypted_receipt_roundtrip_ms": message.get("encrypted_receipt_rtt_ms"),
                     "reactions": dict(message.get("reactions", {}))
                     if isinstance(message.get("reactions", {}), dict) else {},
                 })
@@ -566,16 +635,26 @@ class MessengerService:
             raise RuntimeError("Identità non configurata")
         with self._state_lock:
             reactions = target.setdefault("reactions", {})
-            remove = reactions.get(identity.identity_id) == emoji
+            if not isinstance(reactions, dict):
+                reactions = {}
+                target["reactions"] = reactions
+            own_reactions = _reaction_values(reactions.get(identity.identity_id))
+            remove = emoji in own_reactions
             if remove:
-                reactions.pop(identity.identity_id, None)
+                own_reactions.remove(emoji)
             else:
-                reactions[identity.identity_id] = emoji
+                if len(own_reactions) >= 12:
+                    raise ValueError("Puoi aggiungere al massimo 12 reazioni per messaggio")
+                own_reactions.append(emoji)
+            if own_reactions:
+                reactions[identity.identity_id] = own_reactions
+            else:
+                reactions.pop(identity.identity_id, None)
             self.vault.save()
         with self._state_lock:
             envelope = self._seal_ratchet(contact, {
                 "kind": "reaction", "target_id": message_id,
-                "emoji": "" if remove else emoji, "remove": remove,
+                "emoji": emoji, "remove": remove,
             })
             self.vault.save()
         self._queue_control(contact.destination, envelope, background=True)
@@ -813,16 +892,32 @@ class MessengerService:
     def _receive_reaction(self, sender_id: str, clear: dict) -> None:
         target_id, emoji = clear.get("target_id", ""), str(clear.get("emoji", ""))
         remove = clear.get("remove") is True
-        if not target_id or (not remove and (not emoji_data.is_emoji(emoji) or len(emoji) > 32)):
+        legacy_remove_all = remove and not emoji
+        if not target_id or (not legacy_remove_all and (not emoji_data.is_emoji(emoji) or len(emoji) > 32)):
             return
         with self._state_lock:
             for message in self.vault.state.get("messages", []):
                 if message.get("message_id") == target_id and message.get("contact_id") == sender_id:
                     reactions = message.setdefault("reactions", {})
+                    if not isinstance(reactions, dict):
+                        reactions = {}
+                        message["reactions"] = reactions
                     if remove:
-                        reactions.pop(sender_id, None)
+                        if legacy_remove_all:
+                            reactions.pop(sender_id, None)
+                        else:
+                            sender_reactions = _reaction_values(reactions.get(sender_id))
+                            if emoji in sender_reactions:
+                                sender_reactions.remove(emoji)
+                            if sender_reactions:
+                                reactions[sender_id] = sender_reactions
+                            else:
+                                reactions.pop(sender_id, None)
                     else:
-                        reactions[sender_id] = emoji
+                        sender_reactions = _reaction_values(reactions.get(sender_id))
+                        if emoji not in sender_reactions and len(sender_reactions) < 12:
+                            sender_reactions.append(emoji)
+                        reactions[sender_id] = sender_reactions
                     self.vault.save()
                     break
         if self.on_message:
@@ -855,16 +950,27 @@ class MessengerService:
                     message["status"] = status if rank.get(status, 0) >= rank.get(current_status, 0) else current_status
                     if status == "delivered":
                         message["delivered_at"] = now
+                        self._finish_receipt_timing(message)
                         if isinstance(received_at, int):
                             message["recipient_received_at"] = received_at
                     elif status == "read":
                         message["delivered_at"] = message.get("delivered_at") or now
+                        self._finish_receipt_timing(message)
                         message["read_at"] = now
                     changed = True
             if changed:
                 self.vault.save()
         if changed and self.on_message:
             self.on_message("status", contact_id)
+
+    def _finish_receipt_timing(self, message: dict) -> None:
+        message_id = str(message.get("message_id", ""))
+        started_ns = self._receipt_started_ns.pop(message_id, None)
+        if started_ns is not None and "encrypted_receipt_rtt_ms" not in message:
+            message["encrypted_receipt_rtt_ms"] = round(
+                (time.perf_counter_ns() - started_ns) / 1_000_000,
+                3,
+            )
 
     def _validated_contact(self, value: dict) -> IdentityBundle:
         contact = IdentityBundle.from_dict(value)
@@ -1066,6 +1172,7 @@ class MessengerService:
                 if message.get("message_id") == message_id and message.get("direction") == "out":
                     message["status"] = "delivered"
                     message["delivered_at"] = int(time.time())
+                    self._finish_receipt_timing(message)
                     if verified_received_at is not None:
                         message["recipient_received_at"] = verified_received_at
                     break
@@ -1252,9 +1359,13 @@ class MessengerService:
             payload = entry["payload"].encode("utf-8")
             self.vault.save()
         started = time.monotonic()
+        with self._state_lock:
+            self._receipt_started_ns[message_id] = time.perf_counter_ns()
         try:
-            self.sam.send(destination, payload)
+            transport_metrics = self.sam.send(destination, payload)
         except Exception as exc:
+            with self._state_lock:
+                self._receipt_started_ns.pop(message_id, None)
             elapsed = time.monotonic() - started
             self._emit_protocol_event(
                 "message_retry",
@@ -1263,13 +1374,18 @@ class MessengerService:
             return False
         elapsed = time.monotonic() - started
         with self._state_lock:
+            for message in self.vault.state["messages"]:
+                if message.get("message_id") == message_id:
+                    if isinstance(transport_metrics, dict):
+                        message["transport_metrics"] = copy.deepcopy(transport_metrics)
+                    break
             still_pending = any(item["message_id"] == message_id for item in self.vault.state["outbox"])
             if still_pending:
                 for message in self.vault.state["messages"]:
                     if message.get("message_id") == message_id:
                         message["status"] = "sent"
                         break
-                self.vault.save()
+            self.vault.save()
         if still_pending:
             self._emit_protocol_event(
                 "message_stream_sent", f"Frame scritto sullo stream in {elapsed:.2f}s; attendo conferma cifrata"

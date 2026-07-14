@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -128,7 +129,13 @@ class NativeSamTransport:
         self._reader.start()
         self._frame_worker.start()
 
-    def request(self, operation: str, destination: str, payload: bytes | None = None, timeout: float = 6) -> None:
+    def request(
+        self,
+        operation: str,
+        destination: str,
+        payload: bytes | None = None,
+        timeout: float = 6,
+    ) -> dict:
         request_id = uuid.uuid4().hex
         event = threading.Event()
         result: dict = {}
@@ -138,14 +145,34 @@ class NativeSamTransport:
         if payload is not None:
             command["payload"] = base64.b64encode(payload).decode("ascii")
         try:
+            started = time.perf_counter_ns()
             self._write(command)
             if not event.wait(timeout):
                 raise TimeoutError("Timeout helper SAM nativo")
+            roundtrip_ms = (time.perf_counter_ns() - started) / 1_000_000
             if not result.get("ok"):
                 raise SamError(str(result.get("error") or "Errore helper SAM nativo"))
+            metrics = {}
+            for key, value in dict(result.get("metrics") or {}).items():
+                if key.endswith("_us") and isinstance(value, (int, float)):
+                    metrics[key.removesuffix("_us") + "_ms"] = round(value / 1000, 3)
+                else:
+                    metrics[key] = value
+            metrics["python_helper_roundtrip_ms"] = round(roundtrip_ms, 3)
+            go_elapsed_ms = sum(
+                float(metrics.get(key, 0)) for key in ("queue_wait_ms", "handler_ms")
+                if isinstance(metrics.get(key, 0), (int, float))
+            )
+            metrics["python_helper_ipc_overhead_ms"] = round(max(0.0, roundtrip_ms - go_elapsed_ms), 3)
+            metrics["backend"] = "go-native"
+            return metrics
         finally:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
+
+    def probe_connect(self, destination: str, timeout: float = 80) -> dict:
+        """Measure a real STREAM STATUS round-trip without changing normal sends."""
+        return self.request("probe", destination, timeout=timeout)
 
     def _write(self, command: dict) -> None:
         process_input = self._process.stdin
@@ -271,6 +298,41 @@ class SamClient:
         self._receiver: FrameReceiver | None = None
         self._native: NativeSamTransport | None = None
         self._fallback_listener: threading.Thread | None = None
+        self._low_latency = False
+
+    @property
+    def low_latency(self) -> bool:
+        return self._low_latency
+
+    def configure_low_latency(self, enabled: bool, *, restart: bool = True) -> bool:
+        """Select the tunnel profile and rebuild an active SAM session if needed."""
+        enabled = bool(enabled)
+        with self._session_lock:
+            changed = enabled != self._low_latency
+            self._low_latency = enabled
+            active = self._control is not None
+        if changed and active and restart:
+            self.start_session(force=True)
+            return True
+        return False
+
+    def _session_options(self) -> str:
+        # Two hops are an explicit latency/anonymity trade-off documented by
+        # I2P. Never permit zero-hop fallback, and retain three live tunnels plus
+        # one backup so the latency profile does not reduce delivery resilience.
+        tunnel_length = 2 if self._low_latency else 3
+        ack_delay = 0 if self._low_latency else 25
+        return (
+            "i2cp.leaseSetEncType=6,4 inbound.quantity=3 outbound.quantity=3 "
+            "inbound.backupQuantity=1 outbound.backupQuantity=1 "
+            f"inbound.length={tunnel_length} outbound.length={tunnel_length} "
+            "inbound.lengthVariance=0 outbound.lengthVariance=0 "
+            "inbound.allowZeroHop=false outbound.allowZeroHop=false "
+            "i2cp.reduceOnIdle=false i2cp.closeOnIdle=false i2cp.fastReceive=true "
+            "i2p.streaming.profile=2 i2p.streaming.connectDelay=125 "
+            f"i2p.streaming.initialAckDelay={ack_delay} "
+            "i2p.streaming.inactivityAction=2 i2p.streaming.inactivityTimeout=30000"
+        )
 
     def set_receiver(self, receiver: FrameReceiver) -> None:
         self._receiver = receiver
@@ -335,11 +397,7 @@ class SamClient:
                     sock,
                     f"SESSION CREATE STYLE=STREAM ID={self.session_id} "
                     f"DESTINATION={private_destination}{signature_option} "
-                    "i2cp.leaseSetEncType=6,4 inbound.quantity=3 outbound.quantity=3 "
-                    "inbound.backupQuantity=1 outbound.backupQuantity=1 "
-                    "i2cp.reduceOnIdle=false i2cp.closeOnIdle=false i2cp.fastReceive=true "
-                    "i2p.streaming.profile=2 i2p.streaming.connectDelay=125 "
-                    "i2p.streaming.initialAckDelay=25 i2p.streaming.inactivityTimeout=30000",
+                    f"{self._session_options()}",
                 )
                 _check(reply)
                 lookup = _check(_command(sock, "NAMING LOOKUP NAME=ME"))
@@ -387,7 +445,7 @@ class SamClient:
         _write_private_text(self.keys_path, private)
         return public
 
-    def send(self, destination: str, payload: bytes) -> None:
+    def send(self, destination: str, payload: bytes) -> dict:
         _validate_destination(destination)
         if len(payload) > 4_000_000:
             raise ValueError("Messaggio troppo grande")
@@ -398,8 +456,7 @@ class SamClient:
             with self._session_lock:
                 generation = self._generation
             try:
-                self._send_once(destination, payload)
-                return
+                return self._send_once(destination, payload)
             except SamError as exc:
                 message = str(exc)
                 if "INVALID_ID" in message and not retried_session:
@@ -445,16 +502,16 @@ class SamClient:
                     continue
                 raise
 
-    def _send_once(self, destination: str, payload: bytes) -> None:
+    def _send_once(self, destination: str, payload: bytes) -> dict:
         if self._native is not None:
             try:
-                self._native.request("send", destination, payload)
-                return
+                return self._native.request("send", destination, payload)
             except (OSError, SamError, TimeoutError):
                 self._native.close()
                 self._native = None
                 self.ensure_fallback_listener()
         peer_lock = self._peer_lock(destination)
+        started = time.perf_counter_ns()
         with peer_lock:
             sock = self._stream_locked(destination)
             try:
@@ -462,6 +519,18 @@ class SamClient:
             except OSError:
                 self._drop_outbound(destination, sock)
                 raise
+        return {
+            "backend": "python-fallback",
+            "python_transport_roundtrip_ms": round((time.perf_counter_ns() - started) / 1_000_000, 3),
+        }
+
+    def probe_connect(self, destination: str, timeout: float = 80) -> dict:
+        """Run the explicit native STREAM STATUS latency probe."""
+        _validate_destination(destination)
+        self.start_session()
+        if self._native is None:
+            raise SamError("La sonda di apertura I2P richiede l'helper Go nativo")
+        return self._native.probe_connect(destination, timeout=timeout)
 
     def _stream_locked(self, destination: str) -> socket.socket:
         with self._streams_lock:

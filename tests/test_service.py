@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from kerberus.config import AppConfig
 from kerberus.crypto import destination_b32, generate_identity, pq_available, profile_destination, seal_message, sign_control, update_destination
@@ -31,6 +32,52 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(service.settings()["stream_proof_enabled"])
             service.update_privacy_settings(stream_proof_enabled=True)
             self.assertTrue(service.settings()["stream_proof_enabled"])
+            service.close(wait=True)
+
+    def test_network_latency_preferences_are_persisted_and_applied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            self.assertFalse(service.settings()["low_latency_mode"])
+            self.assertTrue(service.settings()["warm_recent_contacts"])
+            self.assertFalse(service.settings()["mask_recent_contact_metadata"])
+            service.sam.configure_low_latency = Mock(return_value=False)
+            result = service.update_network_settings(
+                low_latency_mode=True,
+                warm_recent_contacts=False,
+                mask_recent_contact_metadata=True,
+            )
+            self.assertTrue(service.settings()["low_latency_mode"])
+            self.assertFalse(service.settings()["warm_recent_contacts"])
+            self.assertTrue(service.settings()["mask_recent_contact_metadata"])
+            self.assertTrue(result["mask_recent_contact_metadata"])
+            self.assertFalse(result["session_restarted"])
+            service.sam.configure_low_latency.assert_called_once_with(True)
+            service.close(wait=True)
+
+    def test_masked_warmup_randomly_selects_real_contacts_not_recent_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            service.vault.state["contacts"] = {
+                "recent": {"destination": "recent-destination"},
+                "cover-a": {"destination": "cover-a-destination"},
+                "cover-b": {"destination": "cover-b-destination"},
+            }
+            service.vault.state["messages"] = [{"contact_id": "recent"}]
+            service.vault.state["settings"]["mask_recent_contact_metadata"] = True
+            service.warm_contact = Mock()
+            random_source = Mock()
+            random_source.sample.return_value = ["cover-b", "cover-a"]
+            with patch("kerberus.service.secrets.SystemRandom", return_value=random_source):
+                service.warm_recent_contacts(limit=2)
+            random_source.sample.assert_called_once_with(["recent", "cover-a", "cover-b"], 2)
+            self.assertEqual(
+                [call.args[0] for call in service.warm_contact.call_args_list],
+                ["cover-b", "cover-a"],
+            )
             service.close(wait=True)
 
     def test_obsolete_ipinfo_token_is_removed(self):
@@ -113,6 +160,7 @@ class ServiceTests(unittest.TestCase):
             class Endpoint:
                 def send(self, _destination, payload):
                     captured.append(payload)
+                    return {"backend": "go-native", "python_helper_roundtrip_ms": 1.25}
 
                 def stop(self):
                     pass
@@ -127,6 +175,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(delivered["status"], "delivered")
             self.assertIsInstance(delivered["recipient_received_at"], int)
             self.assertIsInstance(delivered["delivered_at"], int)
+            self.assertEqual(delivered["transport_metrics"]["python_helper_roundtrip_ms"], 1.25)
+            self.assertIsInstance(delivered["encrypted_receipt_rtt_ms"], float)
 
             alice_service.send_message(bob.identity_id, "Timing alterato")
             tampered_reply = bob_service._receive(captured[1], inline_reply=True)
@@ -430,6 +480,8 @@ class ServiceTests(unittest.TestCase):
                 "delivered_at": 104,
                 "read_at": 106,
                 "status": "read",
+                "transport_metrics": {"sam_handshake_ms": 2.5},
+                "encrypted_receipt_rtt_ms": 18.75,
                 "reactions": {bob.identity_id: "👍"},
             })
             alice_service.vault.save()
@@ -441,6 +493,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(exported["delays_seconds"]["one_way_clock_dependent"], 2)
             self.assertEqual(exported["delays_seconds"]["round_trip_local_clock"], 4)
             self.assertEqual(exported["delays_seconds"]["read_after_send"], 6)
+            self.assertEqual(exported["transport_timings_ms"]["sam_handshake_ms"], 2.5)
+            self.assertEqual(exported["encrypted_receipt_roundtrip_ms"], 18.75)
             self.assertNotIn("payload", exported)
             self.assertNotIn("destination", report["contact"])
             self.assertNotIn("secrets", report)
@@ -541,8 +595,18 @@ class ServiceTests(unittest.TestCase):
             bob_service.mark_chat_read(alice.identity_id)
             self.assertTrue(self._wait_for(lambda: alice_service.messages_for(bob.identity_id)[0]["status"] == "read"))
             outgoing = alice_service.messages_for(bob.identity_id)[0]
-            self.assertEqual(outgoing["reactions"][bob.identity_id], "👍")
+            self.assertEqual(outgoing["reactions"][bob.identity_id], ["👍"])
+            bob_service.react_to_message(alice.identity_id, incoming["message_id"], "❤️")
+            self.assertTrue(self._wait_for(
+                lambda: outgoing.get("reactions", {}).get(bob.identity_id) == ["👍", "❤️"]
+            ))
+            self.assertEqual(incoming["reactions"][bob.identity_id], ["👍", "❤️"])
             bob_service.react_to_message(alice.identity_id, incoming["message_id"], "👍")
+            self.assertTrue(self._wait_for(
+                lambda: outgoing.get("reactions", {}).get(bob.identity_id) == ["❤️"]
+            ))
+            self.assertEqual(incoming["reactions"][bob.identity_id], ["❤️"])
+            bob_service.react_to_message(alice.identity_id, incoming["message_id"], "❤️")
             self.assertTrue(self._wait_for(lambda: bob.identity_id not in outgoing.get("reactions", {})))
             self.assertNotIn(bob.identity_id, incoming.get("reactions", {}))
             with self.assertRaises(ValueError):

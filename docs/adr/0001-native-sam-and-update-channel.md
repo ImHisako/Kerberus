@@ -21,8 +21,14 @@ SHA-256 siano entrambi presenti. L'applicazione non installa nulla senza conferm
 
 - Si elimina un round-trip durante l'apertura normale dello stream.
 - Tre acceptor nativi restano pendenti e vengono rimpiazzati appena SAM consegna una
-  connessione; i frame applicativi sono elaborati da una coda ordinata che non blocca
-  il lettore IPC.
+  connessione; i comandi IPC sono smistati su code dinamiche per destination. Ogni
+  contatto conserva l'ordine FIFO, mentre contatti diversi avanzano in parallelo.
+- Le risposte IPC includono tempi separati per attesa in coda, handler Go, handshake
+  SAM locale e scrittura del comando CONNECT. Il client misura anche round-trip e
+  overhead IPC Python↔Go, mentre un cronometro monotono associa invio e ricevuta E2EE.
+- Il tempo reale di apertura I2P non è deducibile da `SILENT=true`: il benchmark live
+  apre quindi uno stream usa-e-getta con `SILENT=false` e misura `STREAM STATUS`, senza
+  modificare il percorso di produzione.
 - Ogni stream accettato viene riusato come canale full-duplex per messaggi e controlli
   nella direzione opposta, evitando un secondo handshake I2P Streaming.
 - Gli stream restano caldi e vengono riutilizzati; aumenta leggermente il traffico di

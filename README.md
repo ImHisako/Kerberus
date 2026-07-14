@@ -50,7 +50,7 @@ Delivery and read receipts can be disabled globally or for an individual convers
 
 ### Reactions and emoji
 
-Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Short emoji-only messages are recognized as quick reactions and displayed in a compact bubble with enlarged emoji; reactions attached to a message are grouped in a dedicated chip. Reactions are encrypted inside the ratchet channel. Selecting the same reaction again removes the local user's reaction and sends an authenticated removal event to the peer.
+Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Short emoji-only messages are recognized as quick reactions and displayed in a compact bubble with enlarged emoji; attached reactions use dedicated chips. Each participant can add multiple reactions to one message. Reactions are encrypted inside the ratchet channel; left-clicking one of your own reactions removes only that emoji and sends an authenticated removal event to the peer.
 
 ### Message actions
 
@@ -143,9 +143,11 @@ Transport settings include:
 - persistent I2P destination and long-lived SAM session;
 - three inbound and three outbound tunnels, plus one backup each;
 - default tunnel length retained — Kerberus does not enable zero-hop tunnels for lower latency;
+- optional **Low latency** mode with two-hop tunnels and immediate initial ACKs, enabled only after an embedded UI warning; it reduces resistance to traffic correlation but does not change end-to-end encryption;
 - `i2cp.leaseSetEncType=6,4` for ML-KEM-768/ECIES-X25519 LeaseSet compatibility in supported I2P versions;
 - interactive streaming profile, persistent peer streams, TCP no-delay, and keepalive;
 - `SILENT=true` with a short `connectDelay`, allowing the first frame to accompany stream establishment;
+- configurable pre-warming of up to eight contacts to reduce first-message latency, explicitly presented as a privacy/performance trade-off because it creates background traffic and connection metadata; disable it for maximum privacy. An optional mode uniformly selects real contacts instead of using recent history, reducing correlation with the latest chats without pretending nonexistent destinations are valid. The SAM router still sees selected destinations and contacts may observe the connection;
 - application receipts as the only authoritative delivery signal.
 
 I2P protects the network route; it does not replace application-layer end-to-end encryption or endpoint security.
@@ -362,6 +364,7 @@ Run the native transport checks:
 ```powershell
 cd native
 go test ./...
+go test '-bench=Benchmark' '-run=^$' -benchmem ./...
 go vet ./...
 ```
 
@@ -372,7 +375,9 @@ $env:KERBERUS_LIVE_I2P = "1"
 .\.venv\Scripts\python.exe -m unittest tests.test_live_i2p -v
 ```
 
-The live test performs contact exchange, sends a ten-message burst, verifies delivery and ordering, and reports latency statistics.
+The live test performs contact exchange, sends a ten-message burst, verifies delivery and ordering, and separately reports Python↔helper IPC overhead, the local SAM handshake, actual I2P stream opening, and encrypted-receipt round-trip time. The stream-opening probe uses a disposable `SILENT=false` connection; normal sends retain `SILENT=true` and the 0-RTT path.
+
+The helper processes different destinations concurrently through independent dynamic queues. Commands for one destination remain FIFO, so a slow `STREAM CONNECT` for one contact does not suspend other contacts.
 
 ## Building releases
 
@@ -393,10 +398,10 @@ Linux:
 Python source artifacts and the complete source archive:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.6.0
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.7.0
 ```
 
-Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.6.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
+Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.7.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
 
 ## Repository layout
 
