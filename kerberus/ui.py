@@ -40,6 +40,9 @@ from PyQt6.QtGui import (
     QWheelEvent,
 )
 from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtMultimedia import (
+    QAudioFormat, QAudioOutput, QAudioSource, QMediaDevices, QMediaPlayer,
+)
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -80,6 +83,7 @@ from .network_insights import collect_i2p_peer_connections, lookup_ip_geolocatio
 from .router import I2P_VERSION, RouterInstaller
 from .service import MessengerService
 from .updates import UpdateInfo, check_for_update, download_update
+from .voice import test_tone_wav
 
 
 COLORS = {
@@ -409,6 +413,48 @@ _ENGLISH.update({
     "Risposta del servizio IP troppo grande": "IP service response is too large",
     "Risposta del servizio IP non valida": "Invalid IP service response",
 })
+_ENGLISH.update({
+    "Messaggio vocale": "Voice message",
+    "Privacy dei messaggi vocali": "Voice-message privacy",
+    "Registra messaggio vocale cifrato": "Record encrypted voice message",
+    "Annulla registrazione": "Cancel recording",
+    "Termina e invia": "Stop and send",
+    "Registrazione vocale annullata": "Voice recording cancelled",
+    "Compressione vocale nel helper Go e cifratura…": "Compressing voice in the Go helper and encrypting…",
+    "Decodifica vocale con il codec Go…": "Decoding voice with the Go codec…",
+    "Riproduzione messaggio vocale cifrato": "Playing encrypted voice message",
+    "Nessun microfono disponibile": "No microphone is available",
+    "Il formato del microfono non è supportato": "The microphone format is not supported",
+    "Impossibile avviare il microfono": "Unable to start the microphone",
+    "Il messaggio vocale è troppo breve": "The voice message is too short",
+    "Durata vocale": "Voice duration",
+    "Codifica Go": "Go encoding",
+    "Decodifica Go": "Go decoding",
+    "Registrazione {minutes}:{seconds:02d} · massimo 2:00": "Recording {minutes}:{seconds:02d} · maximum 2:00",
+    "Il formato del microfono produce troppi dati; seleziona un dispositivo standard":
+        "The microphone format produces too much data; select a standard device",
+    "Il contenuto sarà cifrato end-to-end e trasportato soltanto tramite I2P. Durata, dimensione e tempistica del traffico possono comunque essere osservabili e correlate. Il microfono resta attivo soltanto durante la registrazione visibile. Continuare?":
+        "Content is end-to-end encrypted and transported only through I2P. Traffic duration, size, and timing may still be observable and correlated. The microphone remains active only during visible recording. Continue?",
+    "Audio e messaggi vocali": "Audio and voice messages",
+    "Scegli il microfono e le cuffie usati da Kerberus e verifica il percorso audio completo.":
+        "Choose the microphone and headphones used by Kerberus and verify the complete audio path.",
+    "Microfono": "Microphone",
+    "Dispositivo usato per registrare i messaggi vocali.": "Device used to record voice messages.",
+    "Cuffie o altoparlanti": "Headphones or speakers",
+    "Dispositivo sul quale vengono riprodotti messaggi vocali e test.":
+        "Device used to play voice messages and tests.",
+    "Predefinito di sistema": "System default",
+    "Prova uscita": "Test output",
+    "Prova microfono (3 s)": "Test microphone (3 s)",
+    "Il test microfono registra, comprime e decodifica con il helper Go, poi riproduce sulle cuffie scelte.":
+        "The microphone test records, compresses and decodes with the Go helper, then plays through the selected headphones.",
+    "Tono inviato al dispositivo di uscita scelto.": "Tone sent to the selected output device.",
+    "Registrazione di prova in corso per 3 secondi…": "Test recording in progress for 3 seconds…",
+    "Elaborazione con il codec Go…": "Processing with the Go codec…",
+    "Test completato: dovresti sentire la registrazione sul dispositivo di uscita scelto.":
+        "Test complete: you should hear the recording on the selected output device.",
+    "È già in corso una registrazione.": "A recording is already in progress.",
+})
 _ITALIAN = {value: key for key, value in _ENGLISH.items()}
 
 
@@ -453,6 +499,31 @@ def lucide_icon(name: str, color: str = "#aeb8c4", size: int = 24) -> QIcon:
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
+
+
+def audio_device_id(device: object) -> str:
+    """Return a JSON-safe opaque identifier for a Qt audio device."""
+    try:
+        return bytes(device.id()).hex()
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+
+def resolve_audio_device(devices: list[object], stored_id: str, default: object) -> object:
+    """Resolve a saved device, falling back safely when hardware was removed."""
+    if stored_id:
+        for device in devices:
+            if audio_device_id(device) == stored_id:
+                return device
+    return default
+
+
+def available_audio_inputs() -> list[object]:
+    return list(QMediaDevices.audioInputs())
+
+
+def available_audio_outputs() -> list[object]:
+    return list(QMediaDevices.audioOutputs())
 
 
 def avatar_pixmap(identity: IdentityBundle, size: int) -> QPixmap:
@@ -1144,6 +1215,19 @@ class ChatMessageDelegate(QStyledItemDelegate):
                 return emoji
         return ""
 
+    def voice_at(self, message: dict, row_rect: QRect, font: QFont, position: QPoint) -> bool:
+        geometry = self._layout(message, row_rect.width(), font)
+        if not bool(geometry.get("voice_message")):
+            return False
+        bubble_rect = self._bubble_rect(row_rect, geometry)
+        region = QRect(
+            bubble_rect.left() + 10,
+            bubble_rect.top() + 8 + int(geometry["author_height"]),
+            bubble_rect.width() - 20,
+            int(geometry["body_height"]) + 6,
+        )
+        return region.contains(position)
+
     def _layout(self, message: dict, width: int, font: QFont) -> dict[str, object]:
         outgoing = message.get("direction") == "out"
         identity = self.local_identity if outgoing else self.remote_identity
@@ -1151,7 +1235,13 @@ class ChatMessageDelegate(QStyledItemDelegate):
         max_text_width = max(102, max_bubble_width - 28)
         text = str(message.get("text", ""))
         display_text = text.strip()
-        emoji_reaction = is_emoji_reaction(text)
+        voice = message.get("voice") if message.get("kind") == "voice" else None
+        voice_message = isinstance(voice, dict)
+        duration_ms = int(voice.get("duration_ms", 0)) if voice_message else 0
+        duration_text = f"{duration_ms // 60000}:{duration_ms // 1000 % 60:02d}"
+        if voice_message:
+            display_text = f"Messaggio vocale  {duration_text}"
+        emoji_reaction = not voice_message and is_emoji_reaction(text)
         body_font = QFont(font)
         if emoji_reaction:
             body_font.setFamilies(["Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"])
@@ -1169,7 +1259,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
 
         lines = display_text.splitlines() or [""]
         natural_text_width = max((body_metrics.horizontalAdvance(line) for line in lines), default=0)
-        urls = extract_urls(display_text)
+        urls = () if voice_message else extract_urls(display_text)
         link = urls[0] if self.link_previews and urls else ""
         preview = self.preview_cache.get(link) if link else None
         reactions = message.get("reactions", {})
@@ -1180,7 +1270,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
             (sum(chip[3] for chip in row) + max(0, len(row) - 1) * 5 for row in preliminary_rows),
             default=0,
         )
-        minimum_content_width = 80 if emoji_reaction else 72
+        minimum_content_width = 230 if voice_message else (80 if emoji_reaction else 72)
         natural_content_width = max(
             minimum_content_width,
             natural_text_width,
@@ -1193,7 +1283,9 @@ class ChatMessageDelegate(QStyledItemDelegate):
         bubble_width = min(max_bubble_width, max(108 if emoji_reaction else 100, text_width + 28))
         text_width = bubble_width - 28
         reaction_rows = self._reaction_rows(grouped_reactions, font, text_width)
-        if emoji_reaction:
+        if voice_message:
+            body_height = 42
+        elif emoji_reaction:
             body_height = body_metrics.height() + 4
         else:
             text_layout = self._body_layout(display_text, body_font, text_width)
@@ -1226,6 +1318,8 @@ class ChatMessageDelegate(QStyledItemDelegate):
             "reaction_rows": reaction_rows,
             "reaction_height": reaction_height,
             "emoji_reaction": emoji_reaction,
+            "voice_message": voice_message,
+            "voice_duration": duration_text,
             "metadata": metadata,
         }
 
@@ -1288,7 +1382,36 @@ class ChatMessageDelegate(QStyledItemDelegate):
         painter.setFont(geometry["body_font"])
         painter.setPen(QColor(COLORS["text"]))
         body_height = int(geometry["body_height"])
-        if emoji_reaction:
+        if bool(geometry.get("voice_message")):
+            voice_rect = QRect(x, y, content_width, body_height)
+            painter.setPen(QPen(QColor(COLORS["accent"]), 1))
+            painter.setBrush(QColor(COLORS["surface_3"]))
+            painter.drawEllipse(QRect(voice_rect.left(), voice_rect.top() + 4, 34, 34))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["accent"]))
+            play = QPainterPath()
+            play.moveTo(voice_rect.left() + 13, voice_rect.top() + 13)
+            play.lineTo(voice_rect.left() + 13, voice_rect.top() + 29)
+            play.lineTo(voice_rect.left() + 25, voice_rect.top() + 21)
+            play.closeSubpath()
+            painter.drawPath(play)
+            waveform_left = voice_rect.left() + 48
+            waveform_width = max(30, voice_rect.width() - 98)
+            painter.setPen(QPen(QColor(COLORS["accent"] if outgoing else COLORS["cyan"]), 2))
+            for bar in range(18):
+                bar_x = waveform_left + round(bar * waveform_width / 18)
+                height = 7 + ((bar * 11 + 5) % 18)
+                painter.drawLine(
+                    bar_x, voice_rect.center().y() - height // 2,
+                    bar_x, voice_rect.center().y() + height // 2,
+                )
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(
+                QRect(voice_rect.right() - 45, voice_rect.top(), 45, voice_rect.height()),
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                str(geometry.get("voice_duration", "0:00")),
+            )
+        elif emoji_reaction:
             painter.drawText(
                 QRect(x, y, content_width, body_height),
                 int(Qt.AlignmentFlag.AlignCenter), str(geometry["display_text"]),
@@ -1468,6 +1591,7 @@ class VirtualChatView(QListView):
         self.on_open_link: Callable[[str], None] | None = None
         self._pressed_link = ""
         self._pressed_reaction = ""
+        self._pressed_voice = False
         self._pressed_position = QPoint()
 
     def configure(
@@ -1514,7 +1638,7 @@ class VirtualChatView(QListView):
             reaction_menu.addAction(emoji): emoji for emoji in ("👍", "❤️", "😂", "😮", "😢", "🔥")
         }
         all_reactions = reaction_menu.addAction(tr("Tutte le emoji…"))
-        copy_action = menu.addAction(tr("Copia"))
+        copy_action = menu.addAction(tr("Copia")) if message.get("kind") != "voice" else None
         timing_action = menu.addAction(tr("Dettagli di invio e ritardo"))
         link = extract_url(str(message.get("text", "")))
         open_link = menu.addAction(tr("Apri link")) if link else None
@@ -1526,7 +1650,7 @@ class VirtualChatView(QListView):
             self.on_action("react:" + reaction_actions[selected], message)
         elif selected is all_reactions and self.on_action is not None:
             self.on_action("reaction_picker", message)
-        elif selected is copy_action and self.on_action is not None:
+        elif copy_action is not None and selected is copy_action and self.on_action is not None:
             self.on_action("copy", message)
         elif selected is timing_action and self.on_timing is not None:
             self.on_timing(message)
@@ -1556,17 +1680,28 @@ class VirtualChatView(QListView):
             return ""
         return self.chat_delegate.reaction_at(message, self.visualRect(index), self.font(), position)
 
+    def _voice_at_position(self, position: QPoint) -> bool:
+        index = self.indexAt(position)
+        if not index.isValid():
+            return False
+        message = index.data(ChatMessageModel.MessageRole)
+        if not isinstance(message, dict):
+            return False
+        return self.chat_delegate.voice_at(message, self.visualRect(index), self.font(), position)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._pressed_position = event.position().toPoint()
             self._pressed_link = self._link_at_position(self._pressed_position)
             self._pressed_reaction = self._reaction_at_position(self._pressed_position)
+            self._pressed_voice = self._voice_at_position(self._pressed_position)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         position = event.position().toPoint()
         link = self._link_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
         reaction = self._reaction_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
+        voice = self._voice_at_position(position) if event.button() == Qt.MouseButton.LeftButton else False
         moved = (position - self._pressed_position).manhattanLength()
         if link and link == self._pressed_link and moved <= QApplication.startDragDistance():
             self._pressed_link = ""
@@ -1582,13 +1717,26 @@ class VirtualChatView(QListView):
                 self.on_action("react:" + reaction, message)
             event.accept()
             return
+        if voice and self._pressed_voice and moved <= QApplication.startDragDistance():
+            index = self.indexAt(position)
+            message = index.data(ChatMessageModel.MessageRole) if index.isValid() else None
+            if self.on_action is not None and isinstance(message, dict):
+                self.on_action("play_voice", message)
+            self._pressed_voice = False
+            event.accept()
+            return
         self._pressed_link = ""
         self._pressed_reaction = ""
+        self._pressed_voice = False
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         position = event.position().toPoint()
-        interactive = self._link_at_position(position) or self._reaction_at_position(position)
+        interactive = (
+            self._link_at_position(position)
+            or self._reaction_at_position(position)
+            or self._voice_at_position(position)
+        )
         self.viewport().setCursor(
             Qt.CursorShape.PointingHandCursor if interactive else Qt.CursorShape.ArrowCursor
         )
@@ -1912,6 +2060,107 @@ class ComposerEdit(QPlainTextEdit):
             self.send_requested.emit()
             return
         super().keyPressEvent(event)
+
+
+class VoiceRecorder(QObject):
+    """Capture microphone PCM; compression and resampling stay in the Go helper."""
+
+    finished = pyqtSignal(bytes, int, int, str, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._source: QAudioSource | None = None
+        self._device: QIODevice | None = None
+        self._format: QAudioFormat | None = None
+        self._data = bytearray()
+        self._active = False
+        self._overflow_pending = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self, device: object | None = None) -> None:
+        if self._active:
+            return
+        if device is None:
+            device = QMediaDevices.defaultAudioInput()
+        if device.isNull():
+            self.failed.emit("Nessun microfono disponibile")
+            return
+        desired = QAudioFormat()
+        desired.setSampleRate(16_000)
+        desired.setChannelCount(1)
+        desired.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        audio_format = desired if device.isFormatSupported(desired) else device.preferredFormat()
+        sample_formats = {
+            QAudioFormat.SampleFormat.UInt8: "u8",
+            QAudioFormat.SampleFormat.Int16: "s16le",
+            QAudioFormat.SampleFormat.Int32: "s32le",
+            QAudioFormat.SampleFormat.Float: "f32le",
+        }
+        if audio_format.sampleFormat() not in sample_formats:
+            self.failed.emit("Il formato del microfono non è supportato")
+            return
+        self._data.clear()
+        self._overflow_pending = False
+        self._format = audio_format
+        self._source = QAudioSource(device, audio_format, self)
+        self._device = self._source.start()
+        if self._device is None:
+            self._source.deleteLater()
+            self._source = None
+            self.failed.emit("Impossibile avviare il microfono")
+            return
+        self._device.readyRead.connect(self._read_available)
+        self._active = True
+
+    def _read_available(self) -> None:
+        if self._device is not None:
+            self._data.extend(bytes(self._device.readAll()))
+            if len(self._data) > 64 * 1024 * 1024 and not self._overflow_pending:
+                self._overflow_pending = True
+                QTimer.singleShot(0, self._fail_oversized_capture)
+
+    def _fail_oversized_capture(self) -> None:
+        if self._active:
+            self.stop(discard=True)
+            self.failed.emit("Il formato del microfono produce troppi dati; seleziona un dispositivo standard")
+
+    def stop(self, *, discard: bool = False) -> None:
+        if not self._active or self._source is None or self._format is None:
+            return
+        self._read_available()
+        self._source.stop()
+        audio_format = self._format
+        raw = bytes(self._data)
+        duration_ms = max(0, audio_format.durationForBytes(len(raw)) // 1000)
+        sample_formats = {
+            QAudioFormat.SampleFormat.UInt8: "u8",
+            QAudioFormat.SampleFormat.Int16: "s16le",
+            QAudioFormat.SampleFormat.Int32: "s32le",
+            QAudioFormat.SampleFormat.Float: "f32le",
+        }
+        sample_format = sample_formats.get(audio_format.sampleFormat(), "")
+        self._active = False
+        self._device = None
+        self._format = None
+        self._data.clear()
+        self._source.deleteLater()
+        self._source = None
+        if discard:
+            return
+        if duration_ms < 300:
+            self.failed.emit("Il messaggio vocale è troppo breve")
+            return
+        self.finished.emit(
+            raw,
+            audio_format.sampleRate(),
+            audio_format.channelCount(),
+            sample_format,
+            duration_ms,
+        )
 
 
 _EMOJI_CATALOG: list[tuple[str, str, str]] | None = None
@@ -3208,6 +3457,22 @@ class KerberusWindow(QMainWindow):
         self._stream_proof_active = False
         self._stream_proof_detail = ""
         self._tray: QSystemTrayIcon | None = None
+        self._voice_recorder = VoiceRecorder(self)
+        self._voice_recorder.finished.connect(self._voice_recorded)
+        self._voice_recorder.failed.connect(self._voice_recording_failed)
+        self._voice_record_started = 0.0
+        self._voice_record_contact = ""
+        self._voice_record_mode = "message"
+        self._audio_test_output_device_id = ""
+        self._audio_test_status: QLabel | None = None
+        self._audio_test_button: QPushButton | None = None
+        self._voice_privacy_acknowledged = False
+        self._voice_timer = QTimer(self)
+        self._voice_timer.setInterval(250)
+        self._voice_timer.timeout.connect(self._update_voice_recording)
+        self._voice_player: QMediaPlayer | None = None
+        self._voice_audio_output: QAudioOutput | None = None
+        self._voice_buffer: QBuffer | None = None
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Kerberus")
@@ -3635,6 +3900,26 @@ class KerberusWindow(QMainWindow):
         self.composer.setFixedHeight(58)
         self.composer.send_requested.connect(self.send_message)
         composer_layout.addWidget(self.composer, 1)
+        self.voice_recording_label = QLabel("Registrazione 0:00 · massimo 2:00")
+        self.voice_recording_label.setStyleSheet(f"color: {COLORS['danger']}; font-weight: 700;")
+        self.voice_recording_label.hide()
+        composer_layout.addWidget(self.voice_recording_label, 1)
+        self.voice_cancel_button = QToolButton()
+        self.voice_cancel_button.setObjectName("emojiToggle")
+        self.voice_cancel_button.setIcon(lucide_icon("x", COLORS["danger"]))
+        self.voice_cancel_button.setFixedSize(48, 48)
+        self.voice_cancel_button.setToolTip("Annulla registrazione")
+        self.voice_cancel_button.clicked.connect(self.cancel_voice_recording)
+        self.voice_cancel_button.hide()
+        composer_layout.addWidget(self.voice_cancel_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.voice_button = QToolButton()
+        self.voice_button.setObjectName("emojiToggle")
+        self.voice_button.setIcon(lucide_icon("mic", COLORS["danger"]))
+        self.voice_button.setIconSize(QSize(21, 21))
+        self.voice_button.setFixedSize(48, 48)
+        self.voice_button.setToolTip("Registra messaggio vocale cifrato")
+        self.voice_button.clicked.connect(self.toggle_voice_recording)
+        composer_layout.addWidget(self.voice_button, alignment=Qt.AlignmentFlag.AlignBottom)
         self.emoji_button = QToolButton()
         self.emoji_button.setObjectName("emojiToggle")
         self.emoji_button.setText("☺")
@@ -3643,14 +3928,14 @@ class KerberusWindow(QMainWindow):
         self.emoji_button.setToolTip("Emoji")
         self.emoji_button.clicked.connect(self.show_emoji_menu)
         composer_layout.addWidget(self.emoji_button, alignment=Qt.AlignmentFlag.AlignBottom)
-        send = QToolButton()
-        send.setObjectName("sendButton")
-        send.setIcon(lucide_icon("send", "#07120e"))
-        send.setIconSize(QSize(21, 21))
-        send.setFixedSize(48, 48)
-        send.setToolTip("Invia")
-        send.clicked.connect(self.send_message)
-        composer_layout.addWidget(send, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.send_button = QToolButton()
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setIcon(lucide_icon("send", "#07120e"))
+        self.send_button.setIconSize(QSize(21, 21))
+        self.send_button.setFixedSize(48, 48)
+        self.send_button.setToolTip("Invia")
+        self.send_button.clicked.connect(self.send_message)
+        composer_layout.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignBottom)
         conversation_layout.addWidget(composer_frame)
         workspace_layout.addWidget(conversation, 1)
         self.chat_settings_panel = ChatSettingsPanel()
@@ -3722,6 +4007,8 @@ class KerberusWindow(QMainWindow):
         self.select_contact(item.data(Qt.ItemDataRole.UserRole))
 
     def select_contact(self, contact_id: str) -> None:
+        if self._voice_recorder.active and contact_id != self._voice_record_contact:
+            self.cancel_voice_recording()
         contacts = {contact.identity_id: contact for contact in self.service.contacts()}
         contact = contacts.get(contact_id)
         if not contact:
@@ -3820,6 +4107,15 @@ class KerberusWindow(QMainWindow):
         QTimer.singleShot(0, self.message_view.scrollToBottom)
 
     def message_action(self, action: str, message: dict) -> None:
+        if action == "play_voice":
+            message_id = str(message.get("message_id", ""))
+            self.statusBar().showMessage(tr("Decodifica vocale con il codec Go…"), 3000)
+            self._run_task(
+                lambda: self.service.decode_voice(message_id),
+                self._play_voice_wav,
+                lambda error: self._error("Messaggio vocale", error),
+            )
+            return
         if action == "reaction_picker":
             self._emoji_reaction_message = message
             self.emoji_panel.set_reaction_mode(True)
@@ -4059,9 +4355,10 @@ class KerberusWindow(QMainWindow):
             if item is None:
                 return
             contact_id = str(item.data(Qt.ItemDataRole.UserRole))
-            text = str(message.get("text", ""))
+            is_voice = message.get("kind") == "voice"
             self._run_task(
-                lambda: self.service.forward_message(contact_id, text),
+                lambda: self.service.forward_voice(contact_id, message.get("voice"))
+                if is_voice else self.service.forward_message(contact_id, str(message.get("text", ""))),
                 lambda _value: self.statusBar().showMessage(tr("Messaggio inoltrato con nuova cifratura"), 4000),
                 lambda error: self._error("Inoltro", error),
             )
@@ -4070,8 +4367,12 @@ class KerberusWindow(QMainWindow):
         self._show_modeless(dialog)
 
     def show_message_timing(self, message: dict) -> None:
-        dialog = KerberusDialog("Tempi del messaggio", self, 570)
+        dialog = KerberusDialog("Tempi del messaggio", self, 540)
+        available_height = self.screen().availableGeometry().height()
+        dialog.setFixedHeight(max(420, min(640, available_height - 48)))
         layout = dialog.body_layout
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(8)
         eyebrow = QLabel("DIAGNOSTICA DI CONSEGNA")
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Invio e ricezione")
@@ -4123,21 +4424,50 @@ class KerberusWindow(QMainWindow):
             rows.append(("Ricevuta cifrata andata/ritorno", format_ms(message.get("encrypted_receipt_rtt_ms"))))
             if isinstance(sent_at, int) and isinstance(delivered_at, int):
                 rows.append(("Tempo totale andata/ritorno", format_delay(delivered_at - sent_at)))
+        if message.get("kind") == "voice":
+            voice = message.get("voice", {})
+            metrics = message.get("voice_metrics", {})
+            if isinstance(voice, dict):
+                rows.append(("Durata vocale", f"{int(voice.get('duration_ms', 0)) / 1000:.1f} s"))
+                rows.append(("Codec", str(voice.get("codec", ""))))
+            if isinstance(metrics, dict):
+                rows.append(("Codifica Go", format_ms(metrics.get("encode_ms"))))
+                rows.append(("Decodifica Go", format_ms(metrics.get("decode_ms"))))
 
+        scroll = QScrollArea()
+        scroll.setObjectName("timingScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        rows_host = QFrame()
+        rows_host.setObjectName("timingRows")
+        rows_layout = QVBoxLayout(rows_host)
+        rows_layout.setContentsMargins(0, 0, 4, 0)
+        rows_layout.setSpacing(6)
         for label, value in rows:
             row = QFrame()
+            row.setObjectName("timingRow")
             row.setStyleSheet(
-                f"background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 7px;"
+                f"QFrame#timingRow {{ background: {COLORS['surface']}; "
+                f"border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
             )
-            row_layout = QVBoxLayout(row)
-            row_layout.setContentsMargins(12, 9, 12, 9)
+            row.setMinimumHeight(38)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(11, 6, 11, 6)
+            row_layout.setSpacing(12)
             key = QLabel(label.upper())
             key.setObjectName("eyebrow")
+            key.setWordWrap(True)
             data = QLabel(value)
+            data.setObjectName("timingValue")
+            data.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            data.setWordWrap(True)
             data.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            row_layout.addWidget(key)
-            row_layout.addWidget(data)
-            layout.addWidget(row)
+            row_layout.addWidget(key, 3)
+            row_layout.addWidget(data, 2)
+            rows_layout.addWidget(row)
+        scroll.setWidget(rows_host)
+        layout.addWidget(scroll, 1)
 
         note = QLabel(
             "L’orario di invio è autenticato nel messaggio cifrato. Il ritardo a senso unico dipende anche dalla "
@@ -4146,10 +4476,13 @@ class KerberusWindow(QMainWindow):
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
+        actions = QHBoxLayout()
+        actions.addStretch()
         close = QPushButton("Chiudi")
         close.setObjectName("primary")
         close.clicked.connect(dialog.accept)
-        layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+        actions.addWidget(close)
+        layout.addLayout(actions)
         self._show_modeless(dialog)
 
     def send_message(self) -> None:
@@ -4163,6 +4496,209 @@ class KerberusWindow(QMainWindow):
             self._message_send_result,
             lambda error: self._error("Invio", error),
         )
+
+    def toggle_voice_recording(self) -> None:
+        if self._voice_recorder.active:
+            self._voice_recorder.stop()
+            return
+        if not self.selected_contact:
+            return
+        if not self._voice_privacy_acknowledged:
+            accepted = KerberusMessageDialog.ask(
+                self,
+                tr("Privacy dei messaggi vocali"),
+                tr(
+                    "Il contenuto sarà cifrato end-to-end e trasportato soltanto tramite I2P. "
+                    "Durata, dimensione e tempistica del traffico possono comunque essere osservabili e correlate. "
+                    "Il microfono resta attivo soltanto durante la registrazione visibile. Continuare?"
+                ),
+            )
+            if not accepted:
+                return
+            self._voice_privacy_acknowledged = True
+        self._voice_record_contact = self.selected_contact
+        self._voice_record_mode = "message"
+        self._voice_recorder.start(self._selected_audio_input())
+        if not self._voice_recorder.active:
+            return
+        self._voice_record_started = time.monotonic()
+        self._set_voice_recording_ui(True)
+        self._voice_timer.start()
+        self._update_voice_recording()
+
+    def cancel_voice_recording(self) -> None:
+        self._voice_recorder.stop(discard=True)
+        self._voice_timer.stop()
+        self._voice_record_contact = ""
+        self._set_voice_recording_ui(False)
+        self.statusBar().showMessage(tr("Registrazione vocale annullata"), 2500)
+
+    def _set_voice_recording_ui(self, active: bool) -> None:
+        self.composer.setVisible(not active)
+        self.emoji_button.setVisible(not active)
+        self.send_button.setVisible(not active)
+        self.voice_recording_label.setVisible(active)
+        self.voice_cancel_button.setVisible(active)
+        self.voice_button.setIcon(lucide_icon(
+            "send" if active else "mic",
+            COLORS["accent"] if active else COLORS["danger"],
+        ))
+        self.voice_button.setToolTip("Termina e invia" if active else "Registra messaggio vocale cifrato")
+
+    def _update_voice_recording(self) -> None:
+        if not self._voice_recorder.active:
+            self._voice_timer.stop()
+            return
+        precise_elapsed = time.monotonic() - self._voice_record_started
+        elapsed = min(120, int(precise_elapsed))
+        self.voice_recording_label.setText(tr_format(
+            "Registrazione {minutes}:{seconds:02d} · massimo 2:00",
+            minutes=elapsed // 60,
+            seconds=elapsed % 60,
+        ))
+        if precise_elapsed >= 119.5:
+            self._voice_recorder.stop()
+
+    def _voice_recording_failed(self, message: str) -> None:
+        if self._voice_record_mode == "audio_test":
+            self._finish_audio_test(tr(message), success=False)
+            self._voice_record_mode = "message"
+            return
+        self._voice_timer.stop()
+        self._set_voice_recording_ui(False)
+        self._voice_record_contact = ""
+        self._error(tr("Messaggio vocale"), tr(message))
+
+    def _voice_recorded(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        channels: int,
+        sample_format: str,
+        _duration_ms: int,
+    ) -> None:
+        if self._voice_record_mode == "audio_test":
+            output_device_id = self._audio_test_output_device_id
+            self._voice_record_mode = "message"
+            self._set_audio_test_status(tr("Elaborazione con il codec Go…"))
+
+            def test_ready(value: object) -> None:
+                self._play_voice_wav(value, output_device_id)
+                self._finish_audio_test(
+                    tr("Test completato: dovresti sentire la registrazione sul dispositivo di uscita scelto."),
+                    success=True,
+                )
+
+            self._run_task(
+                lambda: self.service.test_voice_roundtrip(
+                    pcm,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    sample_format=sample_format,
+                ),
+                test_ready,
+                lambda error: self._finish_audio_test(error, success=False),
+            )
+            return
+        contact_id = self._voice_record_contact
+        self._voice_timer.stop()
+        self._voice_record_contact = ""
+        self._set_voice_recording_ui(False)
+        if not contact_id:
+            return
+        self.statusBar().showMessage(tr("Compressione vocale nel helper Go e cifratura…"), 5000)
+        self._run_task(
+            lambda: self.service.send_voice(
+                contact_id,
+                pcm,
+                sample_rate=sample_rate,
+                channels=channels,
+                sample_format=sample_format,
+            ),
+            self._message_send_result,
+            lambda error: self._error("Invio vocale", error),
+        )
+
+    def _selected_audio_input(self, device_id: str | None = None) -> object:
+        stored_id = (
+            str(self.service.settings().get("audio_input_device_id", ""))
+            if device_id is None else device_id
+        )
+        return resolve_audio_device(
+            available_audio_inputs(), stored_id, QMediaDevices.defaultAudioInput()
+        )
+
+    def _create_audio_output(self, device_id: str | None = None) -> QAudioOutput:
+        stored_id = (
+            str(self.service.settings().get("audio_output_device_id", ""))
+            if device_id is None else device_id
+        )
+        device = resolve_audio_device(
+            available_audio_outputs(), stored_id, QMediaDevices.defaultAudioOutput()
+        )
+        if not device.isNull():
+            return QAudioOutput(device, self)
+        return QAudioOutput(self)
+
+    def _set_audio_test_status(self, message: str) -> None:
+        if self._audio_test_status is not None and not sip.isdeleted(self._audio_test_status):
+            self._audio_test_status.setText(message)
+
+    def _finish_audio_test(self, message: str, *, success: bool) -> None:
+        self._set_audio_test_status(message)
+        if self._audio_test_button is not None and not sip.isdeleted(self._audio_test_button):
+            self._audio_test_button.setEnabled(True)
+        if not success:
+            self.statusBar().showMessage(message, 5000)
+        self._audio_test_button = None
+        self._audio_test_status = None
+        self._audio_test_output_device_id = ""
+
+    def _start_microphone_test(
+        self,
+        input_device_id: str,
+        output_device_id: str,
+        status: QLabel,
+        button: QPushButton,
+    ) -> None:
+        if self._voice_recorder.active:
+            status.setText(tr("È già in corso una registrazione."))
+            return
+        self._voice_record_mode = "audio_test"
+        self._audio_test_output_device_id = output_device_id
+        self._audio_test_status = status
+        self._audio_test_button = button
+        button.setEnabled(False)
+        status.setText(tr("Registrazione di prova in corso per 3 secondi…"))
+        self._voice_recorder.start(self._selected_audio_input(input_device_id))
+        if self._voice_recorder.active:
+            QTimer.singleShot(
+                3_000,
+                lambda: self._voice_recorder.stop()
+                if self._voice_record_mode == "audio_test" and self._voice_recorder.active else None,
+            )
+
+    def _play_voice_wav(self, wav_data: object, output_device_id: str | None = None) -> None:
+        if not isinstance(wav_data, bytes):
+            self._error("Messaggio vocale", "Audio decodificato non valido")
+            return
+        if self._voice_player is not None:
+            self._voice_player.stop()
+            self._voice_player.deleteLater()
+        if self._voice_buffer is not None:
+            self._voice_buffer.close()
+            self._voice_buffer.deleteLater()
+        if self._voice_audio_output is not None:
+            self._voice_audio_output.deleteLater()
+        self._voice_audio_output = self._create_audio_output(output_device_id)
+        self._voice_player = QMediaPlayer(self)
+        self._voice_player.setAudioOutput(self._voice_audio_output)
+        self._voice_buffer = QBuffer(self)
+        self._voice_buffer.setData(QByteArray(wav_data))
+        self._voice_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self._voice_player.setSourceDevice(self._voice_buffer, QUrl("voice-message.wav"))
+        self._voice_player.play()
+        self.statusBar().showMessage(tr("Riproduzione messaggio vocale cifrato"), 3500)
 
     def _message_send_result(self, value: object) -> None:
         self.refresh_messages("status", self.selected_contact)
@@ -4379,6 +4915,102 @@ class KerberusWindow(QMainWindow):
         language_layout.addLayout(language_text, 1)
         language_layout.addWidget(language)
         language_card.add_row(language_row)
+
+        audio_card = add_card(
+            general_layout,
+            SettingsCard(
+                "mic", "Audio e messaggi vocali",
+                "Scegli il microfono e le cuffie usati da Kerberus e verifica il percorso audio completo.",
+            ),
+        )
+
+        def audio_device_row(
+            title_text: str,
+            hint_text: str,
+            devices: list[object],
+            selected_id: str,
+            object_name: str,
+        ) -> tuple[QFrame, ModernComboBox]:
+            row = QFrame()
+            row.setObjectName("settingsRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(16, 13, 16, 13)
+            row_text = QVBoxLayout()
+            row_text.setSpacing(3)
+            row_text.addWidget(QLabel(title_text))
+            hint = QLabel(hint_text)
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            row_text.addWidget(hint)
+            combo = ModernComboBox()
+            combo.setObjectName(object_name)
+            combo.addItem("Predefinito di sistema", "")
+            for device in devices:
+                device_key = audio_device_id(device)
+                combo.addItem(device.description(), device_key)
+                if device_key and device_key == selected_id:
+                    combo.setCurrentIndex(combo.count() - 1)
+            combo.setMinimumWidth(250)
+            combo.setMaximumWidth(330)
+            row_layout.addLayout(row_text, 1)
+            row_layout.addWidget(combo)
+            return row, combo
+
+        input_row, audio_input = audio_device_row(
+            "Microfono",
+            "Dispositivo usato per registrare i messaggi vocali.",
+            available_audio_inputs(),
+            str(current.get("audio_input_device_id", "")),
+            "audioInputDevice",
+        )
+        output_row, audio_output = audio_device_row(
+            "Cuffie o altoparlanti",
+            "Dispositivo sul quale vengono riprodotti messaggi vocali e test.",
+            available_audio_outputs(),
+            str(current.get("audio_output_device_id", "")),
+            "audioOutputDevice",
+        )
+        audio_card.add_row(input_row)
+        audio_card.add_row(output_row)
+
+        audio_test_row = QFrame()
+        audio_test_row.setObjectName("settingsRow")
+        audio_test_layout = QVBoxLayout(audio_test_row)
+        audio_test_layout.setContentsMargins(16, 13, 16, 15)
+        audio_test_layout.setSpacing(9)
+        test_buttons = QHBoxLayout()
+        output_test = QPushButton("Prova uscita")
+        output_test.setObjectName("audioOutputTest")
+        output_test.setIcon(lucide_icon("send"))
+        microphone_test = QPushButton("Prova microfono (3 s)")
+        microphone_test.setObjectName("audioInputTest")
+        microphone_test.setIcon(lucide_icon("mic"))
+        test_buttons.addWidget(output_test)
+        test_buttons.addWidget(microphone_test)
+        test_buttons.addStretch()
+        audio_test_layout.addLayout(test_buttons)
+        audio_test_status = QLabel(
+            "Il test microfono registra, comprime e decodifica con il helper Go, poi riproduce sulle cuffie scelte."
+        )
+        audio_test_status.setObjectName("muted")
+        audio_test_status.setWordWrap(True)
+        audio_test_layout.addWidget(audio_test_status)
+        audio_card.add_row(audio_test_row)
+
+        def play_output_test() -> None:
+            self._play_voice_wav(test_tone_wav(), str(audio_output.currentData()))
+            audio_test_status.setText(tr("Tono inviato al dispositivo di uscita scelto."))
+
+        output_test.clicked.connect(play_output_test)
+        microphone_test.clicked.connect(
+            lambda: self._start_microphone_test(
+                str(audio_input.currentData()),
+                str(audio_output.currentData()),
+                audio_test_status,
+                microphone_test,
+            )
+        )
 
         # Privacy
         _privacy, privacy_layout = add_page()
@@ -4682,6 +5314,9 @@ class KerberusWindow(QMainWindow):
 
         def save_settings() -> None:
             self.service.update_settings(int(interval.currentData()), single_use.isChecked())
+            self.service.update_audio_settings(
+                str(audio_input.currentData()), str(audio_output.currentData())
+            )
             self.service.update_privacy_settings(
                 send_delivery_receipts=delivery_receipts.isChecked(),
                 send_read_receipts=read_receipts.isChecked(),
@@ -5328,6 +5963,10 @@ class KerberusWindow(QMainWindow):
     def _shutdown(self) -> None:
         if not self._shutdown_complete:
             self._shutdown_complete = True
+            if self._voice_recorder.active:
+                self._voice_recorder.stop(discard=True)
+            if self._voice_player is not None:
+                self._voice_player.stop()
             if self._tray is not None:
                 self._tray.hide()
             self._preview_pool.shutdown(wait=False, cancel_futures=True)

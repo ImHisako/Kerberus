@@ -4,16 +4,16 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QPushButton, QStyleOptionViewItem, QToolButton
-from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, Qt
-from PyQt6.QtGui import QCloseEvent, QImage, QWheelEvent
+from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPushButton, QScrollArea, QStyleOptionViewItem, QToolButton
+from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, Qt
+from PyQt6.QtGui import QCloseEvent, QImage, QPainter, QWheelEvent
 from PyQt6.QtTest import QSignalSpy, QTest
 
 from kerberus.crypto import generate_identity
 from kerberus.ui import (
     STYLE, EmojiPanel, EmojiPicker, ExternalLinkDialog, InlineConfirmationPanel, KerberusWindow, MessageBubble, ModernComboBox,
     NetworkInsightsPanel, SettingsToggleRow, ToggleSwitch, VirtualChatView, emoji_catalog, is_emoji_reaction,
-    localize_widget,
+    audio_device_id, localize_widget, resolve_audio_device,
     open_external_link, set_language, set_window_capture_exclusion,
 )
 
@@ -47,6 +47,66 @@ class UiTests(unittest.TestCase):
         self.assertLess(short["bubble_width"], 180)
         self.assertGreater(long["bubble_width"], short["bubble_width"])
         window.service.close()
+
+    def test_voice_message_has_a_compact_clickable_player(self):
+        view = VirtualChatView()
+        view.resize(760, 240)
+        local, _secrets = generate_identity("Alice")
+        view.configure(local, None, None, None, False)
+        message = {
+            "message_id": "a" * 32,
+            "kind": "voice",
+            "voice": {"duration_ms": 12_400},
+            "text": "Messaggio vocale",
+            "direction": "out",
+            "sent_at": 1_700_000_000,
+            "status": "sent",
+        }
+        geometry = view.chat_delegate._layout(message, 760, view.font())
+        self.assertTrue(geometry["voice_message"])
+        self.assertEqual(geometry["voice_duration"], "0:12")
+        self.assertGreaterEqual(geometry["bubble_width"], 250)
+        row = QRect(0, 0, 760, int(geometry["row_height"]))
+        bubble = view.chat_delegate._bubble_rect(row, geometry)
+        point = QPoint(
+            bubble.left() + 30,
+            bubble.top() + int(geometry["author_height"]) + 25,
+        )
+        self.assertTrue(view.chat_delegate.voice_at(message, row, view.font(), point))
+
+        view.chat_model.set_messages([message])
+        option = QStyleOptionViewItem()
+        option.rect = row
+        option.font = view.font()
+        image = QImage(row.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        try:
+            view.chat_delegate.paint(painter, option, view.chat_model.index(0, 0))
+        finally:
+            painter.end()
+
+    def test_microphone_action_has_the_expected_icon(self):
+        window = KerberusWindow()
+        window._build_ui()
+        self.assertFalse(window.voice_button.icon().isNull())
+        self.assertIn("vocale", window.voice_button.toolTip().lower())
+        self.assertEqual(window.voice_button.iconSize().width(), 21)
+        window.service.close()
+
+    def test_saved_audio_device_is_resolved_or_falls_back(self):
+        class Device:
+            def __init__(self, value: bytes):
+                self.value = value
+
+            def id(self):
+                return self.value
+
+        default = Device(b"default")
+        selected = Device(b"headphones")
+        self.assertEqual(audio_device_id(selected), b"headphones".hex())
+        self.assertIs(resolve_audio_device([selected], b"headphones".hex(), default), selected)
+        self.assertIs(resolve_audio_device([selected], "missing", default), default)
 
     def test_emoji_only_messages_are_recognized_as_compact_reactions(self):
         self.assertTrue(is_emoji_reaction("🎄"))
@@ -337,6 +397,35 @@ class UiTests(unittest.TestCase):
         self.assertIs(window._emoji_reaction_message, message)
         window.service.close()
 
+    def test_message_timing_dialog_is_compact_and_scrollable(self):
+        window = KerberusWindow()
+        window._build_ui()
+        window.show_message_timing({
+            "kind": "voice",
+            "direction": "out",
+            "sent_at": 1_700_000_000,
+            "voice": {"duration_ms": 2_300, "codec": "kerberus-ima-adpcm-v1"},
+            "voice_metrics": {"encode_ms": 39.48, "decode_ms": 28.085},
+            "transport_metrics": {
+                "python_helper_ipc_overhead_ms": 0.853,
+                "python_helper_roundtrip_ms": 0.853,
+                "queue_wait_ms": None,
+                "sam_handshake_ms": None,
+                "sam_connect_command_ms": None,
+            },
+        })
+        self.app.processEvents()
+        dialog = next(iter(window._open_dialogs))
+        scroll = dialog.findChild(QScrollArea, "timingScroll")
+        self.assertIsNotNone(scroll)
+        self.assertLessEqual(dialog.height(), 640)
+        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        rows = dialog.findChildren(QFrame, "timingRow")
+        self.assertGreaterEqual(len(rows), 10)
+        self.assertTrue(all(row.height() <= 52 for row in rows))
+        dialog.close()
+        window.service.close()
+
     def test_settings_rework_has_organized_icon_navigation_and_switches(self):
         window = KerberusWindow()
         window._build_ui()
@@ -358,6 +447,43 @@ class UiTests(unittest.TestCase):
         switch_position = stream_switch.mapTo(dialog, stream_switch.rect().topLeft())
         self.assertLessEqual(switch_position.x() + stream_switch.width(), dialog.width())
         dialog.close()
+        window.service.close()
+
+    def test_audio_settings_list_devices_and_route_tests_to_selected_output(self):
+        class Device:
+            def __init__(self, identifier: bytes, description: str):
+                self._identifier = identifier
+                self._description = description
+
+            def id(self):
+                return self._identifier
+
+            def description(self):
+                return self._description
+
+        microphone = Device(b"usb-microphone", "Microfono USB")
+        headphones = Device(b"usb-headphones", "Cuffie USB")
+        window = KerberusWindow()
+        window._build_ui()
+        with (
+            patch("kerberus.ui.available_audio_inputs", return_value=[microphone]),
+            patch("kerberus.ui.available_audio_outputs", return_value=[headphones]),
+            patch.object(window, "_play_voice_wav") as play,
+        ):
+            window.show_settings()
+            self.app.processEvents()
+            dialog = next(iter(window._open_dialogs))
+            audio_input = dialog.findChild(ModernComboBox, "audioInputDevice")
+            audio_output = dialog.findChild(ModernComboBox, "audioOutputDevice")
+            self.assertEqual(audio_input.itemText(1), "Microfono USB")
+            self.assertEqual(audio_output.itemText(1), "Cuffie USB")
+            audio_output.setCurrentIndex(1)
+            dialog.findChild(QPushButton, "audioOutputTest").click()
+            self.app.processEvents()
+            self.assertEqual(play.call_args.args[0][:4], b"RIFF")
+            self.assertEqual(play.call_args.args[1], b"usb-headphones".hex())
+            self.assertFalse(dialog.findChild(QPushButton, "audioInputTest").icon().isNull())
+            dialog.close()
         window.service.close()
 
     def test_network_settings_include_private_per_ip_insights(self):

@@ -29,6 +29,21 @@ def crypto_self_test() -> int:
         return 2
 
 
+def voice_self_test() -> int:
+    try:
+        from kerberus.voice import NativeVoiceCodec
+
+        pcm = bytes(3_200)
+        codec = NativeVoiceCodec()
+        voice, _encode_metrics = codec.encode(
+            pcm, sample_rate=16_000, channels=1, sample_format="s16le"
+        )
+        decoded, _decode_metrics = codec.decode(voice)
+        return 0 if len(decoded) == len(pcm) else 7
+    except Exception:
+        return 6
+
+
 def main() -> None:
     if "--release-self-test" in sys.argv:
         index = sys.argv.index("--release-self-test")
@@ -36,6 +51,8 @@ def main() -> None:
         raise SystemExit(release_self_test(expected))
     if "--crypto-self-test" in sys.argv:
         raise SystemExit(crypto_self_test())
+    if "--voice-self-test" in sys.argv:
+        raise SystemExit(voice_self_test())
     from kerberus.main import main as app_main
 
     app_main()

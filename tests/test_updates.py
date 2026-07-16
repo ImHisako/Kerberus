@@ -32,10 +32,10 @@ class FakeResponse:
 class UpdateTests(unittest.TestCase):
     def test_check_rejects_rollback_and_selects_platform_assets(self):
         release = {
-            "tag_name": "v0.7.0",
+            "tag_name": f"v{__version__}",
             "draft": False,
             "prerelease": False,
-            "html_url": "https://github.com/ImHisako/Kerberus/releases/tag/v0.7.0",
+            "html_url": f"https://github.com/ImHisako/Kerberus/releases/tag/v{__version__}",
             "assets": [
                 {"name": "KerberusInstaller.exe", "browser_download_url": "https://example/installer"},
                 {"name": "SHA256SUMS.txt", "browser_download_url": "https://example/sums"},
@@ -44,15 +44,15 @@ class UpdateTests(unittest.TestCase):
         with patch("kerberus.updates.os.name", "nt"), patch(
             "kerberus.updates._read_limited", return_value=json.dumps(release).encode()
         ):
-            info = check_for_update("0.6.0")
-            self.assertEqual(info.version, "0.7.0")
+            info = check_for_update("0.0.0")
+            self.assertEqual(info.version, __version__)
             self.assertIsNone(check_for_update(__version__))
 
     def test_download_requires_matching_release_checksum(self):
         payload = b"verified update"
         digest = hashlib.sha256(payload).hexdigest()
         info = UpdateInfo(
-            "0.7.0", "v0.7.0", "https://example/release", "KerberusInstaller.exe",
+            __version__, f"v{__version__}", "https://example/release", "KerberusInstaller.exe",
             "https://example/installer", "SHA256SUMS.txt", "https://example/sums",
         )
         manifest = f"{digest}  KerberusInstaller.exe\n".encode()

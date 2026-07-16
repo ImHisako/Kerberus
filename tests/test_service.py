@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+import struct
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,7 @@ from kerberus.config import AppConfig
 from kerberus.crypto import destination_b32, generate_identity, pq_available, profile_destination, seal_message, sign_control, update_destination
 from kerberus.service import MessengerService
 from kerberus.ratchet import accept_init, complete_init, initiate
+from kerberus.voice import VOICE_CODEC, VOICE_SAMPLE_RATE
 
 
 @unittest.skipUnless(pq_available(), "pqcrypto non installato")
@@ -32,6 +34,31 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(service.settings()["stream_proof_enabled"])
             service.update_privacy_settings(stream_proof_enabled=True)
             self.assertTrue(service.settings()["stream_proof_enabled"])
+            service.close(wait=True)
+
+    def test_audio_preferences_and_go_codec_roundtrip_are_exercised(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            settings = service.update_audio_settings("6d69632d757362", "6865616470686f6e6573")
+            self.assertEqual(settings["audio_input_device_id"], "6d69632d757362")
+            self.assertEqual(settings["audio_output_device_id"], "6865616470686f6e6573")
+
+            codec = Mock()
+            voice = {"codec": VOICE_CODEC, "data": "test"}
+            codec.encode.return_value = (voice, {"encode_ms": 1.0})
+            codec.decode.return_value = (bytes(VOICE_SAMPLE_RATE * 2), {"decode_ms": 1.0})
+            service._voice_codec = codec
+            wav = service.test_voice_roundtrip(
+                bytes(VOICE_SAMPLE_RATE * 2),
+                sample_rate=VOICE_SAMPLE_RATE,
+                channels=1,
+                sample_format="s16le",
+            )
+            self.assertEqual(wav[:4], b"RIFF")
+            codec.encode.assert_called_once()
+            codec.decode.assert_called_once_with(voice)
             service.close(wait=True)
 
     def test_network_latency_preferences_are_persisted_and_applied(self):
@@ -187,6 +214,66 @@ class ServiceTests(unittest.TestCase):
             second = alice_service.messages_for(bob.identity_id)[1]
             self.assertNotEqual(second["status"], "delivered")
             self.assertIsNone(second["recipient_received_at"])
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_voice_message_is_ratchet_encrypted_delivered_and_decoded_by_go_adapter(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
+
+            sample_count = VOICE_SAMPLE_RATE
+            encoded = (
+                b"KVA1" + struct.pack(">IIhBB", VOICE_SAMPLE_RATE, sample_count, 0, 0, 0)
+                + bytes((sample_count - 1 + 1) // 2)
+            )
+            voice = {
+                "codec": VOICE_CODEC,
+                "sample_rate": VOICE_SAMPLE_RATE,
+                "sample_count": sample_count,
+                "duration_ms": 1000,
+                "data": base64.b64encode(encoded).decode("ascii"),
+            }
+            codec = Mock()
+            codec.encode.return_value = (voice, {"backend": "go-native-ima-adpcm", "encode_ms": 1.5})
+            codec.decode.return_value = (bytes(sample_count * 2), {"backend": "go-native-ima-adpcm", "decode_ms": 1.0})
+            alice_service._voice_codec = codec
+            bob_service._voice_codec = codec
+            routes = {alice.destination: alice_service, bob.destination: bob_service}
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    routes[destination]._receive(payload)
+                    return {"backend": "test"}
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            bob_service.sam = Endpoint()
+            result = alice_service.send_voice(
+                bob.identity_id,
+                bytes(sample_count * 2),
+                sample_rate=VOICE_SAMPLE_RATE,
+                channels=1,
+                sample_format="s16le",
+            )
+            self.assertIn(result, {"sent", "queued"})
+            self.assertTrue(self._wait_for(lambda: bool(bob_service.messages_for(alice.identity_id))))
+            incoming = bob_service.messages_for(alice.identity_id)[0]
+            self.assertEqual(incoming["kind"], "voice")
+            self.assertEqual(incoming["voice"]["codec"], VOICE_CODEC)
+            self.assertNotIn(encoded, json.dumps(incoming).encode("utf-8"))
+            wav = bob_service.decode_voice(incoming["message_id"])
+            self.assertEqual(wav[:4], b"RIFF")
+            self.assertEqual(incoming["voice_metrics"]["decode_ms"], 1.0)
             alice_service.close(wait=True)
             bob_service.close(wait=True)
 

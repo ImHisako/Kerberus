@@ -40,6 +40,28 @@ def build_native_helper() -> Path:
     return target
 
 
+def validate_native_voice_codec(helper: Path) -> None:
+    pcm = bytes(16_000 * 2)
+    encoded = subprocess.run(
+        [str(helper), "--voice-encode", "--sample-rate", "16000", "--channels", "1", "--sample-format", "s16le"],
+        input=pcm,
+        stdout=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if encoded.returncode != 0 or not encoded.stdout.startswith(b"KVA1"):
+        raise RuntimeError("Self-test codifica vocale Go fallito")
+    decoded = subprocess.run(
+        [str(helper), "--voice-decode"],
+        input=encoded.stdout,
+        stdout=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if decoded.returncode != 0 or len(decoded.stdout) != len(pcm):
+        raise RuntimeError("Self-test decodifica vocale Go fallito")
+
+
 def run_pyinstaller(arguments: list[str]) -> None:
     import PyInstaller.__main__
 
@@ -53,6 +75,7 @@ def main() -> int:
     installer_only = "--installer-only" in sys.argv
     if not installer_only:
         native_helper = build_native_helper()
+        validate_native_voice_codec(native_helper)
         run_pyinstaller([
             str(ROOT / "kerberus_app.py"),
             "--name=Kerberus",
@@ -81,6 +104,9 @@ def main() -> int:
         raise RuntimeError(
             f"Self-test versione/moduli della build fallito: {release_test.returncode}"
         )
+    voice_test = subprocess.run([str(app), "--voice-self-test"], timeout=60, check=False)
+    if voice_test.returncode != 0:
+        raise RuntimeError(f"Self-test codec vocale Go incorporato fallito: {voice_test.returncode}")
     crypto_test = subprocess.run([str(app), "--crypto-self-test"], timeout=60, check=False)
     if crypto_test.returncode != 0:
         raise RuntimeError(f"Self-test ML-KEM della build fallito: {crypto_test.returncode}")

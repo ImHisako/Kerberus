@@ -38,6 +38,7 @@ from .ratchet import (
     is_ready as ratchet_is_ready,
 )
 from .vault import Vault
+from .voice import NativeVoiceCodec, pcm_to_wav, validate_voice_payload
 
 
 def _reaction_values(value: object) -> list[str]:
@@ -72,6 +73,7 @@ class MessengerService:
         # Monotonic timestamps are session-local by design: wall-clock changes
         # cannot corrupt encrypted receipt round-trip measurements.
         self._receipt_started_ns: dict[str, int] = {}
+        self._voice_codec: NativeVoiceCodec | None = None
 
     def identity(self) -> IdentityBundle | None:
         value = self.vault.state.get("identity")
@@ -265,6 +267,8 @@ class MessengerService:
         settings.setdefault("low_latency_mode", False)
         settings.setdefault("warm_recent_contacts", True)
         settings.setdefault("mask_recent_contact_metadata", False)
+        settings.setdefault("audio_input_device_id", "")
+        settings.setdefault("audio_output_device_id", "")
         settings.setdefault("language", "it")
         for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
@@ -338,6 +342,40 @@ class MessengerService:
             self.vault.save()
         self._emit_protocol_event("privacy_settings_updated", "Policy rete e ricevute aggiornata")
         return self.settings()
+
+    def update_audio_settings(self, input_device_id: str, output_device_id: str) -> dict:
+        """Persist opaque Qt audio-device ids inside the encrypted local vault."""
+        if not isinstance(input_device_id, str) or not isinstance(output_device_id, str):
+            raise ValueError("Identificatore del dispositivo audio non valido")
+        if len(input_device_id) > 4096 or len(output_device_id) > 4096:
+            raise ValueError("Identificatore del dispositivo audio troppo lungo")
+        with self._state_lock:
+            settings = self.vault.state.setdefault("settings", {})
+            settings["audio_input_device_id"] = input_device_id
+            settings["audio_output_device_id"] = output_device_id
+            self.vault.save()
+        self._emit_protocol_event("audio_settings_updated", "Dispositivi audio aggiornati")
+        return self.settings()
+
+    def test_voice_roundtrip(
+        self,
+        pcm: bytes,
+        *,
+        sample_rate: int,
+        channels: int,
+        sample_format: str,
+    ) -> bytes:
+        """Exercise the same Go encode/decode path used by shared voice messages."""
+        codec = self._voice_codec or NativeVoiceCodec()
+        self._voice_codec = codec
+        voice, _encode_metrics = codec.encode(
+            pcm,
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_format=sample_format,
+        )
+        decoded, _decode_metrics = codec.decode(voice)
+        return pcm_to_wav(decoded)
 
     def chat_settings(self, contact_id: str) -> dict:
         stored = self.vault.state.setdefault("chat_settings", {}).setdefault(contact_id, {})
@@ -499,7 +537,16 @@ class MessengerService:
                     "message_id": str(message.get("message_id", "")),
                     "direction": "out" if outgoing else "in",
                     "status": str(message.get("status", "")),
+                    "kind": str(message.get("kind", "message")),
                     "text": str(message.get("text", "")),
+                    "voice": {
+                        "codec": str(dict(message.get("voice") or {}).get("codec", "")),
+                        "duration_ms": dict(message.get("voice") or {}).get("duration_ms"),
+                        "sample_rate": dict(message.get("voice") or {}).get("sample_rate"),
+                        "sample_count": dict(message.get("voice") or {}).get("sample_count"),
+                    } if message.get("kind") == "voice" else None,
+                    "voice_codec_timings_ms": copy.deepcopy(message.get("voice_metrics", {}))
+                    if isinstance(message.get("voice_metrics"), dict) else {},
                     "timestamps": {
                         "sent_epoch": sent_at,
                         "sent_utc": iso_time(sent_at),
@@ -533,7 +580,7 @@ class MessengerService:
 
         report = {
             "format": "kerberus-chat-debug-v1",
-            "warning": "Contiene testo dei messaggi in chiaro. Non contiene password, chiavi private, stato ratchet o payload cifrati.",
+            "warning": "Contiene testo e metadati temporali in chiaro. Non contiene audio, password, chiavi private, stato ratchet o payload cifrati.",
             "exported_at_utc": datetime.now(timezone.utc).isoformat(),
             "local_profile": {"name": identity.name, "identity_id": identity.identity_id},
             "contact": {"name": contact.name, "identity_id": contact.identity_id},
@@ -579,6 +626,75 @@ class MessengerService:
         return self.send_message(contact_id, text)
 
     def send_message(self, contact_id: str, text: str) -> str:
+        text = text.strip()
+        if not text:
+            raise ValueError("Messaggio vuoto")
+        return self._send_user_payload(
+            contact_id,
+            {"kind": "message", "text": text},
+            text=text,
+        )
+
+    def send_voice(
+        self,
+        contact_id: str,
+        pcm: bytes,
+        *,
+        sample_rate: int,
+        channels: int,
+        sample_format: str,
+    ) -> str:
+        codec = self._voice_codec or NativeVoiceCodec()
+        self._voice_codec = codec
+        voice, metrics = codec.encode(
+            pcm,
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_format=sample_format,
+        )
+        return self._send_user_payload(
+            contact_id,
+            {"kind": "voice", "voice": voice},
+            text="Messaggio vocale",
+            voice=voice,
+            voice_metrics=metrics,
+        )
+
+    def forward_voice(self, contact_id: str, voice: object) -> str:
+        normalized = validate_voice_payload(voice)
+        return self._send_user_payload(
+            contact_id,
+            {"kind": "voice", "voice": normalized},
+            text="Messaggio vocale inoltrato",
+            voice=normalized,
+        )
+
+    def decode_voice(self, message_id: str) -> bytes:
+        with self._state_lock:
+            message = next(
+                (item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id),
+                None,
+            )
+            if not message or message.get("kind") != "voice":
+                raise ValueError("Messaggio vocale non trovato")
+            voice = copy.deepcopy(message.get("voice"))
+        codec = self._voice_codec or NativeVoiceCodec()
+        self._voice_codec = codec
+        pcm, metrics = codec.decode(voice)
+        with self._state_lock:
+            message["voice_metrics"] = {**dict(message.get("voice_metrics") or {}), **metrics}
+            self.vault.save()
+        return pcm_to_wav(pcm)
+
+    def _send_user_payload(
+        self,
+        contact_id: str,
+        clear: dict,
+        *,
+        text: str,
+        voice: dict | None = None,
+        voice_metrics: dict | None = None,
+    ) -> str:
         identity = self.identity()
         if not identity:
             raise RuntimeError("Identità non configurata")
@@ -586,30 +702,37 @@ class MessengerService:
         message_id = uuid.uuid4().hex
         with self._state_lock:
             ready = ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), contact_id)
-            envelope = self._seal_ratchet(contact, {"kind": "message", "text": text}, message_id=message_id) if ready else None
+            envelope = self._seal_ratchet(contact, clear, message_id=message_id) if ready else None
         payload = json.dumps(envelope, separators=(",", ":")) if envelope else ""
         now = int(time.time())
+        kind = str(clear.get("kind", "message"))
+        stored_message = {
+            "message_id": message_id,
+            "contact_id": contact_id,
+            "direction": "out",
+            "kind": kind,
+            "text": text,
+            "time": now,
+            "sent_at": now,
+            "received_at": None,
+            "delivered_at": None,
+            "recipient_received_at": None,
+            "read_at": None,
+            "reactions": {},
+            "status": "pending",
+        }
+        if voice is not None:
+            stored_message["voice"] = copy.deepcopy(voice)
+        if voice_metrics is not None:
+            stored_message["voice_metrics"] = copy.deepcopy(voice_metrics)
         with self._state_lock:
-            self.vault.state["messages"].append({
-                "message_id": message_id,
-                "contact_id": contact_id,
-                "direction": "out",
-                "text": text,
-                "time": now,
-                "sent_at": now,
-                "received_at": None,
-                "delivered_at": None,
-                "recipient_received_at": None,
-                "read_at": None,
-                "reactions": {},
-                "status": "pending",
-            })
+            self.vault.state["messages"].append(stored_message)
             self.vault.state["outbox"].append({
                 "message_id": message_id,
                 "contact_id": contact_id,
                 "destination": contact.destination,
                 "payload": payload,
-                "deferred": None if envelope else {"kind": "message", "text": text},
+                "deferred": None if envelope else copy.deepcopy(clear),
                 "created_at": now,
                 "last_attempt": 0,
                 "attempts": 0,
@@ -855,21 +978,34 @@ class MessengerService:
                 self.vault.state["seen"] = self.vault.state["seen"][-10000:]
             self._receive_identity_visibility(sender_id, clear)
             return None
-        if kind != "message":
+        if kind not in {"message", "voice"}:
             return None
+        voice = None
+        text = ""
+        if kind == "voice":
+            try:
+                voice = validate_voice_payload(clear.get("voice"))
+            except ValueError:
+                return None
+            text = "Messaggio vocale"
+        else:
+            text = str(clear["text"])
         with self._state_lock:
             self.vault.state["seen"].append(message_id)
             self.vault.state["seen"] = self.vault.state["seen"][-10000:]
             self._store_message(
                 sender_id,
                 "in",
-                clear["text"],
+                text,
                 message_id=message_id,
                 status="received",
                 sent_at=clear["sent_at"],
                 received_at=received_at,
+                kind=kind,
+                voice=voice,
             )
-        self._emit_protocol_event("message_received", f"Messaggio cifrato ricevuto da {sender.name}")
+        event_label = "Messaggio vocale cifrato" if kind == "voice" else "Messaggio cifrato"
+        self._emit_protocol_event("message_received", f"{event_label} ricevuto da {sender.name}")
         if self.on_message:
             self.on_message("new", sender_id)
         if self._privacy_enabled(sender_id, "send_delivery_receipts"):
@@ -1446,22 +1582,28 @@ class MessengerService:
         status: str = "received",
         sent_at: int | None = None,
         received_at: int | None = None,
+        kind: str = "message",
+        voice: dict | None = None,
     ) -> None:
+        stored = {
+            "message_id": message_id,
+            "contact_id": contact_id,
+            "direction": direction,
+            "kind": kind,
+            "text": text,
+            "time": sent_at if sent_at is not None else int(time.time()),
+            "sent_at": sent_at if sent_at is not None else int(time.time()),
+            "received_at": received_at,
+            "delivered_at": None,
+            "recipient_received_at": None,
+            "read_at": None,
+            "reactions": {},
+            "status": status,
+        }
+        if voice is not None:
+            stored["voice"] = copy.deepcopy(voice)
         with self._state_lock:
-            self.vault.state["messages"].append({
-                "message_id": message_id,
-                "contact_id": contact_id,
-                "direction": direction,
-                "text": text,
-                "time": sent_at if sent_at is not None else int(time.time()),
-                "sent_at": sent_at if sent_at is not None else int(time.time()),
-                "received_at": received_at,
-                "delivered_at": None,
-                "recipient_received_at": None,
-                "read_at": None,
-                "reactions": {},
-                "status": status,
-            })
+            self.vault.state["messages"].append(stored)
             self.vault.save()
 
     def close(self, wait: bool = False) -> None:

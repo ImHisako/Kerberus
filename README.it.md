@@ -23,7 +23,7 @@ Il progetto segue alcuni principi fondamentali:
 
 | Area | Funzionalità |
 |---|---|
-| Messaggi | Testo diretto, outbox locale cifrata, retry automatico, inoltro con nuova cifratura, eliminazione locale, stati di consegna e lettura |
+| Messaggi | Testo e vocali diretti, outbox locale cifrata, retry automatico, inoltro con nuova cifratura, eliminazione locale, stati di consegna e lettura |
 | Identità | Profili firmati Ed25519, ID crittografico stabile, username, avatar, destination I2P persistente |
 | Contatti | Codici a rotazione, uso singolo opzionale, request/accept/reject firmati, cancellazione delle richieste pendenti |
 | Cifratura | Envelope ibrido X25519 + ML-KEM-768, XChaCha20-Poly1305, autenticazione Ed25519, Double Ratchet v3, messaggi fuori ordine limitati |
@@ -47,6 +47,14 @@ Gli stati sono:
 - **Letto** — il destinatario ha restituito una ricevuta di lettura cifrata; le doppie spunte diventano azzurre.
 
 Le ricevute di consegna e lettura possono essere disabilitate globalmente o per una singola conversazione.
+
+### Messaggi vocali privati
+
+Il pulsante rosso con l’icona del microfono nel compositore registra fino a 120 secondi. Kerberus mostra sempre quando il microfono è attivo e permette di annullare prima dell’invio. Nelle Impostazioni si possono scegliere separatamente il microfono e le cuffie/altoparlanti; se un dispositivo salvato non è più collegato viene usato in sicurezza quello predefinito di sistema. Un tono prova l’uscita, mentre il test microfono registra tre secondi, attraversa codifica e decodifica Go e riproduce il risultato sul dispositivo scelto.
+
+L’audio del dispositivo viene affidato al helper Go locale, che esegue downmix, ricampionamento a 16 kHz mono e compressione IMA-ADPCM senza servizi esterni. Il risultato entra nello stesso Double Ratchet dei messaggi di testo, viene conservato nel vault cifrato e attraversa esclusivamente gli stream I2P esistenti. Il destinatario decodifica con lo stesso helper e riproduce il vocale nella chat usando l’uscita configurata.
+
+Inoltrare un vocale crea message ID, chiavi ratchet, nonce ed envelope ibrido nuovi. Il report diagnostico include soltanto codec, durata e tempi locali di codifica/decodifica, mai i dati audio. Il contenuto è privato e autenticato, ma non è corretto promettere anonimato assoluto: durata, dimensione e tempistica del traffico possono facilitare la correlazione e un endpoint compromesso può accedere all’audio riprodotto o registrato.
 
 ### Reazioni ed emoji
 
@@ -128,7 +136,7 @@ Le richieste pendenti possono essere annullate dalla lista delle conversazioni.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Kerberus mantiene una sessione SAM longeva per il profilo locale. Le release includono un helper Go senza dipendenze che mantiene più accept pendenti, multiplexa i frame, riutilizza gli stream e consente risposte sullo stesso stream full-duplex. Se l’helper non parte o termina, il trasporto Python subentra usando lo stesso protocollo applicativo e le stesse code cifrate.
+Kerberus mantiene una sessione SAM longeva per il profilo locale. Le release includono un helper Go senza dipendenze che mantiene più accept pendenti, multiplexa i frame, riutilizza gli stream, consente risposte sullo stesso stream full-duplex e comprime/decodifica i vocali. Se il percorso SAM nativo termina, il trasporto Python può subentrare per i frame già cifrati; la creazione e riproduzione dei vocali richiede invece il codec Go incluso nella release.
 
 ## Crittografia e modello di sicurezza
 
@@ -331,6 +339,8 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m kerberus.main
 ```
 
+`setup.ps1` e `setup.sh` compilano automaticamente il helper nativo quando Go è disponibile. È necessario per i vocali. Le release binarie lo includono già.
+
 ## Utilizzo di base
 
 ### Aggiungere un contatto
@@ -381,6 +391,12 @@ L'helper elabora in parallelo destinazioni diverse tramite code dinamiche indipe
 
 ## Creazione delle release
 
+Prima di preparare gli artefatti, aggiornare la versione e i riferimenti di release con un solo comando:
+
+```powershell
+.\.venv\Scripts\python.exe bump_version.py 0.8.0
+```
+
 Windows:
 
 ```powershell
@@ -398,10 +414,10 @@ Linux:
 Artefatti sorgente Python e archivio completo:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.7.0
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.8.0
 ```
 
-Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.7.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
+Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.8.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
 
 ## Struttura del repository
 
@@ -412,12 +428,13 @@ kerberus/
   service.py       contatti, messaggi, ricevute, reazioni, code e retry
   vault.py         persistenza locale cifrata
   sam.py           sessione SAM, stream, IPC helper e fallback Python
+  voice.py         validazione contenitore vocale e adapter codec Go
   link_preview.py  parsing metadata e download resistente a SSRF
   network_insights.py  peer I2P locali e ricerca IP gratuita esplicita
   router.py        bootstrap, configurazione, avvio e arresto I2P
   updates.py       controllo release GitHub e verifica SHA-256
   ui.py            interfaccia PyQt6 e localizzazione
-native/             multiplexer SAM in Go
+native/             multiplexer SAM e codec vocale IMA-ADPCM in Go
 installer.py        installer Windows
 build_release.py    build PyInstaller
 build_source_release.py  wheel, sdist e archivio sorgente verificato
@@ -429,6 +446,7 @@ docs/adr/           decisioni architetturali
 
 - **Protocollo sperimentale:** Kerberus e il suo Double Ratchet non sono stati verificati formalmente né sottoposti ad audit indipendente.
 - **Nessun anonimato assoluto:** I2P riduce l’esposizione di rete ma non elimina compromissione endpoint, correlazioni comportamentali, analisi temporale o rischi da osservatore globale.
+- **Pattern dei vocali:** contenuto e formato audio sono cifrati, ma dimensione, durata e momento dell’invio possono essere correlati da un osservatore capace.
 - **Ibrido non significa interamente post-quantum:** ML-KEM contribuisce alla confidenzialità dell’envelope. Firme Ed25519 e Double Ratchet X25519 restano classici.
 - **La compromissione dell’endpoint prevale:** malware, screenshot, monitoraggio appunti, lettura memoria o accesso al vault sbloccato possono esporre plaintext e chiavi.
 - **Nessuna garanzia di cancellazione sicura:** snapshot, backup, SSD, swap e gestione memoria Python possono conservare dati precedenti.

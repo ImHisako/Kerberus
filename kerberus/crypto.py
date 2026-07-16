@@ -282,7 +282,12 @@ def seal_payload(
     sent_at = int(time.time())
     clear_fields = {**payload, "sent_at": sent_at}
     unpadded = canonical({**clear_fields, "padding": ""})
-    bucket = next((size for size in (512, 2048, 8192, 32768) if len(unpadded) <= size), None)
+    # Voice messages remain bounded by the 4 MB SAM frame limit after the
+    # ratchet and hybrid envelope layers. Larger buckets are intentionally
+    # sparse so ciphertext length reveals only a coarse size class.
+    bucket = next((size for size in (
+        512, 2048, 8192, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152,
+    ) if len(unpadded) <= size), None)
     if bucket is None:
         raise ValueError("Messaggio troppo lungo")
     padding = b64(os.urandom(max(0, (bucket - len(unpadded)) * 3 // 4)))

@@ -23,7 +23,7 @@ Kerberus is designed around a small set of principles:
 
 | Area | Capabilities |
 |---|---|
-| Messaging | Direct text messages, encrypted local outbox, automatic retry, forwarding with fresh encryption, local deletion, delivery and read states |
+| Messaging | Direct text and voice messages, encrypted local outbox, automatic retry, forwarding with fresh encryption, local deletion, delivery and read states |
 | Identity | Ed25519-signed profiles, stable cryptographic identity ID, username, avatar, persistent I2P destination |
 | Contacts | Rotating contact codes, optional single use, signed request/accept/reject controls, pending-request cancellation |
 | Encryption | X25519 + ML-KEM-768 hybrid envelope, XChaCha20-Poly1305, Ed25519 authentication, Double Ratchet v3, bounded out-of-order support |
@@ -47,6 +47,14 @@ Message states are:
 - **Read** — the recipient returned an encrypted read receipt; the double ticks turn blue.
 
 Delivery and read receipts can be disabled globally or for an individual conversation.
+
+### Private voice messages
+
+The red microphone icon in the composer records up to 120 seconds. Kerberus always displays when the microphone is active and allows cancellation before sending. Settings provide separate microphone and headphone/speaker selection; if saved hardware is disconnected, Kerberus safely falls back to the system default. An output tone tests the selected speakers, while the microphone test records three seconds, runs the Go encode/decode path, and plays the result through the selected device.
+
+Device audio is passed to the local Go helper, which performs downmixing, 16 kHz mono resampling, and dependency-free IMA-ADPCM compression without external services. The result enters the same Double Ratchet as text, is stored in the encrypted vault, and travels only over the existing I2P streams. The recipient decodes it with the same helper and plays it inside the conversation through the configured output.
+
+Forwarding creates a new message ID, ratchet keys, nonce, and hybrid envelope. Diagnostic exports contain only the codec, duration, and local encode/decode timings, never audio data. Content is private and authenticated, but absolute anonymity is not promised: traffic duration, size, and timing may enable correlation, and a compromised endpoint can access captured or played audio.
 
 ### Reactions and emoji
 
@@ -128,7 +136,7 @@ Pending requests can be cancelled from the conversation list.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Kerberus maintains one long-lived SAM session for the local profile. The release build includes a dependency-free Go helper that keeps multiple accepts pending, multiplexes framed traffic, reuses streams, and permits replies on the same full-duplex stream. If the helper cannot start or exits, the Python transport takes over using the same application protocol and encrypted queues.
+Kerberus maintains one long-lived SAM session for the local profile. The release build includes a dependency-free Go helper that keeps multiple accepts pending, multiplexes framed traffic, reuses streams, permits replies on the same full-duplex stream, and encodes/decodes voice data. If the native SAM path exits, Python can take over transport for already-encrypted frames; voice creation and playback still require the Go codec bundled with releases.
 
 ## Cryptography and security design
 
@@ -331,6 +339,8 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m kerberus.main
 ```
 
+`setup.ps1` and `setup.sh` automatically compile the native helper when Go is available. It is required for voice messages. Binary releases already bundle it.
+
 ## Basic use
 
 ### Add a contact
@@ -381,6 +391,12 @@ The helper processes different destinations concurrently through independent dyn
 
 ## Building releases
 
+Before building artifacts, update the application version and release references with one command:
+
+```powershell
+.\.venv\Scripts\python.exe bump_version.py 0.8.0
+```
+
 Windows:
 
 ```powershell
@@ -398,10 +414,10 @@ Linux:
 Python source artifacts and the complete source archive:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.7.0
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.8.0
 ```
 
-Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.7.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
+Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.8.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
 
 ## Repository layout
 
@@ -412,12 +428,13 @@ kerberus/
   service.py       contacts, messaging, receipts, reactions, queues, retry
   vault.py         encrypted local persistence
   sam.py           SAM session, streams, native-helper IPC, Python fallback
+  voice.py         voice-container validation and Go codec adapter
   link_preview.py  metadata parsing and SSRF-resistant preview fetching
   network_insights.py  local I2P peer discovery and explicit free IP lookup
   router.py        I2P bootstrap, configuration, start and stop
   updates.py       GitHub release check and SHA-256 verification
   ui.py            PyQt6 desktop interface and localization
-native/             Go SAM stream multiplexer
+native/             Go SAM stream multiplexer and IMA-ADPCM voice codec
 installer.py        Windows installer
 build_release.py    PyInstaller release build
 build_source_release.py  verified wheel, sdist, and source archive
@@ -429,6 +446,7 @@ docs/adr/           architecture decision records
 
 - **Experimental protocol:** Kerberus and its Double Ratchet implementation have not been independently audited or formally verified.
 - **No absolute anonymity:** I2P reduces network exposure but cannot eliminate endpoint compromise, behavioral correlation, timing analysis, or global-observer risk.
+- **Voice traffic patterns:** audio content and format are encrypted, but message size, duration, and send timing may still be correlated by a capable observer.
 - **Hybrid does not mean fully post-quantum:** ML-KEM contributes to envelope confidentiality. Ed25519 signatures and the X25519 Double Ratchet remain classical.
 - **Endpoint compromise wins:** malware, screen capture, clipboard monitoring, memory inspection, or access to an unlocked vault can expose plaintext and keys.
 - **No secure deletion guarantee:** filesystem snapshots, backups, SSD behavior, swap, and Python memory management may preserve old data.

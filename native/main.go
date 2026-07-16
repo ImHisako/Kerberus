@@ -94,7 +94,32 @@ func main() {
 	host := flag.String("host", "127.0.0.1", "SAM host")
 	port := flag.String("port", "7656", "SAM port")
 	session := flag.String("session", "", "existing SAM session id")
+	voiceEncode := flag.Bool("voice-encode", false, "encode PCM from stdin as a Kerberus voice message")
+	voiceDecode := flag.Bool("voice-decode", false, "decode a Kerberus voice message from stdin to PCM")
+	voiceInputRate := flag.Int("sample-rate", voiceSampleRate, "voice input sample rate")
+	voiceInputChannels := flag.Int("channels", 1, "voice input channel count")
+	voiceInputFormat := flag.String("sample-format", "s16le", "voice input format: u8, s16le, s32le, f32le")
 	flag.Parse()
+	if *voiceEncode || *voiceDecode {
+		if *voiceEncode == *voiceDecode {
+			os.Exit(2)
+		}
+		const maxVoiceInput = 64 * 1024 * 1024
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, maxVoiceInput+1))
+		if err != nil || len(raw) > maxVoiceInput {
+			os.Exit(3)
+		}
+		var output []byte
+		if *voiceEncode {
+			output, err = encodeVoiceInput(raw, *voiceInputRate, *voiceInputChannels, *voiceInputFormat)
+		} else {
+			output, err = decodeIMAADPCM(raw)
+		}
+		if err != nil || writeAll(os.Stdout, output) != nil {
+			os.Exit(4)
+		}
+		return
+	}
 	if *session == "" {
 		os.Exit(2)
 	}

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.0
+
+- Messaggi vocali privati nel Double Ratchet: acquisizione Qt, downmix/ricampionamento e codec IMA-ADPCM nel helper Go, riproduzione incorporata, inoltro con nuova cifratura e limite di 120 secondi.
+- Selezione persistente di microfono e cuffie/altoparlanti, con fallback al dispositivo di sistema, tono di prova e test registrazione → codec Go → riproduzione nelle Impostazioni.
+
 ## 0.7.0
 
 - Modalità I2P opzionale a bassa latenza con tunnel da 2 hop, ACK immediato, conferma incorporata e preparazione configurabile dei contatti recenti.

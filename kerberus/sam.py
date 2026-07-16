@@ -147,7 +147,13 @@ class NativeSamTransport:
         try:
             started = time.perf_counter_ns()
             self._write(command)
-            if not event.wait(timeout):
+            # Large encrypted voice frames may take longer to enter the local
+            # I2P streaming socket. Never time out while the Go worker may still
+            # be writing, otherwise a retry could duplicate the whole frame.
+            effective_timeout = timeout
+            if payload is not None and operation in {"send", "reply"}:
+                effective_timeout = max(timeout, min(120.0, 10.0 + len(payload) / 32_768))
+            if not event.wait(effective_timeout):
                 raise TimeoutError("Timeout helper SAM nativo")
             roundtrip_ms = (time.perf_counter_ns() - started) / 1_000_000
             if not result.get("ok"):

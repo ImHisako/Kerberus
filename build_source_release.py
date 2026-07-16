@@ -46,7 +46,9 @@ def sha256(path: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Crea gli artefatti sorgente di Kerberus")
-    parser.add_argument("--tag", default="", help="Tag release da verificare, per esempio v0.7.0")
+    parser.add_argument(
+        "--tag", default="", help=f"Tag release da verificare, per esempio v{__version__}"
+    )
     args = parser.parse_args(argv)
     environment_tag = os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else ""
     validate_tag(args.tag or environment_tag)

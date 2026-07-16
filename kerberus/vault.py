@@ -38,6 +38,8 @@ def empty_state() -> dict[str, Any]:
             "link_previews": False,
             "clearnet_enabled": False,
             "stream_proof_enabled": False,
+            "audio_input_device_id": "",
+            "audio_output_device_id": "",
             "language": "it",
         },
     }
@@ -82,6 +84,9 @@ class Vault:
         self.state.setdefault("used_contact_codes", [])
         self.state.setdefault("chat_settings", {})
         self.state.setdefault("ratchets", {})
+        for message in self.state.get("messages", []):
+            if isinstance(message, dict):
+                message.setdefault("kind", "voice" if isinstance(message.get("voice"), dict) else "message")
         settings = self.state.setdefault("settings", {})
         settings.setdefault("contact_code_period_minutes", 1)
         settings.setdefault("contact_code_single_use", True)
@@ -92,6 +97,8 @@ class Vault:
         settings.setdefault("link_previews", False)
         settings.setdefault("clearnet_enabled", False)
         settings.setdefault("stream_proof_enabled", False)
+        settings.setdefault("audio_input_device_id", "")
+        settings.setdefault("audio_output_device_id", "")
         settings.setdefault("language", "it")
         for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
