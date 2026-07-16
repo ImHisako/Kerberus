@@ -69,6 +69,7 @@ class ReleaseBuildTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text("utf-8")
         self.assertEqual(workflow.count("softprops/action-gh-release"), 1)
         self.assertIn("needs: [windows-build, linux-build, source-build]", workflow)
+        self.assertIn("libpulse0", workflow)
         self.assertIn("release/Kerberus-*-src.tar.gz", workflow)
         self.assertIn("release/kerberus_i2p-*.whl", workflow)
 
