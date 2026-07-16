@@ -394,7 +394,7 @@ L'helper elabora in parallelo destinazioni diverse tramite code dinamiche indipe
 Prima di preparare gli artefatti, aggiornare la versione e i riferimenti di release con un solo comando:
 
 ```powershell
-.\.venv\Scripts\python.exe bump_version.py 0.8.0
+.\.venv\Scripts\python.exe bump_version.py 0.8.1
 ```
 
 Windows:
@@ -414,10 +414,10 @@ Linux:
 Artefatti sorgente Python e archivio completo:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.8.0
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.8.1
 ```
 
-Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.8.0`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
+Gli artefatti vengono scritti in `release/`. GitHub Actions esegue test Python e Go, costruisce Windows, Linux, wheel, sdist e archivio sorgente in job separati e li pubblica tramite un unico job finale. Il tag deve corrispondere esattamente alla versione applicativa, quindi questa release usa `v0.8.1`; un tag non allineato interrompe la build. La checklist completa è in [`RELEASE.md`](RELEASE.md).
 
 ## Struttura del repository
 

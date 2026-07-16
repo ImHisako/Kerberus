@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- TODO: descrivere le modifiche della release.
+
 ## 0.8.0
 
 - Messaggi vocali privati nel Double Ratchet: acquisizione Qt, downmix/ricampionamento e codec IMA-ADPCM nel helper Go, riproduzione incorporata, inoltro con nuova cifratura e limite di 120 secondi.
