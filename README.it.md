@@ -4,6 +4,10 @@
 
 [English](README.md) · [Decisioni architetturali](docs/adr/) · [Documentazione I2P SAM](https://i2p.net/en/docs/api/samv3/)
 
+<p align="center">
+<img src="https://i.pinimg.com/736x/d3/25/b0/d325b0b5af56e447393b433da90eb492.jpg", width="250", height="250">
+</p>
+
 Kerberus è un messenger peer-to-peer sperimentale per Windows e Linux. Combina trasporto I2P, identità autonome firmate, cifratura ibrida X25519 + ML-KEM-768 per ogni messaggio, Double Ratchet persistente e vault locale cifrato. Non esistono un servizio account Kerberus, una directory centrale dei contatti, un database remoto dei messaggi, un endpoint di analytics o una mailbox cloud.
 
 > [!WARNING]
