@@ -404,7 +404,7 @@ The helper processes different destinations concurrently through independent dyn
 Before building artifacts, update the application version and release references with one command:
 
 ```powershell
-.\.venv\Scripts\python.exe bump_version.py 0.8.1
+.\.venv\Scripts\python.exe bump_version.py 0.9.0
 ```
 
 Windows:
@@ -424,10 +424,10 @@ Linux:
 Python source artifacts and the complete source archive:
 
 ```powershell
-.\.venv\Scripts\python.exe build_source_release.py --tag v0.8.1
+.\.venv\Scripts\python.exe build_source_release.py --tag v0.9.0
 ```
 
-Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.8.1`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
+Artifacts are written to `release/`. GitHub Actions runs Python and Go tests, builds Windows, Linux, wheel, sdist, and source-archive outputs in separate jobs, then publishes them through one final release job. The tag must exactly match the application version, so this release uses `v0.9.0`; a mismatched tag stops the build. See [`RELEASE.md`](RELEASE.md) for the complete checklist.
 
 ## Repository layout
 
