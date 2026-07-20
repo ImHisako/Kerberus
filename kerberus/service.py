@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import copy
+import mimetypes
+import os
 import secrets
 import threading
 import time
 import uuid
 import emoji as emoji_data
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
+
+from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt, crypto_aead_xchacha20poly1305_ietf_encrypt
 
 from .config import AppConfig
 from .crypto import (
     IdentityBundle,
     IdentitySecrets,
+    b64,
     destination_b32,
     generate_identity,
     open_message_payload,
@@ -26,6 +33,7 @@ from .crypto import (
     sign_control,
     update_destination,
     update_public_profile,
+    unb64,
     verify_control,
 )
 from .sam import SamClient
@@ -52,6 +60,88 @@ def _reaction_values(value: object) -> list[str]:
     return normalized[:12]
 
 
+ATTACHMENT_CHUNK_BYTES = 512 * 1024
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _safe_attachment_name(value: object) -> str:
+    name = str(value).replace("\\", "/").rsplit("/", 1)[-1].replace("\x00", "").strip()
+    if not name:
+        raise ValueError("Nome allegato non valido")
+    return name[:180]
+
+
+def _normalize_attachment(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Allegato non valido")
+    name = _safe_attachment_name(value.get("name", ""))
+    mime_type = str(value.get("mime", "application/octet-stream")).strip().lower()
+    if not mime_type or "/" not in mime_type or len(mime_type) > 127:
+        mime_type = "application/octet-stream"
+    encoded = value.get("data", "")
+    if not isinstance(encoded, str):
+        raise ValueError("Dati allegato non validi")
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Dati allegato non validi") from exc
+    if not raw:
+        raise ValueError("Il file è vuoto")
+    limit = MAX_VIDEO_ATTACHMENT_BYTES if mime_type.startswith("video/") else MAX_ATTACHMENT_BYTES
+    if len(raw) > limit:
+        raise ValueError("Il file supera il limite consentito")
+    declared_size = value.get("size")
+    if declared_size is not None and declared_size != len(raw):
+        raise ValueError("Dimensione allegato non valida")
+    digest = hashlib.sha256(raw).hexdigest()
+    declared_digest = str(value.get("sha256", ""))
+    if declared_digest and not hmac.compare_digest(declared_digest, digest):
+        raise ValueError("Hash allegato non valido")
+    return {
+        "name": name,
+        "mime": mime_type,
+        "size": len(raw),
+        "sha256": digest,
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def _attachment_limit(mime_type: str) -> int:
+    return MAX_VIDEO_ATTACHMENT_BYTES if mime_type.startswith("video/") else MAX_ATTACHMENT_BYTES
+
+
+def _normalize_attachment_metadata(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Metadati allegato non validi")
+    name = _safe_attachment_name(value.get("name", ""))
+    mime_type = str(value.get("mime", "application/octet-stream")).strip().lower()
+    if not mime_type or "/" not in mime_type or len(mime_type) > 127:
+        mime_type = "application/octet-stream"
+    try:
+        size = int(value.get("size", -1))
+        total_chunks = int(value.get("total_chunks", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Dimensione allegato non valida") from exc
+    if size <= 0 or size > _attachment_limit(mime_type):
+        raise ValueError("Dimensione allegato non valida")
+    expected_chunks = (size + ATTACHMENT_CHUNK_BYTES - 1) // ATTACHMENT_CHUNK_BYTES
+    if total_chunks != expected_chunks:
+        raise ValueError("Numero di blocchi non valido")
+    digest = str(value.get("sha256", "")).lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("Hash allegato non valido")
+    return {
+        "name": name,
+        "mime": mime_type,
+        "size": size,
+        "sha256": digest,
+        "chunk_size": ATTACHMENT_CHUNK_BYTES,
+        "total_chunks": total_chunks,
+    }
+
+
 class MessengerService:
     _MESSAGE_RETRY_SECONDS = (2, 3, 5, 8, 12, 20)
     _CONTROL_RETRY_SECONDS = (2, 3, 5, 8, 12)
@@ -74,6 +164,7 @@ class MessengerService:
         # cannot corrupt encrypted receipt round-trip measurements.
         self._receipt_started_ns: dict[str, int] = {}
         self._voice_codec: NativeVoiceCodec | None = None
+        self._attachment_store = config.vault_path.parent / "attachments"
 
     def identity(self) -> IdentityBundle | None:
         value = self.vault.state.get("identity")
@@ -133,6 +224,7 @@ class MessengerService:
 
     def retry_all_now(self) -> dict[str, int]:
         handshakes: set[str] = set()
+        resumable_attachments: list[str] = []
         with self._state_lock:
             # Upgrade locally-created requests from pre-authentication releases.
             # They can be re-signed safely because the original target code and
@@ -164,6 +256,12 @@ class MessengerService:
                 entry["last_attempt"] = 0
             for entry in self.vault.state.get("control_outbox", []):
                 entry["last_attempt"] = 0
+            resumable_attachments = [
+                str(transfer_id) for transfer_id, transfer in self.vault.state.setdefault("attachment_transfers", {}).items()
+                if isinstance(transfer, dict) and transfer.get("direction") == "out"
+                and transfer.get("state") == "transferring" and not transfer.get("paused")
+                and not transfer.get("active_message_id")
+            ]
             status = self.queue_status()
             self.vault.save()
         for contact_id in handshakes:
@@ -173,6 +271,8 @@ class MessengerService:
         self.flush_control_outbox(background=True)
         self.flush_pending_contacts(background=True)
         self.flush_outbox(background=True)
+        for transfer_id in resumable_attachments:
+            self._queue_next_attachment_part(transfer_id, force=True)
         self._emit_protocol_event(
             "queues_retried",
             f"Retry immediato: {status['messages']} messaggi, {status['contacts']} contatti, {status['control']} conferme",
@@ -270,6 +370,9 @@ class MessengerService:
         settings.setdefault("audio_input_device_id", "")
         settings.setdefault("audio_output_device_id", "")
         settings.setdefault("language", "it")
+        settings.setdefault("theme", "default")
+        settings.setdefault("text_scale", 100)
+        settings.setdefault("ui_density", "comfortable")
         for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
         return dict(settings)
@@ -355,6 +458,23 @@ class MessengerService:
             settings["audio_output_device_id"] = output_device_id
             self.vault.save()
         self._emit_protocol_event("audio_settings_updated", "Dispositivi audio aggiornati")
+        return self.settings()
+
+    def update_appearance_settings(self, theme: str, text_scale: int, ui_density: str) -> dict:
+        """Persist validated application-wide appearance preferences."""
+        if theme not in {"default", "pink", "orange", "white", "dark"}:
+            raise ValueError("Tema non supportato")
+        if text_scale not in {90, 100, 110, 120}:
+            raise ValueError("Dimensione del testo non supportata")
+        if ui_density not in {"compact", "comfortable", "spacious"}:
+            raise ValueError("Densità dell’interfaccia non supportata")
+        with self._state_lock:
+            settings = self.vault.state.setdefault("settings", {})
+            settings["theme"] = theme
+            settings["text_scale"] = text_scale
+            settings["ui_density"] = ui_density
+            self.vault.save()
+        self._emit_protocol_event("appearance_settings_updated", "Aspetto dell’interfaccia aggiornato")
         return self.settings()
 
     def test_voice_roundtrip(
@@ -545,6 +665,12 @@ class MessengerService:
                         "sample_rate": dict(message.get("voice") or {}).get("sample_rate"),
                         "sample_count": dict(message.get("voice") or {}).get("sample_count"),
                     } if message.get("kind") == "voice" else None,
+                    "attachment": {
+                        "name": str(dict(message.get("attachment") or {}).get("name", "")),
+                        "mime": str(dict(message.get("attachment") or {}).get("mime", "")),
+                        "size": dict(message.get("attachment") or {}).get("size"),
+                        "sha256": str(dict(message.get("attachment") or {}).get("sha256", "")),
+                    } if message.get("kind") == "attachment" else None,
                     "voice_codec_timings_ms": copy.deepcopy(message.get("voice_metrics", {}))
                     if isinstance(message.get("voice_metrics"), dict) else {},
                     "timestamps": {
@@ -603,6 +729,15 @@ class MessengerService:
         """Delete one local copy and cancel its pending delivery, if any."""
         if not message_id:
             return False
+        transfer_id = ""
+        total_chunks = 0
+        with self._state_lock:
+            transfer = next((item for item in self.vault.state.setdefault("attachment_transfers", {}).values() if item.get("message_id") == message_id), None)
+            if isinstance(transfer, dict):
+                transfer_id = str(transfer.get("transfer_id", ""))
+                total_chunks = int(dict(transfer.get("attachment") or {}).get("total_chunks", 0))
+        if transfer_id and isinstance(transfer, dict) and transfer.get("state") not in {"complete", "cancelled"}:
+            self.cancel_attachment(message_id)
         with self._state_lock:
             before = len(self.vault.state["messages"])
             self.vault.state["messages"] = [
@@ -611,11 +746,15 @@ class MessengerService:
             ]
             self.vault.state["outbox"] = [
                 entry for entry in self.vault.state["outbox"]
-                if entry.get("message_id") != message_id
+                if entry.get("message_id") != message_id and entry.get("attachment_transfer_id") != transfer_id
             ]
+            if transfer_id:
+                self.vault.state.setdefault("attachment_transfers", {}).pop(transfer_id, None)
             changed = len(self.vault.state["messages"]) != before
             if changed:
                 self.vault.save()
+        if transfer_id:
+            self._delete_attachment_chunks(transfer_id, total_chunks)
         return changed
 
     def forward_message(self, contact_id: str, text: str) -> str:
@@ -634,6 +773,429 @@ class MessengerService:
             {"kind": "message", "text": text},
             text=text,
         )
+
+    def send_attachment(
+        self,
+        contact_id: str,
+        filename: str,
+        data: bytes,
+        mime_type: str = "",
+    ) -> str:
+        if not isinstance(data, bytes):
+            raise ValueError("Dati allegato non validi")
+        guessed_mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        normalized_mime = (mime_type or guessed_mime).lower()
+        self._validate_attachment_size(len(data), normalized_mime)
+        chunks = (data[offset:offset + ATTACHMENT_CHUNK_BYTES] for offset in range(0, len(data), ATTACHMENT_CHUNK_BYTES))
+        preview = data if normalized_mime.startswith("image/") and len(data) <= MAX_INLINE_IMAGE_BYTES else None
+        return self._create_attachment_transfer(
+            contact_id, filename, normalized_mime, len(data), hashlib.sha256(data).hexdigest(), chunks, preview,
+        )
+
+    def send_attachment_file(self, contact_id: str, path: Path) -> str:
+        source = Path(path)
+        size = source.stat().st_size
+        mime_type = (mimetypes.guess_type(source.name)[0] or "application/octet-stream").lower()
+        self._validate_attachment_size(size, mime_type)
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            while block := stream.read(ATTACHMENT_CHUNK_BYTES):
+                digest.update(block)
+        preview = source.read_bytes() if mime_type.startswith("image/") and size <= MAX_INLINE_IMAGE_BYTES else None
+
+        def chunks() -> Iterable[bytes]:
+            with source.open("rb") as stream:
+                while block := stream.read(ATTACHMENT_CHUNK_BYTES):
+                    yield block
+
+        return self._create_attachment_transfer(
+            contact_id, source.name, mime_type, size, digest.hexdigest(), chunks(), preview,
+        )
+
+    @staticmethod
+    def _validate_attachment_size(size: int, mime_type: str) -> None:
+        if size <= 0:
+            raise ValueError("Il file è vuoto")
+        limit = _attachment_limit(mime_type)
+        if size > limit:
+            label = "100 MB" if mime_type.startswith("video/") else "25 MB"
+            raise ValueError(f"Il file supera il limite di {label}")
+
+    def _create_attachment_transfer(
+        self,
+        contact_id: str,
+        filename: str,
+        mime_type: str,
+        size: int,
+        digest: str,
+        chunks: Iterable[bytes],
+        preview: bytes | None = None,
+    ) -> str:
+        identity = self.identity()
+        if not identity:
+            raise RuntimeError("Identità non configurata")
+        contact = IdentityBundle.from_dict(self.vault.state["contacts"][contact_id])
+        transfer_id = uuid.uuid4().hex
+        message_id = uuid.uuid4().hex
+        total_chunks = (size + ATTACHMENT_CHUNK_BYTES - 1) // ATTACHMENT_CHUNK_BYTES
+        metadata = _normalize_attachment_metadata({
+            "name": filename, "mime": mime_type, "size": size, "sha256": digest,
+            "total_chunks": total_chunks,
+        })
+        storage_key = os.urandom(32)
+        written = 0
+        chunk_count = 0
+        stored_digest = hashlib.sha256()
+        try:
+            for index, chunk in enumerate(chunks):
+                if not chunk or len(chunk) > ATTACHMENT_CHUNK_BYTES:
+                    raise ValueError("Blocco allegato non valido")
+                self._write_attachment_chunk(transfer_id, index, storage_key, bytes(chunk))
+                written += len(chunk)
+                chunk_count = index + 1
+                stored_digest.update(chunk)
+            if written != size or chunk_count != total_chunks or stored_digest.hexdigest() != digest:
+                raise ValueError("File modificato durante la preparazione")
+        except Exception:
+            self._delete_attachment_chunks(transfer_id, total_chunks)
+            raise
+        attachment = {
+            **metadata, "transfer_id": transfer_id, "state": "transferring",
+            "progress": 0, "completed_chunks": 0,
+        }
+        if preview is not None:
+            attachment["data"] = base64.b64encode(preview).decode("ascii")
+        now = int(time.time())
+        transfer = {
+            "transfer_id": transfer_id, "message_id": message_id, "contact_id": contact_id,
+            "destination": contact.destination, "direction": "out", "attachment": metadata,
+            "storage_key": b64(storage_key), "manifest_acked": False, "completed_chunks": 0,
+            "active_message_id": "", "active_phase": "", "active_index": -1,
+            "paused": False, "state": "transferring", "created_at": now,
+        }
+        message = {
+            "message_id": message_id, "contact_id": contact_id, "direction": "out",
+            "kind": "attachment", "text": str(metadata["name"]), "time": now, "sent_at": now,
+            "received_at": None, "delivered_at": None, "recipient_received_at": None,
+            "read_at": None, "reactions": {}, "status": "pending", "attachment": attachment,
+        }
+        with self._state_lock:
+            self.vault.state.setdefault("attachment_transfers", {})[transfer_id] = transfer
+            self.vault.state["messages"].append(message)
+            self.vault.save()
+        if self.on_message:
+            self.on_message("new", contact_id)
+        return "sent" if self._queue_next_attachment_part(transfer_id, force=True) else "queued"
+
+    def forward_attachment(self, contact_id: str, attachment: object) -> str:
+        # Backward compatibility for attachments produced by pre-chunk releases.
+        normalized = _normalize_attachment(attachment)
+        return self._send_user_payload(
+            contact_id,
+            {"kind": "attachment", "attachment": normalized},
+            text=str(normalized["name"]),
+            attachment=normalized,
+        )
+
+    def forward_attachment_message(self, contact_id: str, message_id: str) -> str:
+        metadata, data = self.attachment_content(message_id)
+        return self.send_attachment(contact_id, str(metadata["name"]), data, str(metadata["mime"]))
+
+    def attachment_content(self, message_id: str) -> tuple[dict[str, object], bytes]:
+        with self._state_lock:
+            message = next(
+                (item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id),
+                None,
+            )
+            if not message or message.get("kind") != "attachment":
+                raise ValueError("Allegato non trovato")
+            raw_attachment = copy.deepcopy(message.get("attachment"))
+            if isinstance(raw_attachment, dict) and not raw_attachment.get("transfer_id"):
+                attachment = _normalize_attachment(raw_attachment)
+                return attachment, base64.b64decode(str(attachment["data"]).encode("ascii"), validate=True)
+            transfer_id = str(dict(raw_attachment or {}).get("transfer_id", ""))
+            transfer = copy.deepcopy(self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id))
+        if not transfer:
+            raise ValueError("Trasferimento allegato non trovato")
+        metadata = _normalize_attachment_metadata(transfer.get("attachment"))
+        if transfer.get("direction") == "in" and transfer.get("state") != "complete":
+            raise ValueError("Download dell’allegato non completato")
+        data = b"".join(self._read_attachment_chunk(transfer, index) for index in range(int(metadata["total_chunks"])))
+        if len(data) != metadata["size"] or hashlib.sha256(data).hexdigest() != metadata["sha256"]:
+            raise ValueError("Verifica SHA-256 dell’allegato non riuscita")
+        return metadata, data
+
+    def attachment_metadata(self, message_id: str) -> dict[str, object]:
+        with self._state_lock:
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id), None)
+            attachment = copy.deepcopy(message.get("attachment")) if message else None
+            if not isinstance(attachment, dict):
+                raise ValueError("Allegato non trovato")
+            transfer_id = str(attachment.get("transfer_id", ""))
+            if transfer_id:
+                transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+                if not isinstance(transfer, dict):
+                    raise ValueError("Trasferimento allegato non trovato")
+                return _normalize_attachment_metadata(transfer.get("attachment"))
+        legacy = _normalize_attachment(attachment)
+        return {key: legacy[key] for key in ("name", "mime", "size", "sha256")}
+
+    def save_attachment_to(self, message_id: str, destination: Path) -> Path:
+        with self._state_lock:
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id), None)
+            raw_attachment = copy.deepcopy(message.get("attachment")) if message else None
+            transfer_id = str(dict(raw_attachment or {}).get("transfer_id", ""))
+            transfer = copy.deepcopy(self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id))
+        if not transfer:
+            _metadata, data = self.attachment_content(message_id)
+            Path(destination).write_bytes(data)
+            return Path(destination)
+        metadata = _normalize_attachment_metadata(transfer.get("attachment"))
+        if transfer.get("direction") == "in" and transfer.get("state") != "complete":
+            raise ValueError("Download dell’allegato non completato")
+        target = Path(destination)
+        temporary = target.with_name(target.name + ".kerberus-part")
+        digest = hashlib.sha256()
+        written = 0
+        with temporary.open("wb") as stream:
+            for index in range(int(metadata["total_chunks"])):
+                chunk = self._read_attachment_chunk(transfer, index)
+                stream.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+        if written != metadata["size"] or digest.hexdigest() != metadata["sha256"]:
+            temporary.unlink(missing_ok=True)
+            raise ValueError("Verifica SHA-256 dell’allegato non riuscita")
+        os.replace(temporary, target)
+        return target
+
+    def _attachment_chunk_path(self, transfer_id: str, index: int) -> Path:
+        if len(transfer_id) != 32 or any(character not in "0123456789abcdef" for character in transfer_id):
+            raise ValueError("ID trasferimento non valido")
+        return self._attachment_store / f"{transfer_id}-{index:04d}.kac"
+
+    def _write_attachment_chunk(self, transfer_id: str, index: int, key: bytes, data: bytes) -> None:
+        path = self._attachment_chunk_path(transfer_id, index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        nonce = os.urandom(24)
+        associated = f"kerberus-attachment:{transfer_id}:{index}".encode("ascii")
+        ciphertext = crypto_aead_xchacha20poly1305_ietf_encrypt(data, associated, nonce, key)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(nonce + ciphertext)
+        os.replace(temporary, path)
+
+    def _read_attachment_chunk(self, transfer: dict, index: int) -> bytes:
+        transfer_id = str(transfer.get("transfer_id", ""))
+        raw = self._attachment_chunk_path(transfer_id, index).read_bytes()
+        if len(raw) < 40:
+            raise ValueError("Blocco allegato danneggiato")
+        associated = f"kerberus-attachment:{transfer_id}:{index}".encode("ascii")
+        return crypto_aead_xchacha20poly1305_ietf_decrypt(
+            raw[24:], associated, raw[:24], unb64(str(transfer.get("storage_key", ""))),
+        )
+
+    def _delete_attachment_chunks(self, transfer_id: str, total_chunks: int) -> None:
+        for index in range(max(0, total_chunks)):
+            self._attachment_chunk_path(transfer_id, index).unlink(missing_ok=True)
+
+    def _queue_next_attachment_part(self, transfer_id: str, force: bool = False) -> bool:
+        contact: IdentityBundle | None = None
+        existing_message_id = ""
+        with self._state_lock:
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict):
+                return False
+            if transfer.get("state") in {"complete", "cancelled", "failed"}:
+                return True
+            active_message_id = str(transfer.get("active_message_id", ""))
+            if active_message_id:
+                entry = next((item for item in self.vault.state["outbox"] if item.get("message_id") == active_message_id), None)
+                if entry:
+                    if force:
+                        entry["paused"] = False
+                        entry["last_attempt"] = 0
+                        self.vault.save()
+                    existing_message_id = active_message_id
+                else:
+                    transfer["active_message_id"] = ""
+        if existing_message_id:
+            return self._attempt_outbox(existing_message_id, force=force)
+        with self._state_lock:
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict) or transfer.get("active_message_id"):
+                return False
+            if transfer.get("paused"):
+                return False
+            metadata = _normalize_attachment_metadata(transfer.get("attachment"))
+            contact_data = self.vault.state.get("contacts", {}).get(transfer.get("contact_id"))
+            if not contact_data:
+                return False
+            contact = IdentityBundle.from_dict(contact_data)
+            if not transfer.get("manifest_acked"):
+                phase = "manifest"
+                index = -1
+                clear = {
+                    "kind": "attachment_manifest", "transfer_id": transfer_id,
+                    "chat_message_id": str(transfer.get("message_id", "")), "attachment": metadata,
+                }
+            else:
+                index = int(transfer.get("completed_chunks", 0))
+                if index >= int(metadata["total_chunks"]):
+                    self._complete_outgoing_attachment_locked(transfer)
+                    self.vault.save()
+                    return True
+                phase = "chunk"
+                raw_chunk = self._read_attachment_chunk(transfer, index)
+                clear = {
+                    "kind": "attachment_chunk", "transfer_id": transfer_id, "index": index,
+                    "data": base64.b64encode(raw_chunk).decode("ascii"),
+                    "sha256": hashlib.sha256(raw_chunk).hexdigest(),
+                }
+            protocol_message_id = uuid.uuid4().hex
+            ready = ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), contact.identity_id)
+            envelope = self._seal_ratchet(contact, clear, message_id=protocol_message_id) if ready else None
+            payload = json.dumps(envelope, separators=(",", ":")) if envelope else ""
+            self.vault.state["outbox"].append({
+                "message_id": protocol_message_id, "contact_id": contact.identity_id,
+                "destination": contact.destination, "payload": payload,
+                "deferred": None if envelope else clear, "created_at": int(time.time()),
+                "last_attempt": 0, "attempts": 0, "attachment_transfer_id": transfer_id,
+                "attachment_phase": phase, "attachment_index": index, "paused": False,
+            })
+            transfer["active_message_id"] = protocol_message_id
+            transfer["active_phase"] = phase
+            transfer["active_index"] = index
+            self.vault.save()
+        if contact is not None and not ready:
+            self._ensure_ratchet_handshake(contact)
+        return self._attempt_outbox(protocol_message_id, force=True)
+
+    def _complete_outgoing_attachment_locked(self, transfer: dict) -> None:
+        transfer["state"] = "complete"
+        transfer["paused"] = False
+        message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == transfer.get("message_id")), None)
+        if message:
+            if message.get("status") != "read":
+                message["status"] = "delivered"
+            message["delivered_at"] = int(time.time())
+            attachment = message.get("attachment")
+            if isinstance(attachment, dict):
+                attachment.update({"state": "complete", "progress": 100, "completed_chunks": attachment.get("total_chunks", 0)})
+
+    def _attachment_protocol_acked(self, transfer_id: str, protocol_message_id: str, received_at: object = None) -> None:
+        contact_id = ""
+        continue_transfer = False
+        with self._state_lock:
+            self._receipt_started_ns.pop(protocol_message_id, None)
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict) or transfer.get("active_message_id") != protocol_message_id:
+                return
+            contact_id = str(transfer.get("contact_id", ""))
+            phase = str(transfer.get("active_phase", ""))
+            if phase == "manifest":
+                transfer["manifest_acked"] = True
+            elif phase == "chunk":
+                transfer["completed_chunks"] = max(
+                    int(transfer.get("completed_chunks", 0)), int(transfer.get("active_index", -1)) + 1,
+                )
+            transfer["active_message_id"] = ""
+            transfer["active_phase"] = ""
+            transfer["active_index"] = -1
+            metadata = _normalize_attachment_metadata(transfer.get("attachment"))
+            completed = int(transfer.get("completed_chunks", 0))
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == transfer.get("message_id")), None)
+            if message:
+                message["status"] = "sent"
+                attachment = message.get("attachment")
+                if isinstance(attachment, dict):
+                    attachment["completed_chunks"] = completed
+                    attachment["progress"] = round(completed * 100 / int(metadata["total_chunks"]))
+                    attachment["state"] = "paused" if transfer.get("paused") else "transferring"
+            if completed >= int(metadata["total_chunks"]):
+                self._complete_outgoing_attachment_locked(transfer)
+                if message and isinstance(received_at, int):
+                    message["recipient_received_at"] = received_at
+            else:
+                continue_transfer = not bool(transfer.get("paused")) and transfer.get("state") == "transferring"
+            self.vault.save()
+        if contact_id and self.on_message:
+            self.on_message("status", contact_id)
+        if continue_transfer:
+            marker = f"{transfer_id}:{protocol_message_id}"
+            self._submit_delivery("attachment", marker, self._queue_next_attachment_part, transfer_id)
+
+    def set_attachment_paused(self, message_id: str, paused: bool) -> bool:
+        transfer_id = ""
+        contact: IdentityBundle | None = None
+        active_message_id = ""
+        direction = ""
+        with self._state_lock:
+            transfer = next((item for item in self.vault.state.setdefault("attachment_transfers", {}).values() if item.get("message_id") == message_id), None)
+            if not isinstance(transfer, dict) or transfer.get("state") in {"complete", "cancelled", "failed"}:
+                return False
+            transfer_id = str(transfer.get("transfer_id", ""))
+            direction = str(transfer.get("direction", ""))
+            transfer["paused"] = paused
+            active_message_id = str(transfer.get("active_message_id", ""))
+            for entry in self.vault.state.get("outbox", []):
+                if entry.get("message_id") == active_message_id:
+                    entry["paused"] = paused
+                    if not paused:
+                        entry["last_attempt"] = 0
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id), None)
+            if message and isinstance(message.get("attachment"), dict):
+                message["attachment"]["state"] = "paused" if paused else "transferring"
+            contact_data = self.vault.state.get("contacts", {}).get(transfer.get("contact_id"))
+            contact = IdentityBundle.from_dict(contact_data) if contact_data else None
+            self.vault.save()
+        if direction == "in" and contact is not None:
+            with self._state_lock:
+                envelope = self._seal_ratchet(contact, {
+                    "kind": "attachment_flow", "transfer_id": transfer_id,
+                    "action": "pause" if paused else "resume",
+                })
+                self.vault.save()
+            self._queue_control(contact.destination, envelope, background=True)
+        if self.on_message and contact is not None:
+            self.on_message("status", contact.identity_id)
+        if not paused and direction == "out":
+            if active_message_id:
+                self._attempt_outbox(active_message_id, force=True)
+            else:
+                self._queue_next_attachment_part(transfer_id, force=True)
+        return True
+
+    def cancel_attachment(self, message_id: str) -> bool:
+        transfer_id = ""
+        contact: IdentityBundle | None = None
+        total_chunks = 0
+        with self._state_lock:
+            transfer = next((item for item in self.vault.state.setdefault("attachment_transfers", {}).values() if item.get("message_id") == message_id), None)
+            if not isinstance(transfer, dict) or transfer.get("state") in {"complete", "cancelled"}:
+                return False
+            transfer_id = str(transfer.get("transfer_id", ""))
+            total_chunks = int(dict(transfer.get("attachment") or {}).get("total_chunks", 0))
+            transfer["state"] = "cancelled"
+            transfer["paused"] = False
+            active = str(transfer.get("active_message_id", ""))
+            self.vault.state["outbox"] = [item for item in self.vault.state.get("outbox", []) if item.get("message_id") != active]
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == message_id), None)
+            if message and isinstance(message.get("attachment"), dict):
+                message["attachment"]["state"] = "cancelled"
+            contact_data = self.vault.state.get("contacts", {}).get(transfer.get("contact_id"))
+            contact = IdentityBundle.from_dict(contact_data) if contact_data else None
+            self.vault.save()
+        # A cancelled transfer cannot be resumed, so its encrypted spool no
+        # longer serves a purpose on either side of the conversation.
+        self._delete_attachment_chunks(transfer_id, total_chunks)
+        if contact is not None and ratchet_is_ready(self.vault.state.setdefault("ratchets", {}), contact.identity_id):
+            with self._state_lock:
+                envelope = self._seal_ratchet(contact, {"kind": "attachment_cancel", "transfer_id": transfer_id})
+                self.vault.save()
+            self._queue_control(contact.destination, envelope, background=True)
+            if self.on_message:
+                self.on_message("status", contact.identity_id)
+        return True
 
     def send_voice(
         self,
@@ -694,6 +1256,7 @@ class MessengerService:
         text: str,
         voice: dict | None = None,
         voice_metrics: dict | None = None,
+        attachment: dict[str, object] | None = None,
     ) -> str:
         identity = self.identity()
         if not identity:
@@ -725,6 +1288,8 @@ class MessengerService:
             stored_message["voice"] = copy.deepcopy(voice)
         if voice_metrics is not None:
             stored_message["voice_metrics"] = copy.deepcopy(voice_metrics)
+        if attachment is not None:
+            stored_message["attachment"] = copy.deepcopy(attachment)
         with self._state_lock:
             self.vault.state["messages"].append(stored_message)
             self.vault.state["outbox"].append({
@@ -882,6 +1447,165 @@ class MessengerService:
         if action in {"init", "ready"}:
             self.flush_outbox(background=True)
 
+    def _remember_attachment_protocol(self, message_id: str, received_at: int) -> None:
+        seen = self.vault.state.setdefault("attachment_seen", {})
+        seen[message_id] = received_at
+        while len(seen) > 10_000:
+            seen.pop(next(iter(seen)))
+        self.vault.state["seen"].append(message_id)
+        self.vault.state["seen"] = self.vault.state["seen"][-10_000:]
+
+    def _receive_attachment_manifest(self, sender_id: str, clear: dict, message_id: str, received_at: int) -> bool:
+        transfer_id = str(clear.get("transfer_id", ""))
+        chat_message_id = str(clear.get("chat_message_id", ""))
+        if any(len(value) != 32 or any(character not in "0123456789abcdef" for character in value) for value in (transfer_id, chat_message_id)):
+            return False
+        try:
+            metadata = _normalize_attachment_metadata(clear.get("attachment"))
+        except ValueError:
+            return False
+        with self._state_lock:
+            transfers = self.vault.state.setdefault("attachment_transfers", {})
+            if transfer_id in transfers or any(item.get("message_id") == chat_message_id for item in self.vault.state.get("messages", [])):
+                return False
+            attachment = {
+                **metadata, "transfer_id": transfer_id, "state": "transferring",
+                "progress": 0, "completed_chunks": 0,
+            }
+            transfer = {
+                "transfer_id": transfer_id, "message_id": chat_message_id, "contact_id": sender_id,
+                "direction": "in", "attachment": metadata, "storage_key": b64(os.urandom(32)),
+                "received_chunks": [], "paused": False, "state": "transferring",
+                "created_at": received_at,
+            }
+            transfers[transfer_id] = transfer
+            self.vault.state["messages"].append({
+                "message_id": chat_message_id, "contact_id": sender_id, "direction": "in",
+                "kind": "attachment", "text": str(metadata["name"]),
+                "time": int(clear.get("sent_at", received_at)), "sent_at": int(clear.get("sent_at", received_at)),
+                "received_at": received_at, "delivered_at": None, "recipient_received_at": None,
+                "read_at": None, "reactions": {}, "status": "receiving", "attachment": attachment,
+            })
+            self._remember_attachment_protocol(message_id, received_at)
+            self.vault.save()
+        self._emit_protocol_event("attachment_manifest_received", f"Download cifrato avviato: {metadata['name']}")
+        if self.on_message:
+            self.on_message("new", sender_id)
+        return True
+
+    def _receive_attachment_chunk(self, sender_id: str, clear: dict, message_id: str, received_at: int) -> bool:
+        transfer_id = str(clear.get("transfer_id", ""))
+        try:
+            index = int(clear.get("index", -1))
+            encoded = str(clear.get("data", "")).encode("ascii")
+            raw_chunk = base64.b64decode(encoded, validate=True)
+        except (TypeError, ValueError, UnicodeEncodeError):
+            return False
+        digest = str(clear.get("sha256", ""))
+        if not raw_chunk or len(raw_chunk) > ATTACHMENT_CHUNK_BYTES or not hmac.compare_digest(hashlib.sha256(raw_chunk).hexdigest(), digest):
+            return False
+        with self._state_lock:
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict) or transfer.get("direction") != "in" or transfer.get("contact_id") != sender_id:
+                return False
+            if transfer.get("state") in {"cancelled", "failed", "complete"}:
+                return False
+            metadata = _normalize_attachment_metadata(transfer.get("attachment"))
+            total_chunks = int(metadata["total_chunks"])
+            if index < 0 or index >= total_chunks:
+                return False
+            expected_size = ATTACHMENT_CHUNK_BYTES if index < total_chunks - 1 else int(metadata["size"]) - ATTACHMENT_CHUNK_BYTES * (total_chunks - 1)
+            if len(raw_chunk) != expected_size:
+                return False
+            received = {int(value) for value in transfer.get("received_chunks", [])}
+            if index not in received:
+                self._write_attachment_chunk(transfer_id, index, unb64(str(transfer["storage_key"])), raw_chunk)
+                received.add(index)
+            transfer["received_chunks"] = sorted(received)
+            completed = len(received)
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == transfer.get("message_id")), None)
+            state = "paused" if transfer.get("paused") else "transferring"
+            if completed == total_chunks:
+                try:
+                    full_digest = hashlib.sha256()
+                    assembled_size = 0
+                    preview_parts: list[bytes] = []
+                    keep_preview = str(metadata["mime"]).startswith("image/") and int(metadata["size"]) <= MAX_INLINE_IMAGE_BYTES
+                    for chunk_index in range(total_chunks):
+                        block = self._read_attachment_chunk(transfer, chunk_index)
+                        full_digest.update(block)
+                        assembled_size += len(block)
+                        if keep_preview:
+                            preview_parts.append(block)
+                    if assembled_size != metadata["size"] or full_digest.hexdigest() != metadata["sha256"]:
+                        raise ValueError("SHA-256 non valido")
+                    state = "complete"
+                    transfer["state"] = "complete"
+                    if message and keep_preview and isinstance(message.get("attachment"), dict):
+                        message["attachment"]["data"] = base64.b64encode(b"".join(preview_parts)).decode("ascii")
+                except Exception:
+                    state = "failed"
+                    transfer["state"] = "failed"
+            if message and isinstance(message.get("attachment"), dict):
+                message["attachment"].update({
+                    "completed_chunks": completed, "progress": round(completed * 100 / total_chunks), "state": state,
+                })
+                message["status"] = "received" if state == "complete" else state
+            self._remember_attachment_protocol(message_id, received_at)
+            self.vault.save()
+        if self.on_message:
+            self.on_message("status", sender_id)
+        return state != "failed"
+
+    def _receive_attachment_flow(self, sender_id: str, clear: dict) -> None:
+        transfer_id = str(clear.get("transfer_id", ""))
+        action = str(clear.get("action", ""))
+        if action not in {"pause", "resume"}:
+            return
+        active_message_id = ""
+        with self._state_lock:
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict) or transfer.get("direction") != "out" or transfer.get("contact_id") != sender_id:
+                return
+            paused = action == "pause"
+            transfer["paused"] = paused
+            active_message_id = str(transfer.get("active_message_id", ""))
+            for entry in self.vault.state.get("outbox", []):
+                if entry.get("message_id") == active_message_id:
+                    entry["paused"] = paused
+                    if not paused:
+                        entry["last_attempt"] = 0
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == transfer.get("message_id")), None)
+            if message and isinstance(message.get("attachment"), dict):
+                message["attachment"]["state"] = "paused" if paused else "transferring"
+            self.vault.save()
+        if self.on_message:
+            self.on_message("status", sender_id)
+        if action == "resume":
+            if active_message_id:
+                self._attempt_outbox(active_message_id, force=True)
+            else:
+                self._queue_next_attachment_part(transfer_id, force=True)
+
+    def _receive_attachment_cancel(self, sender_id: str, clear: dict) -> None:
+        transfer_id = str(clear.get("transfer_id", ""))
+        total_chunks = 0
+        with self._state_lock:
+            transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id)
+            if not isinstance(transfer, dict) or transfer.get("contact_id") != sender_id:
+                return
+            total_chunks = int(dict(transfer.get("attachment") or {}).get("total_chunks", 0))
+            transfer["state"] = "cancelled"
+            active = str(transfer.get("active_message_id", ""))
+            self.vault.state["outbox"] = [item for item in self.vault.state.get("outbox", []) if item.get("message_id") != active]
+            message = next((item for item in self.vault.state.get("messages", []) if item.get("message_id") == transfer.get("message_id")), None)
+            if message and isinstance(message.get("attachment"), dict):
+                message["attachment"]["state"] = "cancelled"
+            self.vault.save()
+        self._delete_attachment_chunks(transfer_id, total_chunks)
+        if self.on_message:
+            self.on_message("status", sender_id)
+
     def _receive(self, payload: bytes, remote_destination: str = "", inline_reply: bool = False) -> bytes | None:
         envelope = json.loads(payload.decode("utf-8"))
         message_type = envelope.get("type")
@@ -929,10 +1653,12 @@ class MessengerService:
                 (message for message in self.vault.state["messages"] if message.get("message_id") == message_id),
                 {},
             )
-            if not stored:
+            protocol_received_at = self.vault.state.setdefault("attachment_seen", {}).get(message_id)
+            if not stored and not isinstance(protocol_received_at, int):
                 return None
-            received_at = int(stored.get("received_at") or time.time())
-            if self._privacy_enabled(sender_id, "send_delivery_receipts"):
+            received_at = int(stored.get("received_at") or time.time()) if stored else int(protocol_received_at)
+            protocol_ack = isinstance(protocol_received_at, int)
+            if protocol_ack or self._privacy_enabled(sender_id, "send_delivery_receipts"):
                 if inline_reply:
                     return self._message_ack_payload(sender, message_id, received_at)
                 self._send_message_ack(sender, message_id, received_at)
@@ -978,9 +1704,33 @@ class MessengerService:
                 self.vault.state["seen"] = self.vault.state["seen"][-10000:]
             self._receive_identity_visibility(sender_id, clear)
             return None
-        if kind not in {"message", "voice"}:
+        if kind == "attachment_flow":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+                self.vault.save()
+            self._receive_attachment_flow(sender_id, clear)
+            return None
+        if kind == "attachment_cancel":
+            with self._state_lock:
+                self.vault.state["seen"].append(message_id)
+                self.vault.state["seen"] = self.vault.state["seen"][-10000:]
+                self.vault.save()
+            self._receive_attachment_cancel(sender_id, clear)
+            return None
+        if kind in {"attachment_manifest", "attachment_chunk"}:
+            accepted = self._receive_attachment_manifest(sender_id, clear, message_id, received_at) \
+                if kind == "attachment_manifest" else self._receive_attachment_chunk(sender_id, clear, message_id, received_at)
+            if not accepted:
+                return None
+            if inline_reply:
+                return self._message_ack_payload(sender, message_id, received_at)
+            self._send_message_ack(sender, message_id, received_at)
+            return None
+        if kind not in {"message", "voice", "attachment"}:
             return None
         voice = None
+        attachment = None
         text = ""
         if kind == "voice":
             try:
@@ -988,6 +1738,12 @@ class MessengerService:
             except ValueError:
                 return None
             text = "Messaggio vocale"
+        elif kind == "attachment":
+            try:
+                attachment = _normalize_attachment(clear.get("attachment"))
+            except ValueError:
+                return None
+            text = str(attachment["name"])
         else:
             text = str(clear["text"])
         with self._state_lock:
@@ -1003,8 +1759,12 @@ class MessengerService:
                 received_at=received_at,
                 kind=kind,
                 voice=voice,
+                attachment=attachment,
             )
-        event_label = "Messaggio vocale cifrato" if kind == "voice" else "Messaggio cifrato"
+        event_label = {
+            "voice": "Messaggio vocale cifrato",
+            "attachment": "Allegato cifrato",
+        }.get(kind, "Messaggio cifrato")
         self._emit_protocol_event("message_received", f"{event_label} ricevuto da {sender.name}")
         if self.on_message:
             self.on_message("new", sender_id)
@@ -1074,10 +1834,16 @@ class MessengerService:
 
     def _mark_outgoing_status(self, contact_id: str, message_ids: list[str], status: str, received_at: object = None) -> None:
         changed = False
+        attachment_acks: list[tuple[str, str]] = []
         now = int(time.time())
         with self._state_lock:
             if status in {"delivered", "read"}:
                 pending = set(message_ids)
+                attachment_acks = [
+                    (str(item.get("attachment_transfer_id", "")), str(item.get("message_id", "")))
+                    for item in self.vault.state.get("outbox", [])
+                    if item.get("message_id") in pending and item.get("attachment_transfer_id")
+                ]
                 self.vault.state["outbox"] = [item for item in self.vault.state["outbox"] if item.get("message_id") not in pending]
             for message in self.vault.state.get("messages", []):
                 if message.get("message_id") in message_ids and message.get("direction") == "out" and message.get("contact_id") == contact_id:
@@ -1094,8 +1860,10 @@ class MessengerService:
                         self._finish_receipt_timing(message)
                         message["read_at"] = now
                     changed = True
-            if changed:
+            if changed or attachment_acks:
                 self.vault.save()
+        for transfer_id, protocol_message_id in attachment_acks:
+            self._attachment_protocol_acked(transfer_id, protocol_message_id, received_at)
         if changed and self.on_message:
             self.on_message("status", contact_id)
 
@@ -1473,6 +2241,8 @@ class MessengerService:
             entry = next((item for item in self.vault.state["outbox"] if item["message_id"] == message_id), None)
             if not entry:
                 return True
+            if entry.get("paused"):
+                return False
             if not entry.get("payload"):
                 contact_data = self.vault.state.get("contacts", {}).get(entry.get("contact_id"))
                 if not contact_data or not ratchet_is_ready(
@@ -1510,10 +2280,17 @@ class MessengerService:
             return False
         elapsed = time.monotonic() - started
         with self._state_lock:
+            parent_message_id = ""
+            transfer_id = str(entry.get("attachment_transfer_id", ""))
+            if transfer_id:
+                transfer = self.vault.state.setdefault("attachment_transfers", {}).get(transfer_id, {})
+                parent_message_id = str(transfer.get("message_id", "")) if isinstance(transfer, dict) else ""
             for message in self.vault.state["messages"]:
-                if message.get("message_id") == message_id:
+                if message.get("message_id") in {message_id, parent_message_id}:
                     if isinstance(transport_metrics, dict):
                         message["transport_metrics"] = copy.deepcopy(transport_metrics)
+                    if parent_message_id:
+                        message["status"] = "sent"
                     break
             still_pending = any(item["message_id"] == message_id for item in self.vault.state["outbox"])
             if still_pending:
@@ -1584,6 +2361,7 @@ class MessengerService:
         received_at: int | None = None,
         kind: str = "message",
         voice: dict | None = None,
+        attachment: dict[str, object] | None = None,
     ) -> None:
         stored = {
             "message_id": message_id,
@@ -1602,6 +2380,8 @@ class MessengerService:
         }
         if voice is not None:
             stored["voice"] = copy.deepcopy(voice)
+        if attachment is not None:
+            stored["attachment"] = copy.deepcopy(attachment)
         with self._state_lock:
             self.vault.state["messages"].append(stored)
             self.vault.save()

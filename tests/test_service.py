@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 import struct
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -60,6 +61,30 @@ class ServiceTests(unittest.TestCase):
             codec.encode.assert_called_once()
             codec.decode.assert_called_once_with(voice)
             service.close(wait=True)
+
+    def test_appearance_preferences_are_validated_and_persisted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            service.vault.create("password-lunga-di-test")
+            settings = service.update_appearance_settings("pink", 110, "compact")
+            self.assertEqual(settings["theme"], "pink")
+            self.assertEqual(settings["text_scale"], 110)
+            self.assertEqual(settings["ui_density"], "compact")
+            with self.assertRaises(ValueError):
+                service.update_appearance_settings("invalido", 110, "compact")
+            with self.assertRaises(ValueError):
+                service.update_appearance_settings("pink", 95, "compact")
+            with self.assertRaises(ValueError):
+                service.update_appearance_settings("pink", 110, "invalida")
+            service.close(wait=True)
+
+            reopened = MessengerService(AppConfig(vault_path=root / "vault.kbv", sam_keys_path=root / "sam.txt"))
+            reopened.vault.unlock("password-lunga-di-test")
+            self.assertEqual(reopened.settings()["theme"], "pink")
+            self.assertEqual(reopened.settings()["text_scale"], 110)
+            self.assertEqual(reopened.settings()["ui_density"], "compact")
+            reopened.close(wait=True)
 
     def test_network_latency_preferences_are_persisted_and_applied(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -276,6 +301,196 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(incoming["voice_metrics"]["decode_ms"], 1.0)
             alice_service.close(wait=True)
             bob_service.close(wait=True)
+
+    def test_attachment_is_ratchet_encrypted_delivered_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
+            routes = {alice.destination: alice_service, bob.destination: bob_service}
+            captured = []
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    captured.append(payload)
+                    response = routes[destination]._receive(payload, inline_reply=True)
+                    if response:
+                        routes[alice.destination]._receive(response)
+                    return {"backend": "test"}
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Endpoint()
+            bob_service.sam = Endpoint()
+            original = b"\x89PNG\r\n\x1a\nprivate-image"
+            result = alice_service.send_attachment(bob.identity_id, "../foto.png", original, "image/png")
+            self.assertIn(result, {"sent", "queued"})
+            incoming = bob_service.messages_for(alice.identity_id)[0]
+            self.assertEqual(incoming["kind"], "attachment")
+            self.assertEqual(incoming["attachment"]["name"], "foto.png")
+            self.assertEqual(incoming["attachment"]["mime"], "image/png")
+            self.assertTrue(self._wait_for(lambda: incoming["attachment"].get("state") == "complete"))
+            metadata, recovered = bob_service.attachment_content(incoming["message_id"])
+            self.assertEqual(metadata["size"], len(original))
+            self.assertEqual(recovered, original)
+            self.assertNotIn(original, captured[0])
+            with self.assertRaisesRegex(ValueError, "25 MB"):
+                alice_service.send_attachment(bob.identity_id, "large.bin", bytes(25 * 1024 * 1024 + 1))
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_chunked_attachment_pauses_retries_and_resumes_without_restarting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_service = self._service(root / "alice", "Alice")
+            bob_service = self._service(root / "bob", "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
+            routes = {alice.destination: alice_service, bob.destination: bob_service}
+            failed_chunk = threading.Event()
+            fail_once = {"value": True}
+            sent_to_bob = []
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    if destination == bob.destination:
+                        sent_to_bob.append(payload)
+                        if len(sent_to_bob) >= 2 and fail_once["value"]:
+                            fail_once["value"] = False
+                            failed_chunk.set()
+                            raise ConnectionError("interruzione simulata")
+                    response = routes[destination]._receive(payload, inline_reply=True)
+                    if response:
+                        routes[alice.destination if destination == bob.destination else bob.destination]._receive(response)
+                    return {"backend": "test"}
+
+                def stop(self):
+                    pass
+
+            endpoint = Endpoint()
+            alice_service.sam = endpoint
+            bob_service.sam = endpoint
+            original = bytes((index * 17) % 251 for index in range(1_200_000))
+            alice_service.send_attachment(bob.identity_id, "archivio.bin", original)
+            outgoing = alice_service.messages_for(bob.identity_id)[0]
+            self.assertTrue(failed_chunk.wait(3))
+            self.assertEqual(len(alice_service.vault.state["outbox"]), 1)
+            active_id = alice_service.vault.state["outbox"][0]["message_id"]
+            attempts_before_pause = len(sent_to_bob)
+            incoming = bob_service.messages_for(alice.identity_id)[0]
+            self.assertTrue(bob_service.set_attachment_paused(incoming["message_id"], True))
+            self.assertTrue(self._wait_for(lambda: outgoing["attachment"].get("state") == "paused"))
+            self.assertFalse(alice_service._attempt_outbox(active_id, force=True))
+            self.assertEqual(len(sent_to_bob), attempts_before_pause)
+            self.assertEqual(outgoing["attachment"]["state"], "paused")
+            self.assertTrue(bob_service.set_attachment_paused(incoming["message_id"], False))
+            self.assertTrue(self._wait_for(lambda: outgoing["attachment"].get("state") == "complete", timeout=8))
+            self.assertEqual(incoming["attachment"]["total_chunks"], 3)
+            self.assertEqual(incoming["attachment"]["progress"], 100)
+            _metadata, recovered = bob_service.attachment_content(incoming["message_id"])
+            self.assertEqual(recovered, original)
+            transfer_id = outgoing["attachment"]["transfer_id"]
+            encrypted_chunk = (root / "alice" / "attachments" / f"{transfer_id}-0000.kac").read_bytes()
+            self.assertNotIn(original[:128], encrypted_chunk)
+            alice_service.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_chunked_attachment_resumes_from_persisted_outbox_after_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            alice_root, bob_root = root / "alice", root / "bob"
+            alice_service = self._service(alice_root, "Alice")
+            bob_service = self._service(bob_root, "Bob")
+            alice, bob = alice_service.identity(), bob_service.identity()
+            alice_service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            bob_service.vault.state["contacts"][alice.identity_id] = alice.to_dict()
+            alice_service.vault.save()
+            bob_service.vault.save()
+            self._establish_ratchet(alice_service, bob_service)
+
+            class Offline:
+                def send(self, _destination, _payload):
+                    raise ConnectionError("offline")
+
+                def stop(self):
+                    pass
+
+            alice_service.sam = Offline()
+            original = bytes((index * 7) % 253 for index in range(700_000))
+            alice_service.send_attachment(bob.identity_id, "ripresa.dat", original)
+            message_id = alice_service.messages_for(bob.identity_id)[0]["message_id"]
+            self.assertEqual(len(alice_service.vault.state["outbox"]), 1)
+            alice_service.close(wait=True)
+
+            reopened = MessengerService(AppConfig(
+                vault_path=alice_root / "vault.kbv", sam_keys_path=alice_root / "sam.txt",
+            ))
+            reopened.vault.unlock("password-lunga-di-test")
+            routes = {bob.destination: bob_service, alice.destination: reopened}
+
+            class Endpoint:
+                def send(self, destination, payload):
+                    response = routes[destination]._receive(payload, inline_reply=True)
+                    if response:
+                        routes[alice.destination if destination == bob.destination else bob.destination]._receive(response)
+                    return {"backend": "test"}
+
+                def stop(self):
+                    pass
+
+            endpoint = Endpoint()
+            reopened.sam = endpoint
+            bob_service.sam = endpoint
+            reopened.retry_all_now()
+            outgoing = next(item for item in reopened.messages_for(bob.identity_id) if item["message_id"] == message_id)
+            self.assertTrue(self._wait_for(lambda: outgoing["attachment"].get("state") == "complete", timeout=8))
+            incoming = bob_service.messages_for(alice.identity_id)[0]
+            _metadata, recovered = bob_service.attachment_content(incoming["message_id"])
+            self.assertEqual(recovered, original)
+            reopened.close(wait=True)
+            bob_service.close(wait=True)
+
+    def test_chunked_attachment_can_be_cancelled_and_stops_retrying(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = self._service(root / "alice", "Alice")
+            bob, _bob_secrets = generate_identity("Bob", "bob-destination")
+            service.vault.state["contacts"][bob.identity_id] = bob.to_dict()
+            service.vault.save()
+            states = service.vault.state.setdefault("ratchets", {})
+            # A ready state is not required to queue the manifest; offline delivery
+            # keeps the exact encrypted/deferred outbox entry available for cancellation.
+            service.sam = type("Offline", (), {
+                "send": lambda *_args: (_ for _ in ()).throw(ConnectionError("offline")),
+                "stop": lambda *_args: None,
+            })()
+            service.send_attachment(bob.identity_id, "annulla.bin", b"private" * 100_000)
+            outgoing = service.messages_for(bob.identity_id)[0]
+            transfer_id = outgoing["attachment"]["transfer_id"]
+            chunk_paths = list((root / "alice" / "attachments").glob(f"{transfer_id}-*.kac"))
+            self.assertTrue(chunk_paths)
+            self.assertTrue(service.vault.state["outbox"])
+            self.assertTrue(service.cancel_attachment(outgoing["message_id"]))
+            self.assertEqual(outgoing["attachment"]["state"], "cancelled")
+            self.assertFalse(any(
+                item.get("attachment_transfer_id") == outgoing["attachment"]["transfer_id"]
+                for item in service.vault.state["outbox"]
+            ))
+            self.assertTrue(all(not path.exists() for path in chunk_paths))
+            self.assertFalse(service.set_attachment_paused(outgoing["message_id"], False))
+            self.assertIsInstance(states, dict)
+            service.close(wait=True)
 
     def test_code_request_creates_both_chats_and_delivers_first_message(self):
         with tempfile.TemporaryDirectory() as folder:

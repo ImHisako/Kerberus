@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -43,6 +45,7 @@ from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtMultimedia import (
     QAudioFormat, QAudioOutput, QAudioSource, QMediaDevices, QMediaPlayer,
 )
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -86,23 +89,44 @@ from .updates import UpdateInfo, check_for_update, download_update
 from .voice import test_tone_wav
 
 
-COLORS = {
-    "window": "#0c0f13",
-    "sidebar": "#12161b",
-    "surface": "#171c22",
-    "surface_2": "#20262e",
-    "surface_3": "#29313b",
-    "border": "#2d3540",
-    "text": "#f2f5f7",
-    "muted": "#909aa6",
-    "faint": "#626d79",
-    "accent": "#35d09a",
-    "accent_hover": "#50ddb0",
-    "accent_dark": "#174d3b",
-    "cyan": "#4dbbd5",
-    "warning": "#f0b35a",
-    "danger": "#ef6b73",
+THEMES = {
+    "default": {
+        "window": "#0c0f13", "sidebar": "#12161b", "surface": "#171c22",
+        "surface_2": "#20262e", "surface_3": "#29313b", "border": "#2d3540",
+        "text": "#f2f5f7", "muted": "#909aa6", "faint": "#626d79",
+        "accent": "#35d09a", "accent_hover": "#50ddb0", "accent_dark": "#174d3b",
+        "cyan": "#4dbbd5", "warning": "#f0b35a", "danger": "#ef6b73",
+    },
+    "pink": {
+        "window": "#170f16", "sidebar": "#21131e", "surface": "#291825",
+        "surface_2": "#382031", "surface_3": "#482940", "border": "#57344e",
+        "text": "#fff3fa", "muted": "#c39aad", "faint": "#8e687d",
+        "accent": "#f472b6", "accent_hover": "#fb8fc6", "accent_dark": "#612447",
+        "cyan": "#d88cff", "warning": "#f5bd68", "danger": "#ff7185",
+    },
+    "orange": {
+        "window": "#15100b", "sidebar": "#1e160e", "surface": "#281c12",
+        "surface_2": "#372619", "surface_3": "#473122", "border": "#59402d",
+        "text": "#fff6ed", "muted": "#bea38d", "faint": "#876e5b",
+        "accent": "#f59e42", "accent_hover": "#ffb35f", "accent_dark": "#603817",
+        "cyan": "#e7c15b", "warning": "#f7c768", "danger": "#ef6b73",
+    },
+    "white": {
+        "window": "#f6f7f9", "sidebar": "#ffffff", "surface": "#ffffff",
+        "surface_2": "#edf0f3", "surface_3": "#e1e6eb", "border": "#ccd3da",
+        "text": "#18212b", "muted": "#5f6d7a", "faint": "#8995a1",
+        "accent": "#16865f", "accent_hover": "#0f9c6b", "accent_dark": "#ccecdf",
+        "cyan": "#157f9b", "warning": "#b66b12", "danger": "#c73f4b",
+    },
+    "dark": {
+        "window": "#050608", "sidebar": "#0a0c0f", "surface": "#101318",
+        "surface_2": "#171b21", "surface_3": "#21262e", "border": "#292f38",
+        "text": "#f6f7f9", "muted": "#9aa3ad", "faint": "#626b75",
+        "accent": "#8b9cff", "accent_hover": "#a2afff", "accent_dark": "#29315f",
+        "cyan": "#6ec5df", "warning": "#eeb35f", "danger": "#f06c76",
+    },
 }
+COLORS = dict(THEMES["default"])
 
 _LANGUAGE = "it"
 _ENGLISH = {
@@ -205,6 +229,17 @@ _ENGLISH.update({
         "I2P streaming · X25519 + ML-KEM-768 · XChaCha20-Poly1305",
     "Diagnostica JSON (*.json)": "Diagnostics JSON (*.json)",
     "Immagini (*.png *.jpg *.jpeg *.webp *.bmp)": "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+    "Tutti i file (*.*)": "All files (*.*)",
+    "Invia un file cifrato (25 MB · video 100 MB)": "Send an encrypted file (25 MB · video 100 MB)",
+    "Invia file": "Send file", "Salva file": "Save file", "Salva allegato": "Save attachment",
+    "Allegato": "Attachment", "Allegato inviato": "Attachment sent",
+    "Allegato salvato": "Attachment saved", "Riproduci video": "Play video",
+    "Cifratura e invio dell’allegato…": "Encrypting and sending attachment…",
+    "Metti in pausa": "Pause", "Riprendi": "Resume", "Annulla trasferimento": "Cancel transfer",
+    "Trasferimento annullato": "Transfer cancelled", "Trasferimento in pausa": "Transfer paused",
+    "Interrompere e annullare questo trasferimento?": "Stop and cancel this transfer?",
+    "Il file è vuoto": "The file is empty",
+    "Allegato salvato: {path}": "Attachment saved: {path}",
     "Profilo Kerberus (*.kbid *.json);;Tutti i file (*.*)": "Kerberus profile (*.kbid *.json);;All files (*.*)",
     "Profilo Kerberus (*.kbid)": "Kerberus profile (*.kbid)",
     "Kerberus · I2P messenger": "Kerberus · I2P messenger",
@@ -454,8 +489,87 @@ _ENGLISH.update({
     "Test completato: dovresti sentire la registrazione sul dispositivo di uscita scelto.":
         "Test complete: you should hear the recording on the selected output device.",
     "È già in corso una registrazione.": "A recording is already in progress.",
+    "Aspetto": "Appearance",
+    "Tema e interfaccia": "Theme and interface",
+    "Personalizza colori, leggibilità e spaziatura dei controlli.":
+        "Customize colors, readability, and control spacing.",
+    "Tema dell’applicazione": "Application theme",
+    "Cambia la palette di tutta l’interfaccia senza riavviare Kerberus.":
+        "Change the entire interface palette without restarting Kerberus.",
+    "Predefinito": "Default", "Rosa": "Pink", "Arancione": "Orange",
+    "Bianco": "White", "Scuro": "Dark",
+    "Dimensione del testo": "Text size",
+    "Aumenta o riduci il testo mantenendo invariato il contenuto.":
+        "Increase or reduce text size without changing content.",
+    "Densità dell’interfaccia": "Interface density",
+    "Regola lo spazio verticale di pulsanti, menu e campi.":
+        "Adjust the vertical spacing of buttons, menus, and fields.",
+    "Compatta": "Compact", "Bilanciata": "Balanced", "Spaziosa": "Spacious",
+    "Anteprima palette": "Palette preview",
+    "Le modifiche di aspetto vengono applicate immediatamente e salvate nel vault locale.":
+        "Appearance changes are applied immediately and stored in the local vault.",
+    "Emoji e simboli": "Emoji and symbols",
+    "Scegli un’emoji o cercala per nome.": "Choose an emoji or search for it by name.",
+    "Reazioni al messaggio": "Message reactions",
+    "Chiudi pannello emoji": "Close emoji panel",
+    "Apri menu emoji": "Open emoji menu",
+    "Evento protocollo": "Protocol event",
+    "Apertura Console UI": "Opening UI console",
+    "Apertura Impostazioni": "Opening Settings",
+    "Apertura Nuovo contatto": "Opening New contact",
+    "Apertura Profilo": "Opening Profile",
+    "Apertura Stato I2P": "Opening I2P status",
+    "Invio messaggio richiesto": "Message send requested",
+    "Impostazioni privacy aggiornate": "Privacy settings updated",
+    "Policy rete e ricevute aggiornata": "Network and receipt policy updated",
+    "Dispositivi audio aggiornati": "Audio devices updated",
+    "Aspetto dell’interfaccia aggiornato": "Interface appearance updated",
+    "Richiesta contatto annullata localmente": "Contact request cancelled locally",
+    "Conferma contatto restituita sullo stesso stream I2P":
+        "Contact confirmation returned over the same I2P stream",
+    "Conferma contatto inserita nella coda I2P": "Contact confirmation added to the I2P queue",
+    "Il contatto ha aggiornato la visibilità del proprio Identity ID":
+        "The contact updated the visibility of their Identity ID",
+    "Nessuna conferma ricevuta entro 10 minuti": "No confirmation received within 10 minutes",
+    "Frame affidato a SAM; attendo la conferma firmata del destinatario":
+        "Frame handed to SAM; waiting for the recipient’s signed confirmation",
+    "Messaggio consegnato e confermato": "Message delivered and confirmed",
 })
 _ITALIAN = {value: key for key, value in _ENGLISH.items()}
+
+_RUNTIME_ENGLISH_REPLACEMENTS = (
+    ("Evento protocollo", "Protocol event"),
+    ("Impostazioni privacy aggiornate", "Privacy settings updated"),
+    ("Policy rete e ricevute aggiornata", "Network and receipt policy updated"),
+    ("Dispositivi audio aggiornati", "Audio devices updated"),
+    ("Aspetto dell’interfaccia aggiornato", "Interface appearance updated"),
+    ("Richiesta contatto annullata localmente", "Contact request cancelled locally"),
+    ("Conferma contatto restituita sullo stesso stream I2P", "Contact confirmation returned over the same I2P stream"),
+    ("Conferma contatto inserita nella coda I2P", "Contact confirmation added to the I2P queue"),
+    ("Il contatto ha aggiornato la visibilità del proprio Identity ID", "The contact updated the visibility of their Identity ID"),
+    ("Nessuna conferma ricevuta entro 10 minuti", "No confirmation received within 10 minutes"),
+    ("Frame affidato a SAM; attendo la conferma firmata del destinatario", "Frame handed to SAM; waiting for the recipient’s signed confirmation"),
+    ("Messaggio consegnato e confermato", "Message delivered and confirmed"),
+    ("Frame I2P ricevuto ma rifiutato", "I2P frame received but rejected"),
+    ("Retry immediato", "Immediate retry"),
+    (" messaggi", " messages"),
+    (" contatti", " contacts"),
+    (" conferme", " confirmations"),
+    ("Profilo I2P applicato", "I2P profile applied"),
+    ("bassa latenza", "low latency"),
+    ("massima privacy", "maximum privacy"),
+    ("Messaggio vocale cifrato ricevuto da", "Encrypted voice message received from"),
+    ("Messaggio cifrato ricevuto da", "Encrypted message received from"),
+    ("Ritrasmissione valida ricevuta da", "Valid retransmission received from"),
+    ("Richiesta valida ricevuta da", "Valid request received from"),
+    ("Contatto confermato", "Contact confirmed"),
+    ("Destinatario non raggiungibile; nuovo tentativo automatico", "Recipient unreachable; new automatic attempt"),
+    ("Conferma di protocollo in coda; retry I2P", "Protocol confirmation queued; I2P retry"),
+    ("Errore nella coda", "Queue error"),
+    ("Invio I2P fallito dopo", "I2P send failed after"),
+    ("Frame scritto sullo stream in", "Frame written to the stream in"),
+    ("attendo conferma cifrata", "waiting for encrypted ACK"),
+)
 
 
 def set_language(language: str) -> None:
@@ -469,6 +583,18 @@ def tr(text: str) -> str:
 
 def tr_format(text: str, **values: object) -> str:
     return tr(text).format(**values)
+
+
+def tr_runtime(text: str) -> str:
+    """Translate diagnostic text that may contain runtime values."""
+    if _LANGUAGE != "en":
+        return tr(text)
+    translated = _ENGLISH.get(text)
+    if translated is not None:
+        return translated
+    for italian, english in _RUNTIME_ENGLISH_REPLACEMENTS:
+        text = text.replace(italian, english)
+    return text
 
 
 def localize_widget(root: QWidget) -> None:
@@ -562,10 +688,15 @@ def set_avatar(label: QLabel, identity: IdentityBundle, size: int) -> None:
     label.setPixmap(avatar_pixmap(identity, size))
 
 
-STYLE = f"""
+def build_style(text_scale: int = 100, density: str = "comfortable") -> str:
+    font_size = max(12, min(18, round(14 * text_scale / 100)))
+    control_padding = {"compact": 7, "comfortable": 9, "spacious": 12}.get(density, 9)
+    field_padding = {"compact": 8, "comfortable": 10, "spacious": 13}.get(density, 10)
+    nav_padding = {"compact": 8, "comfortable": 11, "spacious": 14}.get(density, 11)
+    return f"""
 * {{
     font-family: "Segoe UI";
-    font-size: 14px;
+    font-size: {font_size}px;
     color: {COLORS['text']};
 }}
 QMainWindow {{ background: transparent; }}
@@ -576,6 +707,12 @@ QFrame#sidebar {{ background: {COLORS['sidebar']}; border-right: 1px solid {COLO
 QFrame#topbar {{ background: {COLORS['window']}; border-bottom: 1px solid {COLORS['border']}; }}
 QFrame#composer {{ background: {COLORS['window']}; border-top: 1px solid {COLORS['border']}; }}
 QFrame#emojiPanel {{ background: {COLORS['sidebar']}; border-top: 1px solid {COLORS['border']}; }}
+QFrame#emojiHeader {{ background: transparent; border: 0; }}
+QLabel#emojiPanelTitle {{ color: {COLORS['text']}; font-size: 16px; font-weight: 700; }}
+QLineEdit#emojiSearch {{ background: {COLORS['window']}; border-radius: 9px; }}
+QFrame#emojiCategories {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 9px; }}
+QScrollArea#emojiScroll {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}
+QFrame#emojiFooter {{ background: {COLORS['sidebar']}; border: 0; border-top: 1px solid {COLORS['border']}; }}
 QFrame#settingsSidebar {{ background: {COLORS['sidebar']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}
 QFrame#settingsCard {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}
 QFrame#settingsRow {{ background: transparent; border-top: 1px solid {COLORS['border']}; }}
@@ -596,7 +733,7 @@ QLineEdit, QPlainTextEdit {{
     background: {COLORS['surface_2']};
     border: 1px solid {COLORS['border']};
     border-radius: 7px;
-    padding: 10px 12px;
+    padding: {field_padding}px 12px;
     selection-background-color: {COLORS['accent_dark']};
 }}
 QLineEdit:focus, QPlainTextEdit:focus {{ border-color: {COLORS['accent']}; }}
@@ -604,16 +741,16 @@ QPushButton {{
     background: {COLORS['surface_2']};
     border: 1px solid {COLORS['border']};
     border-radius: 7px;
-    padding: 9px 14px;
+    padding: {control_padding}px 14px;
     font-weight: 600;
 }}
-QPushButton:hover {{ background: {COLORS['surface_3']}; border-color: #46515e; }}
-QPushButton:pressed {{ background: #101419; }}
+QPushButton:hover {{ background: {COLORS['surface_3']}; border-color: {COLORS['faint']}; }}
+QPushButton:pressed {{ background: {COLORS['sidebar']}; }}
 QPushButton#primary {{ background: {COLORS['accent']}; color: #07120e; border: 0; }}
 QPushButton#primary:hover {{ background: {COLORS['accent_hover']}; }}
 QPushButton#ghost {{ background: transparent; border: 0; color: {COLORS['muted']}; }}
 QPushButton#ghost:hover {{ color: {COLORS['text']}; background: {COLORS['surface_2']}; }}
-QPushButton#settingsNav {{ background: transparent; border: 0; padding: 11px 12px; text-align: left; color: {COLORS['muted']}; }}
+QPushButton#settingsNav {{ background: transparent; border: 0; padding: {nav_padding}px 12px; text-align: left; color: {COLORS['muted']}; }}
 QPushButton#settingsNav:hover {{ background: {COLORS['surface_2']}; color: {COLORS['text']}; }}
 QPushButton#settingsNav:checked {{ background: {COLORS['accent_dark']}; color: {COLORS['accent']}; }}
 QToolButton {{
@@ -625,13 +762,22 @@ QToolButton {{
 QToolButton:hover {{ background: {COLORS['surface_2']}; }}
 QToolButton#sendButton {{ background: {COLORS['accent']}; color: #07120e; }}
 QToolButton#sendButton:hover {{ background: {COLORS['accent_hover']}; }}
+QToolButton#attachmentButton {{ background: {COLORS['surface_2']}; border: 1px solid {COLORS['border']}; border-radius: 24px; }}
+QToolButton#attachmentButton:hover {{ background: {COLORS['surface_3']}; border-color: {COLORS['accent']}; }}
 QToolButton#timingButton {{ padding: 1px; border-radius: 4px; }}
-QToolButton#emojiToggle[active="true"] {{ background: {COLORS['accent_dark']}; color: {COLORS['accent']}; }}
+QToolButton#emojiToggle {{ border: 1px solid transparent; }}
+QToolButton#emojiToggle:hover {{ border-color: {COLORS['border']}; }}
+QToolButton#emojiToggle[active="true"] {{ background: {COLORS['accent_dark']}; border-color: {COLORS['accent']}; color: {COLORS['accent']}; }}
 QToolButton#chatSettingsToggle[active="true"] {{ background: {COLORS['accent_dark']}; color: {COLORS['accent']}; }}
-QToolButton#emojiCategory {{ border-radius: 6px; padding: 4px; }}
+QToolButton#emojiCategory {{ background: transparent; border-radius: 7px; padding: 4px; }}
+QToolButton#emojiCategory:hover {{ background: {COLORS['surface_2']}; }}
 QToolButton#emojiCategory[active="true"] {{ background: {COLORS['accent_dark']}; color: {COLORS['accent']}; }}
-QToolButton#emojiItem {{ border-radius: 7px; padding: 2px; }}
-QToolButton#emojiItem:hover {{ background: {COLORS['surface_3']}; }}
+QToolButton#emojiItem {{ background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 2px; }}
+QToolButton#emojiItem:hover {{ background: {COLORS['surface_3']}; border-color: {COLORS['border']}; }}
+QToolButton#emojiPager {{ background: {COLORS['surface_2']}; border: 1px solid {COLORS['border']}; border-radius: 7px; padding: 5px; }}
+QToolButton#emojiPager:hover {{ background: {COLORS['surface_3']}; border-color: {COLORS['faint']}; }}
+QToolButton#emojiClose {{ background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 6px; }}
+QToolButton#emojiClose:hover {{ background: {COLORS['surface_2']}; border-color: {COLORS['border']}; }}
 QToolButton#windowButton {{ border-radius: 0; padding: 0; }}
 QToolButton#windowButton:hover {{ background: {COLORS['surface_3']}; }}
 QToolButton#closeButton {{ border-radius: 0; padding: 0; }}
@@ -639,11 +785,11 @@ QToolButton#closeButton:hover {{ background: {COLORS['danger']}; }}
 QListWidget {{ background: transparent; border: 0; outline: 0; padding: 0; }}
 QListWidget::item {{ border: 0; padding: 0; }}
 QListWidget::item:selected {{ background: {COLORS['surface_2']}; border-radius: 6px; }}
-QListWidget::item:hover:!selected {{ background: #181e24; border-radius: 6px; }}
+QListWidget::item:hover:!selected {{ background: {COLORS['surface_2']}; border-radius: 6px; }}
 QScrollArea {{ background: transparent; border: 0; }}
 QScrollBar:vertical {{ background: transparent; width: 14px; margin: 2px 2px 2px 0; }}
-QScrollBar::handle:vertical {{ background: #3a434e; border-radius: 5px; min-height: 42px; }}
-QScrollBar::handle:vertical:hover {{ background: #566270; }}
+QScrollBar::handle:vertical {{ background: {COLORS['border']}; border-radius: 5px; min-height: 42px; }}
+QScrollBar::handle:vertical:hover {{ background: {COLORS['faint']}; }}
 QScrollBar::handle:vertical:pressed {{ background: {COLORS['accent']}; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
@@ -654,10 +800,10 @@ QComboBox {{
     border: 1px solid {COLORS['border']};
     border-radius: 8px;
     min-height: 20px;
-    padding: 9px 42px 9px 12px;
+    padding: {control_padding}px 42px {control_padding}px 12px;
     selection-background-color: {COLORS['accent_dark']};
 }}
-QComboBox:hover {{ background: {COLORS['surface_3']}; border-color: #46515e; }}
+QComboBox:hover {{ background: {COLORS['surface_3']}; border-color: {COLORS['faint']}; }}
 QComboBox:focus, QComboBox:on {{ border-color: {COLORS['accent']}; }}
 QComboBox:disabled {{ color: {COLORS['faint']}; background: {COLORS['surface']}; }}
 QComboBox::drop-down {{
@@ -671,7 +817,7 @@ QComboBox::drop-down {{
 QComboBox::down-arrow {{ image: url("{(ICON_DIR / 'chevron-down.svg').as_posix()}"); width: 15px; height: 15px; }}
 QComboBox QAbstractItemView {{
     background: {COLORS['surface_2']};
-    border: 1px solid #46515e;
+    border: 1px solid {COLORS['faint']};
     border-radius: 8px;
     padding: 6px;
     outline: 0;
@@ -681,7 +827,7 @@ QComboBox QAbstractItemView {{
 QComboBox QAbstractItemView::item {{ min-height: 36px; padding: 7px 11px; border-radius: 6px; }}
 QFrame#dropdownPopup {{
     background: {COLORS['surface_2']};
-    border: 1px solid #46515e;
+    border: 1px solid {COLORS['faint']};
     border-radius: 10px;
 }}
 QFrame#dropdownOptionHost {{ background: {COLORS['surface_2']}; border: 0; }}
@@ -695,7 +841,7 @@ QPushButton#dropdownOption {{
     text-align: left;
 }}
 QPushButton#dropdownOption:hover {{ background: {COLORS['surface_3']}; }}
-QPushButton#dropdownOption:focus {{ background: {COLORS['surface_3']}; border: 1px solid #46515e; }}
+QPushButton#dropdownOption:focus {{ background: {COLORS['surface_3']}; border: 1px solid {COLORS['faint']}; }}
 QPushButton#dropdownOption:pressed {{ background: {COLORS['accent_dark']}; }}
 QPushButton#dropdownOption[selected="true"] {{
     background: {COLORS['accent_dark']};
@@ -716,6 +862,24 @@ QMenu::separator {{ height: 1px; background: {COLORS['border']}; margin: 6px 8px
 QMenu::right-arrow {{ image: url("{(ICON_DIR / 'chevron-right.svg').as_posix()}"); width: 13px; height: 13px; }}
 QCheckBox {{ spacing: 9px; }}
 """
+
+
+STYLE = build_style()
+
+
+def apply_appearance(theme: str, text_scale: int, density: str) -> tuple[str, int, str]:
+    """Apply a validated palette, text scale and control density application-wide."""
+    global STYLE
+    selected_theme = theme if theme in THEMES else "default"
+    selected_scale = text_scale if text_scale in {90, 100, 110, 120} else 100
+    selected_density = density if density in {"compact", "comfortable", "spacious"} else "comfortable"
+    COLORS.clear()
+    COLORS.update(THEMES[selected_theme])
+    STYLE = build_style(selected_scale, selected_density)
+    application = QApplication.instance()
+    if application is not None:
+        application.setStyleSheet(STYLE)
+    return selected_theme, selected_scale, selected_density
 
 
 def set_window_capture_exclusion(window: QWidget, enabled: bool) -> tuple[bool, str]:
@@ -961,6 +1125,18 @@ def reaction_groups(reactions: object) -> tuple[tuple[str, tuple[str, ...]], ...
     return tuple((emoji, tuple(owners)) for emoji, owners in grouped.items())
 
 
+def format_file_size(value: object) -> str:
+    try:
+        size = max(0, int(value))
+    except (TypeError, ValueError):
+        size = 0
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 class ChatMessageDelegate(QStyledItemDelegate):
     def __init__(self, view: "VirtualChatView"):
         super().__init__(view)
@@ -973,6 +1149,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
         self.preview_cache: dict[str, dict] = {}
         self.preview_requested: Callable[[str], None] | None = None
         self._preview_images: dict[str, QImage] = {}
+        self._attachment_images: dict[str, QImage] = {}
 
     def configure(
         self,
@@ -1166,7 +1343,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
         current: list[tuple[str, tuple[str, ...], str, int]] = []
         used = 0
         for emoji, owners in groups:
-            text = f"{emoji} {len(owners)}" if len(owners) > 1 else emoji
+            text = f"{emoji} {len(owners)}"
             width = min(maximum_width, metrics.horizontalAdvance(text) + 20)
             required = width + (5 if current else 0)
             if current and used + required > maximum_width:
@@ -1191,16 +1368,12 @@ class ChatMessageDelegate(QStyledItemDelegate):
         if not isinstance(rows, tuple) or not rows:
             return []
         bubble_rect = self._bubble_rect(row_rect, geometry)
-        x = bubble_rect.left() + 14
-        y = (
-            bubble_rect.top() + 10 + int(geometry["author_height"])
-            + int(geometry["body_height"]) + 5 + int(geometry["link_height"])
-        )
-        content_width = bubble_rect.width() - 28
+        outgoing = bool(geometry["outgoing"])
+        y = bubble_rect.bottom() + 4
         regions: list[tuple[str, tuple[str, ...], QRect]] = []
         for row in rows:
             row_width = sum(chip[3] for chip in row) + max(0, len(row) - 1) * 5
-            cursor_x = x + content_width - row_width
+            cursor_x = bubble_rect.right() - row_width + 1 if outgoing else bubble_rect.left()
             for emoji, owners, _text, width in row:
                 rect = QRect(cursor_x, y, width, 22)
                 regions.append((emoji, owners, rect))
@@ -1228,6 +1401,63 @@ class ChatMessageDelegate(QStyledItemDelegate):
         )
         return region.contains(position)
 
+    def _attachment_image(self, message: dict) -> QImage | None:
+        attachment = message.get("attachment")
+        if not isinstance(attachment, dict) or not str(attachment.get("mime", "")).startswith("image/"):
+            return None
+        cache_key = f"{message.get('message_id', '')}:{attachment.get('sha256', '')}"
+        cached = self._attachment_images.get(cache_key)
+        if cached is not None:
+            return cached if not cached.isNull() else None
+        image = QImage()
+        try:
+            encoded = str(attachment.get("data", "")).encode("ascii")
+            image.loadFromData(base64.b64decode(encoded, validate=True))
+        except (ValueError, UnicodeEncodeError):
+            pass
+        self._attachment_images[cache_key] = image
+        return image if not image.isNull() else None
+
+    def attachment_action_at(self, message: dict, row_rect: QRect, font: QFont, position: QPoint) -> str:
+        geometry = self._layout(message, row_rect.width(), font)
+        if not bool(geometry.get("attachment_message")):
+            return ""
+        bubble_rect = self._bubble_rect(row_rect, geometry)
+        x = bubble_rect.left() + 14
+        y = bubble_rect.top() + 10 + int(geometry["author_height"])
+        width = bubble_rect.width() - 28
+        content_height = int(geometry.get("attachment_content_height", geometry["body_height"]))
+        state = str(geometry.get("attachment_state", "complete"))
+        if state in {"transferring", "paused"}:
+            controls_y = y + content_height + 12
+            pause_button = QRect(x + width - 202, controls_y, 96, 30)
+            cancel_button = QRect(x + width - 100, controls_y, 96, 30)
+            if pause_button.contains(position):
+                return "resume_attachment" if state == "paused" else "pause_attachment"
+            if cancel_button.contains(position):
+                return "cancel_attachment"
+            return ""
+        if state != "complete":
+            return ""
+        if bool(geometry.get("attachment_video")):
+            return "play_video" if QRect(x, y, width, content_height - 30).contains(position) else ""
+        if not bool(geometry.get("attachment_image")):
+            button = QRect(x + width - 104, y + 17, 96, 36)
+            return "save_attachment" if button.contains(position) else ""
+        return ""
+
+    def video_rect(self, message: dict, row_rect: QRect, font: QFont) -> QRect:
+        geometry = self._layout(message, row_rect.width(), font)
+        if not bool(geometry.get("attachment_video")) or str(geometry.get("attachment_state", "complete")) != "complete":
+            return QRect()
+        bubble_rect = self._bubble_rect(row_rect, geometry)
+        return QRect(
+            bubble_rect.left() + 14,
+            bubble_rect.top() + 10 + int(geometry["author_height"]),
+            bubble_rect.width() - 28,
+            int(geometry.get("attachment_content_height", geometry["body_height"])) - 30,
+        )
+
     def _layout(self, message: dict, width: int, font: QFont) -> dict[str, object]:
         outgoing = message.get("direction") == "out"
         identity = self.local_identity if outgoing else self.remote_identity
@@ -1237,11 +1467,21 @@ class ChatMessageDelegate(QStyledItemDelegate):
         display_text = text.strip()
         voice = message.get("voice") if message.get("kind") == "voice" else None
         voice_message = isinstance(voice, dict)
+        attachment = message.get("attachment") if message.get("kind") == "attachment" else None
+        attachment_message = isinstance(attachment, dict)
+        attachment_mime = str(attachment.get("mime", "")) if attachment_message else ""
+        attachment_image_data = self._attachment_image(message) if attachment_message else None
+        attachment_image = attachment_mime.startswith("image/") and attachment_image_data is not None
+        attachment_video = attachment_mime.startswith("video/")
+        attachment_state = str(attachment.get("state", "complete")) if attachment_message else ""
+        attachment_active = attachment_state in {"transferring", "paused"}
         duration_ms = int(voice.get("duration_ms", 0)) if voice_message else 0
         duration_text = f"{duration_ms // 60000}:{duration_ms // 1000 % 60:02d}"
         if voice_message:
             display_text = f"Messaggio vocale  {duration_text}"
-        emoji_reaction = not voice_message and is_emoji_reaction(text)
+        if attachment_message:
+            display_text = str(attachment.get("name", "Allegato"))
+        emoji_reaction = not voice_message and not attachment_message and is_emoji_reaction(text)
         body_font = QFont(font)
         if emoji_reaction:
             body_font.setFamilies(["Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"])
@@ -1259,44 +1499,51 @@ class ChatMessageDelegate(QStyledItemDelegate):
 
         lines = display_text.splitlines() or [""]
         natural_text_width = max((body_metrics.horizontalAdvance(line) for line in lines), default=0)
-        urls = () if voice_message else extract_urls(display_text)
+        urls = () if voice_message or attachment_message else extract_urls(display_text)
         link = urls[0] if self.link_previews and urls else ""
         preview = self.preview_cache.get(link) if link else None
         reactions = message.get("reactions", {})
         reaction_values = tuple(emoji for _owner, emoji in reaction_items(reactions))
         grouped_reactions = reaction_groups(reactions)
-        preliminary_rows = self._reaction_rows(grouped_reactions, font, max_text_width)
-        reaction_width = max(
-            (sum(chip[3] for chip in row) + max(0, len(row) - 1) * 5 for row in preliminary_rows),
-            default=0,
-        )
-        minimum_content_width = 230 if voice_message else (80 if emoji_reaction else 72)
+        minimum_content_width = 360 if attachment_message else (230 if voice_message else (80 if emoji_reaction else 72))
         natural_content_width = max(
             minimum_content_width,
             natural_text_width,
             author_width,
             metadata_width,
-            reaction_width,
             320 if link else 0,
         )
         text_width = min(max_text_width, natural_content_width)
         bubble_width = min(max_bubble_width, max(108 if emoji_reaction else 100, text_width + 28))
         text_width = bubble_width - 28
-        reaction_rows = self._reaction_rows(grouped_reactions, font, text_width)
+        reaction_rows = self._reaction_rows(grouped_reactions, font, max_bubble_width)
+        attachment_content_height = 0
         if voice_message:
             body_height = 42
+        elif attachment_image:
+            image_height = round(attachment_image_data.height() * text_width / max(1, attachment_image_data.width()))
+            attachment_content_height = min(270, max(120, image_height)) + 30
+            body_height = attachment_content_height
+        elif attachment_video:
+            attachment_content_height = 210
+            body_height = attachment_content_height
+        elif attachment_message:
+            attachment_content_height = 72
+            body_height = attachment_content_height
         elif emoji_reaction:
             body_height = body_metrics.height() + 4
         else:
             text_layout = self._body_layout(display_text, body_font, text_width)
             body_height = int(text_layout.boundingRect().height() + 0.999)
+        if attachment_active:
+            body_height += 50
         body_height = max(body_height, 20)
         author_height = 18 if identity is not None else 0
         preview_geometry = self._preview_layout(link, preview, text_width, font) if link else None
         link_height = int(preview_geometry["height"]) + 8 if preview_geometry is not None else 0
         reaction_height = len(reaction_rows) * 26
-        bubble_height = 18 + author_height + body_height + link_height + reaction_height + 23
-        row_height = max(54, bubble_height + 8)
+        bubble_height = 18 + author_height + body_height + link_height + 23
+        row_height = max(54, bubble_height + reaction_height + 8)
         return {
             "outgoing": outgoing,
             "identity": identity,
@@ -1320,6 +1567,14 @@ class ChatMessageDelegate(QStyledItemDelegate):
             "emoji_reaction": emoji_reaction,
             "voice_message": voice_message,
             "voice_duration": duration_text,
+            "attachment_message": attachment_message,
+            "attachment": attachment,
+            "attachment_image": attachment_image,
+            "attachment_video": attachment_video,
+            "attachment_image_data": attachment_image_data,
+            "attachment_state": attachment_state,
+            "attachment_active": attachment_active,
+            "attachment_content_height": attachment_content_height,
             "metadata": metadata,
         }
 
@@ -1382,7 +1637,110 @@ class ChatMessageDelegate(QStyledItemDelegate):
         painter.setFont(geometry["body_font"])
         painter.setPen(QColor(COLORS["text"]))
         body_height = int(geometry["body_height"])
-        if bool(geometry.get("voice_message")):
+        if bool(geometry.get("attachment_message")):
+            attachment = geometry.get("attachment")
+            attachment = attachment if isinstance(attachment, dict) else {}
+            name = str(attachment.get("name", tr("Allegato")))
+            details = f"{format_file_size(attachment.get('size'))} · {str(attachment.get('mime', 'application/octet-stream'))}"
+            attachment_state = str(geometry.get("attachment_state", "complete"))
+            attachment_active = bool(geometry.get("attachment_active"))
+            attachment_rect = QRect(x, y, content_width, int(geometry.get("attachment_content_height", body_height)))
+            painter.setPen(QPen(QColor(COLORS["border"]), 1))
+            painter.setBrush(QColor(COLORS["surface"] if outgoing else COLORS["surface_3"]))
+            painter.drawRoundedRect(attachment_rect, 9, 9)
+            if bool(geometry.get("attachment_image")):
+                image_rect = attachment_rect.adjusted(1, 1, -1, -30)
+                image = geometry.get("attachment_image_data")
+                if isinstance(image, QImage) and not image.isNull():
+                    scaled = image.scaled(
+                        image_rect.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    target = QRect(
+                        image_rect.left() + (image_rect.width() - scaled.width()) // 2,
+                        image_rect.top() + (image_rect.height() - scaled.height()) // 2,
+                        scaled.width(), scaled.height(),
+                    )
+                    painter.drawImage(target, scaled)
+                painter.setPen(QColor(COLORS["muted"]))
+                painter.drawText(
+                    QRect(attachment_rect.left() + 10, attachment_rect.bottom() - 28, attachment_rect.width() - 20, 24),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    QFontMetrics(option.font).elidedText(name, Qt.TextElideMode.ElideMiddle, attachment_rect.width() - 20),
+                )
+            elif bool(geometry.get("attachment_video")):
+                video_rect = attachment_rect.adjusted(1, 1, -1, -30)
+                painter.setBrush(QColor("#080a0d"))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(video_rect, 8, 8)
+                circle = QRect(video_rect.center().x() - 27, video_rect.center().y() - 27, 54, 54)
+                painter.setBrush(QColor(COLORS["accent_dark"]))
+                painter.setPen(QPen(QColor(COLORS["accent"]), 1))
+                painter.drawEllipse(circle)
+                play = QPainterPath()
+                play.moveTo(circle.left() + 22, circle.top() + 15)
+                play.lineTo(circle.left() + 22, circle.bottom() - 15)
+                play.lineTo(circle.right() - 14, circle.center().y())
+                play.closeSubpath()
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(COLORS["accent"]))
+                painter.drawPath(play)
+                painter.setPen(QColor(COLORS["muted"]))
+                painter.drawText(
+                    QRect(attachment_rect.left() + 10, attachment_rect.bottom() - 28, attachment_rect.width() - 20, 24),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    QFontMetrics(option.font).elidedText(name, Qt.TextElideMode.ElideMiddle, attachment_rect.width() - 20),
+                )
+            else:
+                painter.setPen(QColor(COLORS["text"]))
+                name_font = QFont(option.font)
+                name_font.setBold(True)
+                painter.setFont(name_font)
+                text_space = attachment_rect.width() - (128 if attachment_state == "complete" else 24)
+                painter.drawText(
+                    QRect(attachment_rect.left() + 12, attachment_rect.top() + 10, text_space, 24),
+                    int(Qt.AlignmentFlag.AlignVCenter),
+                    QFontMetrics(name_font).elidedText(name, Qt.TextElideMode.ElideMiddle, text_space),
+                )
+                painter.setFont(option.font)
+                painter.setPen(QColor(COLORS["muted"]))
+                painter.drawText(
+                    QRect(attachment_rect.left() + 12, attachment_rect.top() + 35, attachment_rect.width() - 128, 20),
+                    int(Qt.AlignmentFlag.AlignVCenter), details,
+                )
+                if attachment_state == "complete":
+                    button = QRect(attachment_rect.right() - 103, attachment_rect.top() + 17, 95, 36)
+                    painter.setPen(QPen(QColor(COLORS["accent"]), 1))
+                    painter.setBrush(QColor(COLORS["accent_dark"]))
+                    painter.drawRoundedRect(button, 8, 8)
+                    painter.setPen(QColor(COLORS["accent"]))
+                    painter.drawText(button, int(Qt.AlignmentFlag.AlignCenter), tr("Salva file"))
+            if attachment_active:
+                progress = max(0, min(100, int(attachment.get("progress", 0))))
+                progress_y = attachment_rect.bottom() + 7
+                progress_rect = QRect(attachment_rect.left(), progress_y, attachment_rect.width(), 6)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(COLORS["surface_3"]))
+                painter.drawRoundedRect(progress_rect, 3, 3)
+                if progress:
+                    painter.setBrush(QColor(COLORS["accent"]))
+                    painter.drawRoundedRect(QRect(progress_rect.left(), progress_rect.top(), round(progress_rect.width() * progress / 100), 6), 3, 3)
+                controls_y = progress_y + 11
+                painter.setPen(QColor(COLORS["muted"]))
+                painter.drawText(QRect(attachment_rect.left(), controls_y, 70, 30), int(Qt.AlignmentFlag.AlignVCenter), f"{progress}%")
+                pause_button = QRect(attachment_rect.right() - 201, controls_y, 96, 30)
+                cancel_button = QRect(attachment_rect.right() - 99, controls_y, 96, 30)
+                for button, label, danger in (
+                    (pause_button, tr("Riprendi") if attachment_state == "paused" else tr("Metti in pausa"), False),
+                    (cancel_button, tr("Annulla"), True),
+                ):
+                    color = COLORS["danger"] if danger else COLORS["accent"]
+                    painter.setPen(QPen(QColor(color), 1))
+                    painter.setBrush(QColor(COLORS["surface"]))
+                    painter.drawRoundedRect(button, 7, 7)
+                    painter.setPen(QColor(color))
+                    painter.drawText(button, int(Qt.AlignmentFlag.AlignCenter), label)
+        elif bool(geometry.get("voice_message")):
             voice_rect = QRect(x, y, content_width, body_height)
             painter.setPen(QPen(QColor(COLORS["accent"]), 1))
             painter.setBrush(QColor(COLORS["surface_3"]))
@@ -1444,7 +1802,7 @@ class ChatMessageDelegate(QStyledItemDelegate):
             local_id = self.local_identity.identity_id if self.local_identity is not None else ""
             group_by_emoji = {emoji: owners for emoji, owners in geometry.get("reaction_groups", ())}
             text_by_emoji = {
-                emoji: f"{emoji} {len(owners)}" if len(owners) > 1 else emoji
+                emoji: f"{emoji} {len(owners)}"
                 for emoji, owners in group_by_emoji.items()
             }
             for emoji, owners, reaction_rect in reaction_regions:
@@ -1592,7 +1950,14 @@ class VirtualChatView(QListView):
         self._pressed_link = ""
         self._pressed_reaction = ""
         self._pressed_voice = False
+        self._pressed_attachment = ""
         self._pressed_position = QPoint()
+        self._video_message_id = ""
+        # Multimedia objects are relatively expensive and can initialize native
+        # backends.  Most chats never play a video, so create them only on demand.
+        self._video_widget: QVideoWidget | None = None
+        self._video_audio: QAudioOutput | None = None
+        self._video_player: QMediaPlayer | None = None
 
     def configure(
         self,
@@ -1617,12 +1982,15 @@ class VirtualChatView(QListView):
         if new_ids == old_ids:
             self.chat_model.update_messages(messages)
             self.viewport().update()
+            self._position_video_widget()
             return "updated"
         if len(new_ids) >= len(old_ids) and new_ids[:len(old_ids)] == old_ids:
             self.chat_model.update_messages(messages[:len(old_ids)])
             self.chat_model.append_messages(messages[len(old_ids):])
+            self._position_video_widget()
             return "appended"
         self.chat_model.set_messages(messages)
+        self._position_video_widget()
         return "reset"
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
@@ -1633,16 +2001,23 @@ class VirtualChatView(QListView):
         if not isinstance(message, dict):
             return
         menu = QMenu(self)
+        attachment = message.get("attachment") if message.get("kind") == "attachment" else None
+        attachment_state = str(attachment.get("state", "complete")) if isinstance(attachment, dict) else ""
         reaction_menu = menu.addMenu(tr("Reagisci"))
         reaction_actions = {
             reaction_menu.addAction(emoji): emoji for emoji in ("👍", "❤️", "😂", "😮", "😢", "🔥")
         }
         all_reactions = reaction_menu.addAction(tr("Tutte le emoji…"))
-        copy_action = menu.addAction(tr("Copia")) if message.get("kind") != "voice" else None
+        copy_action = menu.addAction(tr("Copia")) if message.get("kind") not in {"voice", "attachment"} else None
+        save_attachment = menu.addAction(tr("Salva allegato")) if message.get("kind") == "attachment" and attachment_state == "complete" else None
+        pause_attachment = menu.addAction(tr("Riprendi") if attachment_state == "paused" else tr("Metti in pausa")) \
+            if attachment_state in {"transferring", "paused"} else None
+        cancel_attachment = menu.addAction(tr("Annulla trasferimento")) if attachment_state in {"transferring", "paused"} else None
         timing_action = menu.addAction(tr("Dettagli di invio e ritardo"))
         link = extract_url(str(message.get("text", "")))
         open_link = menu.addAction(tr("Apri link")) if link else None
-        forward_action = menu.addAction(tr("Inoltra…"))
+        can_forward = message.get("kind") != "attachment" or attachment_state == "complete" or message.get("direction") == "out"
+        forward_action = menu.addAction(tr("Inoltra…")) if can_forward else None
         menu.addSeparator()
         delete_action = menu.addAction(tr("Elimina da questo dispositivo"))
         selected = menu.exec(event.globalPos())
@@ -1652,12 +2027,18 @@ class VirtualChatView(QListView):
             self.on_action("reaction_picker", message)
         elif copy_action is not None and selected is copy_action and self.on_action is not None:
             self.on_action("copy", message)
+        elif save_attachment is not None and selected is save_attachment and self.on_action is not None:
+            self.on_action("save_attachment", message)
+        elif pause_attachment is not None and selected is pause_attachment and self.on_action is not None:
+            self.on_action("resume_attachment" if attachment_state == "paused" else "pause_attachment", message)
+        elif cancel_attachment is not None and selected is cancel_attachment and self.on_action is not None:
+            self.on_action("cancel_attachment", message)
         elif selected is timing_action and self.on_timing is not None:
             self.on_timing(message)
         elif open_link is not None and selected is open_link and link:
             if self.on_open_link is not None:
                 self.on_open_link(link)
-        elif selected is forward_action and self.on_action is not None:
+        elif forward_action is not None and selected is forward_action and self.on_action is not None:
             self.on_action("forward", message)
         elif selected is delete_action and self.on_action is not None:
             self.on_action("delete", message)
@@ -1689,12 +2070,91 @@ class VirtualChatView(QListView):
             return False
         return self.chat_delegate.voice_at(message, self.visualRect(index), self.font(), position)
 
+    def _attachment_at_position(self, position: QPoint) -> str:
+        index = self.indexAt(position)
+        if not index.isValid():
+            return ""
+        message = index.data(ChatMessageModel.MessageRole)
+        if not isinstance(message, dict):
+            return ""
+        return self.chat_delegate.attachment_action_at(
+            message, self.visualRect(index), self.font(), position,
+        )
+
+    def play_inline_video(self, message_id: str, path: Path) -> None:
+        self._ensure_video_player()
+        assert self._video_player is not None
+        assert self._video_widget is not None
+        if message_id == self._video_message_id:
+            if self._video_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self._video_player.pause()
+            else:
+                self._video_player.play()
+            return
+        self._video_message_id = message_id
+        self._video_player.setSource(QUrl.fromLocalFile(str(path)))
+        self._position_video_widget()
+        self._video_widget.show()
+        self._video_widget.raise_()
+        self._video_player.play()
+
+    def _ensure_video_player(self) -> None:
+        if self._video_player is not None:
+            return
+        self._video_widget = QVideoWidget(self.viewport())
+        self._video_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._video_widget.hide()
+        self._video_audio = QAudioOutput(self)
+        self._video_player = QMediaPlayer(self)
+        self._video_player.setAudioOutput(self._video_audio)
+        self._video_player.setVideoOutput(self._video_widget)
+
+    def stop_inline_video(self) -> None:
+        if self._video_player is None or self._video_widget is None:
+            self._video_message_id = ""
+            return
+        self._video_player.stop()
+        self._video_player.setSource(QUrl())
+        self._video_message_id = ""
+        self._video_widget.hide()
+
+    def _position_video_widget(self) -> None:
+        if not self._video_message_id or self._video_widget is None:
+            return
+        row = next((
+            index for index, message in enumerate(self.chat_model.messages)
+            if str(message.get("message_id", "")) == self._video_message_id
+        ), -1)
+        if row < 0:
+            self.stop_inline_video()
+            return
+        index = self.chat_model.index(row, 0)
+        row_rect = self.visualRect(index)
+        if not row_rect.isValid() or not self.viewport().rect().intersects(row_rect):
+            self._video_widget.hide()
+            return
+        message = self.chat_model.messages[row]
+        rect = self.chat_delegate.video_rect(message, row_rect, self.font()).adjusted(1, 1, -1, -1)
+        if rect.isValid():
+            self._video_widget.setGeometry(rect)
+            self._video_widget.show()
+            self._video_widget.raise_()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        self._position_video_widget()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._position_video_widget()
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._pressed_position = event.position().toPoint()
             self._pressed_link = self._link_at_position(self._pressed_position)
             self._pressed_reaction = self._reaction_at_position(self._pressed_position)
             self._pressed_voice = self._voice_at_position(self._pressed_position)
+            self._pressed_attachment = self._attachment_at_position(self._pressed_position)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -1702,6 +2162,7 @@ class VirtualChatView(QListView):
         link = self._link_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
         reaction = self._reaction_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
         voice = self._voice_at_position(position) if event.button() == Qt.MouseButton.LeftButton else False
+        attachment = self._attachment_at_position(position) if event.button() == Qt.MouseButton.LeftButton else ""
         moved = (position - self._pressed_position).manhattanLength()
         if link and link == self._pressed_link and moved <= QApplication.startDragDistance():
             self._pressed_link = ""
@@ -1725,9 +2186,18 @@ class VirtualChatView(QListView):
             self._pressed_voice = False
             event.accept()
             return
+        if attachment and attachment == self._pressed_attachment and moved <= QApplication.startDragDistance():
+            index = self.indexAt(position)
+            message = index.data(ChatMessageModel.MessageRole) if index.isValid() else None
+            if self.on_action is not None and isinstance(message, dict):
+                self.on_action(attachment, message)
+            self._pressed_attachment = ""
+            event.accept()
+            return
         self._pressed_link = ""
         self._pressed_reaction = ""
         self._pressed_voice = False
+        self._pressed_attachment = ""
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -1736,6 +2206,7 @@ class VirtualChatView(QListView):
             self._link_at_position(position)
             or self._reaction_at_position(position)
             or self._voice_at_position(position)
+            or self._attachment_at_position(position)
         )
         self.viewport().setCursor(
             Qt.CursorShape.PointingHandCursor if interactive else Qt.CursorShape.ArrowCursor
@@ -2336,11 +2807,13 @@ class EmojiPanel(QFrame):
 
     PAGE_SIZE = 96
     selected = pyqtSignal(str)
+    close_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("emojiPanel")
-        self.setMaximumHeight(356)
+        self.setMinimumHeight(430)
+        self.setMaximumHeight(460)
         self._category = "recent"
         self._page = 0
         self._reaction_mode = False
@@ -2350,8 +2823,34 @@ class EmojiPanel(QFrame):
         self._category_buttons: dict[str, QToolButton] = {}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 12, 20, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(20, 14, 20, 14)
+        layout.setSpacing(10)
+
+        header = QFrame()
+        header.setObjectName("emojiHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+        heading = QVBoxLayout()
+        heading.setSpacing(2)
+        self.panel_title = QLabel("Emoji e simboli")
+        self.panel_title.setObjectName("emojiPanelTitle")
+        self.reaction_hint = QLabel("Scegli un’emoji o cercala per nome.")
+        self.reaction_hint.setObjectName("muted")
+        self.reaction_hint.setWordWrap(True)
+        heading.addWidget(self.panel_title)
+        heading.addWidget(self.reaction_hint)
+        close = QToolButton()
+        close.setObjectName("emojiClose")
+        close.setIcon(lucide_icon("x"))
+        close.setIconSize(QSize(17, 17))
+        close.setFixedSize(34, 34)
+        close.setToolTip("Chiudi pannello emoji")
+        close.clicked.connect(self.close_requested.emit)
+        header_layout.addLayout(heading, 1)
+        header_layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(header)
+
         self.search = QLineEdit()
         self.search.setObjectName("emojiSearch")
         self.search.setPlaceholderText("Cerca emoji…")
@@ -2359,15 +2858,11 @@ class EmojiPanel(QFrame):
         self.search.addAction(lucide_icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self._filter)
         layout.addWidget(self.search)
-        self.reaction_hint = QLabel(
-            "Puoi aggiungere più reazioni. Clicca con il tasto sinistro su una tua reazione per rimuoverla"
-        )
-        self.reaction_hint.setObjectName("muted")
-        self.reaction_hint.setWordWrap(True)
-        self.reaction_hint.hide()
-        layout.addWidget(self.reaction_hint)
 
-        categories = QHBoxLayout()
+        category_bar = QFrame()
+        category_bar.setObjectName("emojiCategories")
+        categories = QHBoxLayout(category_bar)
+        categories.setContentsMargins(6, 4, 6, 4)
         categories.setSpacing(4)
         for key, glyph, label in _EMOJI_CATEGORIES:
             button = QToolButton()
@@ -2380,7 +2875,7 @@ class EmojiPanel(QFrame):
             categories.addWidget(button)
             self._category_buttons[key] = button
         categories.addStretch()
-        layout.addLayout(categories)
+        layout.addWidget(category_bar)
 
         scroll = QScrollArea()
         scroll.setObjectName("emojiScroll")
@@ -2395,22 +2890,29 @@ class EmojiPanel(QFrame):
         scroll.setWidget(self.grid_host)
         layout.addWidget(scroll, 1)
 
-        footer = QHBoxLayout()
+        footer_frame = QFrame()
+        footer_frame.setObjectName("emojiFooter")
+        footer_frame.setFixedHeight(40)
+        footer = QHBoxLayout(footer_frame)
+        footer.setContentsMargins(2, 6, 0, 0)
+        footer.setSpacing(6)
         self.section_label = QLabel()
         self.section_label.setObjectName("muted")
         self.previous = QToolButton()
-        self.previous.setText("‹")
+        self.previous.setObjectName("emojiPager")
+        self.previous.setIcon(lucide_icon("chevron-left"))
         self.previous.setToolTip("Precedente")
         self.previous.clicked.connect(lambda: self._change_page(-1))
         self.next = QToolButton()
-        self.next.setText("›")
+        self.next.setObjectName("emojiPager")
+        self.next.setIcon(lucide_icon("chevron-right"))
         self.next.setToolTip("Successiva")
         self.next.clicked.connect(lambda: self._change_page(1))
         footer.addWidget(self.section_label)
         footer.addStretch()
         footer.addWidget(self.previous)
         footer.addWidget(self.next)
-        layout.addLayout(footer)
+        layout.addWidget(footer_frame)
         self.set_category("recent")
 
     def set_category(self, category: str) -> None:
@@ -2427,7 +2929,11 @@ class EmojiPanel(QFrame):
 
     def set_reaction_mode(self, enabled: bool) -> None:
         self._reaction_mode = enabled
-        self.reaction_hint.setVisible(enabled)
+        self.panel_title.setText(tr("Reazioni al messaggio" if enabled else "Emoji e simboli"))
+        self.reaction_hint.setText(tr(
+            "Puoi aggiungere più reazioni. Clicca con il tasto sinistro su una tua reazione per rimuoverla"
+            if enabled else "Scegli un’emoji o cercala per nome."
+        ))
         self._render()
 
     def _update_category_buttons(self) -> None:
@@ -3473,6 +3979,7 @@ class KerberusWindow(QMainWindow):
         self._voice_player: QMediaPlayer | None = None
         self._voice_audio_output: QAudioOutput | None = None
         self._voice_buffer: QBuffer | None = None
+        self._attachment_temp_dir = tempfile.TemporaryDirectory(prefix="kerberus-media-")
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Kerberus")
@@ -3509,6 +4016,12 @@ class KerberusWindow(QMainWindow):
             )
             return False
         set_language(str(self.service.settings().get("language", "it")))
+        appearance = self.service.settings()
+        apply_appearance(
+            str(appearance.get("theme", "default")),
+            int(appearance.get("text_scale", 100)),
+            str(appearance.get("ui_density", "comfortable")),
+        )
         if not self.service.identity():
             name, ok = self._ask_name()
             if not ok:
@@ -3565,6 +4078,9 @@ class KerberusWindow(QMainWindow):
         self._log_action("UI pronta")
 
     def _create_resize_handles(self) -> None:
+        for handle in getattr(self, "_resize_handles", []):
+            handle.hide()
+            handle.deleteLater()
         edge_sets = (
             Qt.Edge.TopEdge,
             Qt.Edge.BottomEdge,
@@ -3770,11 +4286,29 @@ class KerberusWindow(QMainWindow):
         status_layout.setContentsMargins(11, 9, 9, 9)
         self.router_dot = QLabel()
         self.router_dot.setFixedSize(9, 9)
-        self.router_text = QLabel("I2P: verifica...")
+        if self._router_connected:
+            router_color = COLORS["accent"]
+            router_label = "I2P: connesso"
+            router_meta = "Tunnel pronto · SAM locale"
+        elif self._connecting:
+            router_color = COLORS["warning"]
+            router_label = "I2P: connessione..."
+            router_meta = "Avvio router e tunnel"
+        elif self._router_detail == "Verifica non ancora completata":
+            router_color = COLORS["warning"]
+            router_label = "I2P: verifica..."
+            router_meta = "Controllo bridge SAM"
+        else:
+            router_color = COLORS["danger"]
+            router_label = "I2P: non connesso"
+            router_meta = "Nuovo tentativo tra 10 s"
+        self.router_dot.setStyleSheet(f"background: {router_color}; border-radius: 4px;")
+        self.router_text = QLabel(router_label)
         self.router_text.setObjectName("muted")
+        self.router_text.setToolTip(self._router_detail)
         status_text = QVBoxLayout()
         status_text.setSpacing(1)
-        self.router_meta = QLabel("Controllo bridge SAM")
+        self.router_meta = QLabel(router_meta)
         self.router_meta.setObjectName("muted")
         self.router_meta.setStyleSheet("font-size: 11px;")
         status_text.addWidget(self.router_text)
@@ -3887,6 +4421,7 @@ class KerberusWindow(QMainWindow):
 
         self.emoji_panel = EmojiPanel()
         self.emoji_panel.selected.connect(self._emoji_selected)
+        self.emoji_panel.close_requested.connect(lambda: self._set_emoji_panel_visible(False))
         conversation_layout.addWidget(self.emoji_panel)
         self.emoji_panel.hide()
 
@@ -3895,6 +4430,14 @@ class KerberusWindow(QMainWindow):
         composer_layout = QHBoxLayout(composer_frame)
         composer_layout.setContentsMargins(20, 14, 20, 16)
         composer_layout.setSpacing(10)
+        self.attachment_button = QToolButton()
+        self.attachment_button.setObjectName("attachmentButton")
+        self.attachment_button.setIcon(lucide_icon("plus", COLORS["accent"], 22))
+        self.attachment_button.setIconSize(QSize(22, 22))
+        self.attachment_button.setFixedSize(48, 48)
+        self.attachment_button.setToolTip("Invia un file cifrato (25 MB · video 100 MB)")
+        self.attachment_button.clicked.connect(self.choose_attachment)
+        composer_layout.addWidget(self.attachment_button, alignment=Qt.AlignmentFlag.AlignBottom)
         self.composer = ComposerEdit()
         self.composer.setPlaceholderText("Scrivi un messaggio")
         self.composer.setFixedHeight(58)
@@ -3922,10 +4465,10 @@ class KerberusWindow(QMainWindow):
         composer_layout.addWidget(self.voice_button, alignment=Qt.AlignmentFlag.AlignBottom)
         self.emoji_button = QToolButton()
         self.emoji_button.setObjectName("emojiToggle")
-        self.emoji_button.setText("☺")
-        self.emoji_button.setFont(QFont("Segoe UI Emoji", 22))
-        self.emoji_button.setFixedSize(52, 52)
-        self.emoji_button.setToolTip("Emoji")
+        self.emoji_button.setIcon(lucide_icon("smile", COLORS["muted"], 22))
+        self.emoji_button.setIconSize(QSize(22, 22))
+        self.emoji_button.setFixedSize(48, 48)
+        self.emoji_button.setToolTip("Apri menu emoji")
         self.emoji_button.clicked.connect(self.show_emoji_menu)
         composer_layout.addWidget(self.emoji_button, alignment=Qt.AlignmentFlag.AlignBottom)
         self.send_button = QToolButton()
@@ -4107,6 +4650,38 @@ class KerberusWindow(QMainWindow):
         QTimer.singleShot(0, self.message_view.scrollToBottom)
 
     def message_action(self, action: str, message: dict) -> None:
+        if action in {"pause_attachment", "resume_attachment"}:
+            paused = action == "pause_attachment"
+            message_id = str(message.get("message_id", ""))
+            self._run_task(
+                lambda: self.service.set_attachment_paused(message_id, paused),
+                lambda _value: self.refresh_messages("status", self.selected_contact),
+                lambda error: self._error(tr("Allegato"), error),
+            )
+            return
+        if action == "cancel_attachment":
+            if not KerberusMessageDialog.ask(
+                self, tr("Annulla trasferimento"), tr("Interrompere e annullare questo trasferimento?"),
+            ):
+                return
+            message_id = str(message.get("message_id", ""))
+            self._run_task(
+                lambda: self.service.cancel_attachment(message_id),
+                lambda _value: self.refresh_messages("status", self.selected_contact),
+                lambda error: self._error(tr("Allegato"), error),
+            )
+            return
+        if action == "save_attachment":
+            self.save_attachment(message)
+            return
+        if action == "play_video":
+            message_id = str(message.get("message_id", ""))
+            self._run_task(
+                lambda: self._prepare_inline_video(message_id),
+                self._play_inline_video_ready,
+                lambda error: self._error("Video", error),
+            )
+            return
         if action == "play_voice":
             message_id = str(message.get("message_id", ""))
             self.statusBar().showMessage(tr("Decodifica vocale con il codec Go…"), 3000)
@@ -4163,6 +4738,9 @@ class KerberusWindow(QMainWindow):
         self._emoji_panel_open = visible
         self.emoji_panel.setVisible(visible)
         self.emoji_button.setProperty("active", visible)
+        self.emoji_button.setIcon(lucide_icon(
+            "smile", COLORS["accent"] if visible else COLORS["muted"], 22
+        ))
         self.emoji_button.style().unpolish(self.emoji_button)
         self.emoji_button.style().polish(self.emoji_button)
         if visible:
@@ -4356,9 +4934,11 @@ class KerberusWindow(QMainWindow):
                 return
             contact_id = str(item.data(Qt.ItemDataRole.UserRole))
             is_voice = message.get("kind") == "voice"
+            is_attachment = message.get("kind") == "attachment"
             self._run_task(
                 lambda: self.service.forward_voice(contact_id, message.get("voice"))
-                if is_voice else self.service.forward_message(contact_id, str(message.get("text", ""))),
+                if is_voice else self.service.forward_attachment_message(contact_id, str(message.get("message_id", "")))
+                if is_attachment else self.service.forward_message(contact_id, str(message.get("text", ""))),
                 lambda _value: self.statusBar().showMessage(tr("Messaggio inoltrato con nuova cifratura"), 4000),
                 lambda error: self._error("Inoltro", error),
             )
@@ -4491,11 +5071,84 @@ class KerberusWindow(QMainWindow):
             return
         self._log_action("Invio messaggio richiesto")
         self.composer.clear()
+        contact_id = self.selected_contact
         self._run_task(
-            lambda: self.service.send_message(self.selected_contact, text),
+            lambda: self.service.send_message(contact_id, text),
             self._message_send_result,
             lambda error: self._error("Invio", error),
         )
+
+    def choose_attachment(self) -> None:
+        if not self.selected_contact:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, tr("Invia file"), "", tr("Tutti i file (*.*)"))
+        if not path:
+            return
+        source = Path(path)
+        try:
+            if source.stat().st_size <= 0:
+                raise ValueError(tr("Il file è vuoto"))
+        except OSError as exc:
+            self._error(tr("Invia file"), str(exc))
+            return
+        except ValueError as exc:
+            self._error(tr("Invia file"), str(exc))
+            return
+        contact_id = self.selected_contact
+        self.statusBar().showMessage(tr("Cifratura e invio dell’allegato…"), 5000)
+        self._run_task(
+            lambda: self.service.send_attachment_file(contact_id, source),
+            self._attachment_send_result,
+            lambda error: self._error(tr("Invia file"), error),
+        )
+
+    def _attachment_send_result(self, value: object) -> None:
+        self._message_send_result(value)
+        if value != "queued":
+            self.statusBar().showMessage(tr("Allegato inviato"), 4000)
+
+    def save_attachment(self, message: dict) -> None:
+        attachment = message.get("attachment")
+        if not isinstance(attachment, dict):
+            return
+        name = str(attachment.get("name", "allegato"))
+        self.service.config.downloads_path.mkdir(parents=True, exist_ok=True)
+        suggested = self.service.config.downloads_path / name
+        path, _ = QFileDialog.getSaveFileName(self, tr("Salva allegato"), str(suggested), tr("Tutti i file (*.*)"))
+        if not path:
+            return
+        message_id = str(message.get("message_id", ""))
+
+        def save() -> Path:
+            destination = Path(path)
+            return self.service.save_attachment_to(message_id, destination)
+
+        self._run_task(
+            save,
+            lambda destination: self.statusBar().showMessage(
+                tr_format("Allegato salvato: {path}", path=destination), 5000,
+            ),
+            lambda error: self._error(tr("Salva allegato"), error),
+        )
+
+    def _prepare_inline_video(self, message_id: str) -> tuple[str, Path]:
+        metadata = self.service.attachment_metadata(message_id)
+        extension = Path(str(metadata.get("name", ""))).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", extension):
+            extension = {
+                "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+            }.get(str(metadata.get("mime", "")), ".video")
+        destination = Path(self._attachment_temp_dir.name) / f"{message_id}{extension}"
+        if not destination.exists():
+            self.service.save_attachment_to(message_id, destination)
+        return message_id, destination
+
+    def _play_inline_video_ready(self, value: object) -> None:
+        if not isinstance(value, tuple) or len(value) != 2:
+            return
+        message_id, path = value
+        if hasattr(self, "message_view"):
+            self.message_view.play_inline_video(str(message_id), Path(path))
 
     def toggle_voice_recording(self) -> None:
         if self._voice_recorder.active:
@@ -4535,6 +5188,7 @@ class KerberusWindow(QMainWindow):
 
     def _set_voice_recording_ui(self, active: bool) -> None:
         self.composer.setVisible(not active)
+        self.attachment_button.setVisible(not active)
         self.emoji_button.setVisible(not active)
         self.send_button.setVisible(not active)
         self.voice_recording_label.setVisible(active)
@@ -4743,10 +5397,10 @@ class KerberusWindow(QMainWindow):
         if kind == "contact_reject_received":
             KerberusMessageDialog.show_message(self, "Richiesta contatto rifiutata", detail)
             return
-        self.statusBar().showMessage(tr(detail), 8000)
+        self.statusBar().showMessage(tr_runtime(detail), 8000)
 
     def _log_action(self, action: str) -> None:
-        safe = action.replace("\r", " ").replace("\n", " ")[:180]
+        safe = tr_runtime(action).replace("\r", " ").replace("\n", " ")[:180]
         self._ui_events.append(f"{datetime.now().strftime('%H:%M:%S')}  {safe}")
         self._ui_events = self._ui_events[-1000:]
 
@@ -4869,6 +5523,7 @@ class KerberusWindow(QMainWindow):
 
         nav_specs = (
             ("settings-2", "Generali"),
+            ("image-plus", "Aspetto"),
             ("shield-check", "Privacy"),
             ("network", "Rete"),
             ("lock-keyhole", "Sicurezza"),
@@ -5011,6 +5666,123 @@ class KerberusWindow(QMainWindow):
                 microphone_test,
             )
         )
+
+        # Aspetto
+        _appearance, appearance_layout = add_page()
+        appearance_card = add_card(
+            appearance_layout,
+            SettingsCard(
+                "image-plus", "Tema e interfaccia",
+                "Personalizza colori, leggibilità e spaziatura dei controlli.",
+            ),
+        )
+
+        def appearance_combo_row(
+            title_text: str,
+            hint_text: str,
+            object_name: str,
+        ) -> tuple[QFrame, ModernComboBox]:
+            row = QFrame()
+            row.setObjectName("settingsRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(16, 13, 16, 13)
+            copy = QVBoxLayout()
+            copy.setSpacing(3)
+            copy.addWidget(QLabel(title_text))
+            hint = QLabel(hint_text)
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            copy.addWidget(hint)
+            combo = ModernComboBox()
+            combo.setObjectName(object_name)
+            combo.setFixedWidth(190)
+            row_layout.addLayout(copy, 1)
+            row_layout.addWidget(combo)
+            return row, combo
+
+        theme_row, theme = appearance_combo_row(
+            "Tema dell’applicazione",
+            "Cambia la palette di tutta l’interfaccia senza riavviare Kerberus.",
+            "applicationTheme",
+        )
+        for key, label in (
+            ("default", "Predefinito"), ("pink", "Rosa"), ("orange", "Arancione"),
+            ("white", "Bianco"), ("dark", "Scuro"),
+        ):
+            theme.addItem(label, key)
+            if key == current.get("theme", "default"):
+                theme.setCurrentIndex(theme.count() - 1)
+        appearance_card.add_row(theme_row)
+
+        palette_row = QFrame()
+        palette_row.setObjectName("settingsRow")
+        palette_layout = QHBoxLayout(palette_row)
+        palette_layout.setContentsMargins(16, 12, 16, 14)
+        palette_layout.addWidget(QLabel("Anteprima palette"))
+        palette_layout.addStretch()
+        for key in ("default", "pink", "orange", "white", "dark"):
+            swatch = QFrame()
+            swatch.setObjectName(f"themeSwatch-{key}")
+            swatch.setFixedSize(34, 24)
+            palette = THEMES[key]
+            swatch.setToolTip(key.title())
+            fill = "#ffffff" if key == "white" else palette["accent"]
+            border = palette["border"] if key == "white" else palette["surface_2"]
+            swatch.setStyleSheet(
+                f"background: {fill}; border: 5px solid {border}; "
+                f"border-radius: 7px;"
+            )
+            palette_layout.addWidget(swatch)
+        appearance_card.add_row(palette_row)
+
+        text_row, text_scale = appearance_combo_row(
+            "Dimensione del testo",
+            "Aumenta o riduci il testo mantenendo invariato il contenuto.",
+            "textScale",
+        )
+        for scale in (90, 100, 110, 120):
+            text_scale.addItem(f"{scale}%", scale)
+            if scale == int(current.get("text_scale", 100)):
+                text_scale.setCurrentIndex(text_scale.count() - 1)
+        appearance_card.add_row(text_row)
+
+        density_row, ui_density = appearance_combo_row(
+            "Densità dell’interfaccia",
+            "Regola lo spazio verticale di pulsanti, menu e campi.",
+            "uiDensity",
+        )
+        for key, label in (
+            ("compact", "Compatta"), ("comfortable", "Bilanciata"), ("spacious", "Spaziosa"),
+        ):
+            ui_density.addItem(label, key)
+            if key == current.get("ui_density", "comfortable"):
+                ui_density.setCurrentIndex(ui_density.count() - 1)
+        appearance_card.add_row(density_row)
+
+        appearance_note = QLabel(
+            "Le modifiche di aspetto vengono applicate immediatamente e salvate nel vault locale."
+        )
+        appearance_note.setObjectName("muted")
+        appearance_note.setWordWrap(True)
+        appearance_note.setContentsMargins(16, 13, 16, 15)
+        appearance_card.add_row(appearance_note)
+
+        original_appearance = (
+            str(current.get("theme", "default")),
+            int(current.get("text_scale", 100)),
+            str(current.get("ui_density", "comfortable")),
+        )
+
+        def preview_appearance() -> None:
+            apply_appearance(
+                str(theme.currentData()), int(text_scale.currentData()), str(ui_density.currentData())
+            )
+
+        theme.currentIndexChanged.connect(preview_appearance)
+        text_scale.currentIndexChanged.connect(preview_appearance)
+        ui_density.currentIndexChanged.connect(preview_appearance)
+        dialog.rejected.connect(lambda: apply_appearance(*original_appearance))
 
         # Privacy
         _privacy, privacy_layout = add_page()
@@ -5163,14 +5935,23 @@ class KerberusWindow(QMainWindow):
         )
         network_insights = NetworkInsightsPanel()
         peer_card.add_row(network_insights)
+        network_context = {"active": True}
+
+        def stop_network_insights(*_args: object) -> None:
+            # Results can arrive after the modeless settings dialog was closed.
+            # Do not touch widgets while Qt is deleting their native objects.
+            network_context["active"] = False
+
+        dialog.finished.connect(stop_network_insights)
+        dialog.destroyed.connect(stop_network_insights)
 
         def refresh_network_insights() -> None:
-            if sip.isdeleted(network_insights):
+            if not network_context["active"] or sip.isdeleted(network_insights):
                 return
             network_insights.set_loading(True)
 
             def loaded(value: object) -> None:
-                if sip.isdeleted(network_insights):
+                if not network_context["active"] or sip.isdeleted(network_insights):
                     return
                 network_insights.set_loading(False)
                 peers = value if isinstance(value, list) else []
@@ -5181,7 +5962,7 @@ class KerberusWindow(QMainWindow):
                         lookup_peer(ip)
 
             def failed(error: str) -> None:
-                if sip.isdeleted(network_insights):
+                if not network_context["active"] or sip.isdeleted(network_insights):
                     return
                 network_insights.set_loading(False)
                 network_insights.status.setText(tr_format("Analisi rete non disponibile: {detail}", detail=tr(error)))
@@ -5189,7 +5970,7 @@ class KerberusWindow(QMainWindow):
             self._run_task(collect_i2p_peer_connections, loaded, failed)
 
         def lookup_peer(ip: str) -> None:
-            if sip.isdeleted(network_insights):
+            if not network_context["active"] or sip.isdeleted(network_insights):
                 return
             cached = self._ip_lookup_cache.get(ip)
             if cached is not None:
@@ -5205,12 +5986,12 @@ class KerberusWindow(QMainWindow):
                 self._ip_lookup_pending.discard(ip)
                 result = value if isinstance(value, dict) else {}
                 self._ip_lookup_cache[ip] = result
-                if not sip.isdeleted(network_insights):
+                if network_context["active"] and not sip.isdeleted(network_insights):
                     network_insights.set_lookup_result(ip, result)
 
             def lookup_failed(error: str) -> None:
                 self._ip_lookup_pending.discard(ip)
-                if not sip.isdeleted(network_insights):
+                if network_context["active"] and not sip.isdeleted(network_insights):
                     network_insights.set_lookup_error(ip, error)
 
             self._run_network_task(
@@ -5317,6 +6098,9 @@ class KerberusWindow(QMainWindow):
             self.service.update_audio_settings(
                 str(audio_input.currentData()), str(audio_output.currentData())
             )
+            self.service.update_appearance_settings(
+                str(theme.currentData()), int(text_scale.currentData()), str(ui_density.currentData())
+            )
             self.service.update_privacy_settings(
                 send_delivery_receipts=delivery_receipts.isChecked(),
                 send_read_receipts=read_receipts.isChecked(),
@@ -5344,7 +6128,12 @@ class KerberusWindow(QMainWindow):
                 lambda error: self._protocol_event("network_profile_error", error),
             )
             set_language(str(language.currentData()))
+            apply_appearance(
+                str(theme.currentData()), int(text_scale.currentData()), str(ui_density.currentData())
+            )
+            self._build_ui()
             localize_widget(self)
+            self.refresh_contacts()
             if self._tray is not None:
                 old_tray = self._tray
                 self._tray = None
@@ -5967,12 +6756,15 @@ class KerberusWindow(QMainWindow):
                 self._voice_recorder.stop(discard=True)
             if self._voice_player is not None:
                 self._voice_player.stop()
+            if hasattr(self, "message_view"):
+                self.message_view.stop_inline_video()
             if self._tray is not None:
                 self._tray.hide()
             self._preview_pool.shutdown(wait=False, cancel_futures=True)
             self._network_pool.shutdown(wait=False, cancel_futures=True)
             self.service.close()
             RouterInstaller.stop_running()
+            self._attachment_temp_dir.cleanup()
         self._quit_application()
 
     @staticmethod

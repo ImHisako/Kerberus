@@ -18,6 +18,11 @@ class VaultTests(unittest.TestCase):
             reopened.unlock("password-lunga-di-test")
             self.assertEqual(reopened.state["messages"][0]["text"], "segreto")
             self.assertFalse(reopened.state["settings"]["stream_proof_enabled"])
+            self.assertEqual(reopened.state["settings"]["theme"], "default")
+            self.assertEqual(reopened.state["settings"]["text_scale"], 100)
+            self.assertEqual(reopened.state["settings"]["ui_density"], "comfortable")
+            self.assertEqual(reopened.state["attachment_transfers"], {})
+            self.assertEqual(reopened.state["attachment_seen"], {})
             self.assertNotIn("ipinfo_token", reopened.state["settings"])
             with self.assertRaises(ValueError):
                 Vault(path).unlock("password-completamente-errata")

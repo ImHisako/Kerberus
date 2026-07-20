@@ -23,12 +23,12 @@ Kerberus is designed around a small set of principles:
 
 | Area | Capabilities |
 |---|---|
-| Messaging | Direct text and voice messages, encrypted local outbox, automatic retry, forwarding with fresh encryption, local deletion, delivery and read states |
+| Messaging | Encrypted text, voice messages, and attachments, inline image/video previews, local outbox, automatic retry, forwarding with fresh encryption, local deletion, delivery and read states |
 | Identity | Ed25519-signed profiles, stable cryptographic identity ID, username, avatar, persistent I2P destination |
 | Contacts | Rotating contact codes, optional single use, signed request/accept/reject controls, pending-request cancellation |
 | Encryption | X25519 + ML-KEM-768 hybrid envelope, XChaCha20-Poly1305, Ed25519 authentication, Double Ratchet v3, bounded out-of-order support |
 | Privacy | No application telemetry, encrypted receipts and reactions, per-chat overrides, optional link previews, padded plaintext buckets, Windows capture exclusion and Linux privacy curtain |
-| Interface | PyQt6 desktop UI, Italian and English, embedded emoji and contact-profile panels, reactions, modern dropdowns, organized settings, system tray |
+| Interface | PyQt6 desktop UI, Italian and English, Default/Pink/Orange/White/Dark themes, configurable text scale and density, embedded emoji and contact-profile panels, reactions, modern dropdowns, organized settings, system tray |
 | Diagnostics | Local UI event console, explicit connection errors, I2P transport peers with automatic geographic details, per-chat JSON export |
 | Transport | I2P SAM v3, persistent session and streams, native Go multiplexer with Python fallback, full-duplex inline replies |
 | Platforms | Standalone Windows installer and Linux portable builds, source execution on Python 3.11+ |
@@ -56,9 +56,15 @@ Device audio is passed to the local Go helper, which performs downmixing, 16 kHz
 
 Forwarding creates a new message ID, ratchet keys, nonce, and hybrid envelope. Diagnostic exports contain only the codec, duration, and local encode/decode timings, never audio data. Content is private and authenticated, but absolute anonymity is not promised: traffic duration, size, and timing may enable correlation, and a compromised endpoint can access captured or played audio.
 
+### Encrypted attachments
+
+The circular **+** button to the left of the composer sends files up to 25 MB and videos up to 100 MB. Every attachment is split into 512 KB chunks, separately encrypted through the same Double Ratchet as messages, and acknowledged one at a time: a failure retries only the current chunk, while an application restart resumes after the last confirmed chunk. The conversation shows progress, pause/resume, and cancellation controls. Temporary chunks are encrypted at rest, and the reconstructed file is accepted only when its size and SHA-256 match the signed manifest.
+
+Images and videos are displayed in the conversation, and videos can play inline. Other formats expose a **Save file** button and are never written to disk automatically in plaintext. Diagnostic exports contain only the filename, MIME type, size, chunk count, and hash, never attachment bytes.
+
 ### Reactions and emoji
 
-Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Short emoji-only messages are recognized as quick reactions and displayed in a compact bubble with enlarged emoji; attached reactions use dedicated chips. Each participant can add multiple reactions to one message. Reactions are encrypted inside the ratchet channel; left-clicking one of your own reactions removes only that emoji and sends an authenticated removal event to the peer.
+Kerberus includes a searchable picker backed by the full emoji catalog shipped by the `emoji` package, including variants, skin tones, flags, and ZWJ sequences. Search terms work in Italian and English. Short emoji-only messages are recognized as quick reactions and displayed in a compact bubble with enlarged emoji; attached reactions are aggregated below the message in chips showing the emoji and participant count. Each participant can add multiple reactions to one message. Reactions are encrypted inside the ratchet channel; left-clicking one of your own reactions removes only that emoji and sends an authenticated removal event to the peer.
 
 ### Message actions
 
@@ -455,7 +461,7 @@ docs/adr/           architecture decision records
 - **Link-preview disclosure:** enabled previews contact clearnet websites and reveal the device's clearnet IP to those sites.
 - **Plaintext exports:** debug exports and clipboard operations intentionally move plaintext outside the vault.
 - **Release trust:** updates require matching SHA-256 manifests and reject rollback, but the artifact and checksum come from the same GitHub release. There is no independent offline signature or project code-signing certificate yet.
-- **Missing product areas:** groups, multi-device synchronization, attachments, voice/video, key backup, and distributed mailboxes are not implemented.
+- **Missing product areas:** groups, multi-device synchronization, audio/video calls, key backup, and distributed mailboxes are not implemented.
 
 ## Licensing
 

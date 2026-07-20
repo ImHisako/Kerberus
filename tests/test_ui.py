@@ -1,10 +1,11 @@
 import os
+import base64
 import unittest
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPushButton, QScrollArea, QStyleOptionViewItem, QToolButton
+from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QStyleOptionViewItem, QToolButton
 from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, Qt
 from PyQt6.QtGui import QCloseEvent, QImage, QPainter, QWheelEvent
 from PyQt6.QtTest import QSignalSpy, QTest
@@ -94,6 +95,76 @@ class UiTests(unittest.TestCase):
         self.assertEqual(window.voice_button.iconSize().width(), 21)
         window.service.close()
 
+    def test_attachment_button_precedes_composer_and_attachment_cards_are_interactive(self):
+        window = KerberusWindow()
+        window._build_ui()
+        window.show()
+        self.app.processEvents()
+        self.assertFalse(window.attachment_button.icon().isNull())
+        composer_layout = window.attachment_button.parentWidget().layout()
+        self.assertLess(composer_layout.indexOf(window.attachment_button), composer_layout.indexOf(window.composer))
+        self.assertIn("100 MB", window.attachment_button.toolTip())
+
+        delegate = window.message_view.chat_delegate
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        image_message = {
+            "message_id": "1" * 32, "kind": "attachment", "direction": "in", "sent_at": 1_700_000_000,
+            "attachment": {"name": "foto.png", "mime": "image/png", "size": len(png),
+                           "sha256": "image", "data": base64.b64encode(png).decode("ascii")},
+        }
+        image_layout = delegate._layout(image_message, 760, window.font())
+        self.assertTrue(image_layout["attachment_image"])
+        self.assertGreater(image_layout["body_height"], 100)
+
+        file_message = {
+            "message_id": "2" * 32, "kind": "attachment", "direction": "out", "sent_at": 1_700_000_000,
+            "status": "sent", "attachment": {"name": "documento.pdf", "mime": "application/pdf",
+            "size": 100, "sha256": "file", "data": base64.b64encode(b"x" * 100).decode("ascii")},
+        }
+        geometry = delegate._layout(file_message, 760, window.font())
+        row = QRect(0, 0, 760, int(geometry["row_height"]))
+        bubble = delegate._bubble_rect(row, geometry)
+        save_point = QPoint(
+            bubble.right() - 14 - 50,
+            bubble.top() + 10 + int(geometry["author_height"]) + 35,
+        )
+        self.assertEqual(delegate.attachment_action_at(file_message, row, window.font(), save_point), "save_attachment")
+
+        transferring = {
+            **file_message,
+            "message_id": "3" * 32,
+            "attachment": {**file_message["attachment"], "state": "transferring", "progress": 42,
+                           "completed_chunks": 2, "total_chunks": 5, "transfer_id": "a" * 32},
+        }
+        transfer_geometry = delegate._layout(transferring, 760, window.font())
+        self.assertGreater(transfer_geometry["body_height"], transfer_geometry["attachment_content_height"])
+        transfer_row = QRect(0, 0, 760, int(transfer_geometry["row_height"]))
+        transfer_bubble = delegate._bubble_rect(transfer_row, transfer_geometry)
+        controls_y = (
+            transfer_bubble.top() + 10 + int(transfer_geometry["author_height"])
+            + int(transfer_geometry["attachment_content_height"]) + 12
+        )
+        pause_point = QPoint(transfer_bubble.right() - 14 - 150, controls_y + 15)
+        cancel_point = QPoint(transfer_bubble.right() - 14 - 50, controls_y + 15)
+        self.assertEqual(delegate.attachment_action_at(transferring, transfer_row, window.font(), pause_point), "pause_attachment")
+        self.assertEqual(delegate.attachment_action_at(transferring, transfer_row, window.font(), cancel_point), "cancel_attachment")
+        window.message_view.chat_model.set_messages([transferring])
+        option = QStyleOptionViewItem()
+        option.rect = transfer_row
+        option.font = window.font()
+        rendered = QImage(transfer_row.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        rendered.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(rendered)
+        try:
+            delegate.paint(painter, option, window.message_view.chat_model.index(0, 0))
+        finally:
+            painter.end()
+        window.hide()
+        window.service.close()
+        window._attachment_temp_dir.cleanup()
+
     def test_saved_audio_device_is_resolved_or_falls_back(self):
         class Device:
             def __init__(self, value: bytes):
@@ -156,6 +227,19 @@ class UiTests(unittest.TestCase):
             message, view.visualRect(index), view.font()
         )
         self.assertEqual([(emoji, len(owners)) for emoji, owners, _rect in regions], [("👍", 2), ("❤️", 1)])
+        geometry = view.chat_delegate._layout(message, view.width(), view.font())
+        chip_texts = [chip[2] for row in geometry["reaction_rows"] for chip in row]
+        self.assertEqual(chip_texts, ["👍 2", "❤️ 1"])
+        bubble = view.chat_delegate._bubble_rect(view.visualRect(index), geometry)
+        self.assertTrue(all(rect.top() > bubble.bottom() for _emoji, _owners, rect in regions))
+        self.assertEqual(regions[-1][2].right(), bubble.right())
+        incoming = dict(message, direction="in")
+        incoming_geometry = view.chat_delegate._layout(incoming, view.visualRect(index).width(), view.font())
+        incoming_bubble = view.chat_delegate._bubble_rect(view.visualRect(index), incoming_geometry)
+        incoming_regions = view.chat_delegate.reaction_regions(
+            incoming, view.visualRect(index), view.font()
+        )
+        self.assertEqual(incoming_regions[0][2].left(), incoming_bubble.left())
         heart = next(rect for emoji, _owners, rect in regions if emoji == "❤️")
         QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=heart.center())
         self.assertEqual(actions, [("react:❤️", "a" * 32)])
@@ -276,8 +360,10 @@ class UiTests(unittest.TestCase):
 
         window = KerberusWindow()
         window._build_ui()
-        emoji_button = next(button for button in window.findChildren(QToolButton) if button.text() == "☺")
-        self.assertGreaterEqual(emoji_button.width(), 50)
+        emoji_button = window.emoji_button
+        self.assertEqual(emoji_button.text(), "")
+        self.assertFalse(emoji_button.icon().isNull())
+        self.assertEqual(emoji_button.iconSize().width(), 22)
         author, _secrets = generate_identity("Alice")
         bubble = MessageBubble("x", 1_700_000_000, False, on_action=lambda *_args: None, author=author)
         self.assertFalse(any(button.text() == "☺+" for button in bubble.findChildren(QToolButton)))
@@ -295,14 +381,41 @@ class UiTests(unittest.TestCase):
             window.show_emoji_menu()
         popup.assert_not_called()
         self.assertFalse(window.emoji_panel.isHidden())
+        self.assertEqual(window.emoji_panel.panel_title.text(), "Emoji e simboli")
+        self.assertIn("QFrame#emojiCategories", STYLE)
+        self.assertIn("QToolButton#emojiPager", STYLE)
         window.emoji_panel._select("🔥")
         window.emoji_panel._select("❤️")
         self.assertEqual(window.composer.toPlainText(), "🔥❤️")
         self.assertFalse(window.emoji_panel.isHidden())
         self.assertEqual(window.emoji_panel._recent[:2], ["❤️", "🔥"])
+        close = next(
+            button for button in window.emoji_panel.findChildren(QToolButton)
+            if button.toolTip() == "Chiudi pannello emoji"
+        )
+        close.click()
+        self.assertTrue(window.emoji_panel.isHidden())
+        window.show_emoji_menu()
+        self.assertFalse(window.emoji_panel.isHidden())
         window.show_emoji_menu()
         self.assertTrue(window.emoji_panel.isHidden())
         window.service.close()
+
+    def test_emoji_footer_stays_below_the_scrollable_grid(self):
+        panel = EmojiPanel()
+        panel.resize(860, 440)
+        panel.show()
+        self.app.processEvents()
+        scroll = panel.findChild(QScrollArea, "emojiScroll")
+        footer = panel.findChild(QFrame, "emojiFooter")
+        self.assertIsNotNone(scroll)
+        self.assertIsNotNone(footer)
+        scroll_bottom = scroll.mapTo(panel, scroll.rect().bottomLeft()).y()
+        footer_top = footer.mapTo(panel, footer.rect().topLeft()).y()
+        self.assertGreater(footer_top, scroll_bottom)
+        self.assertEqual(footer.height(), 40)
+        self.assertIn("QFrame#emojiFooter", STYLE)
+        panel.close()
 
     def test_contact_profile_can_be_opened_from_chat_header(self):
         window = KerberusWindow()
@@ -394,6 +507,7 @@ class UiTests(unittest.TestCase):
         popup.assert_not_called()
         self.assertTrue(window._emoji_panel_open)
         self.assertTrue(window.emoji_panel._reaction_mode)
+        self.assertEqual(window.emoji_panel.panel_title.text(), "Reazioni al messaggio")
         self.assertIs(window._emoji_reaction_message, message)
         window.service.close()
 
@@ -422,7 +536,9 @@ class UiTests(unittest.TestCase):
         self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
         rows = dialog.findChildren(QFrame, "timingRow")
         self.assertGreaterEqual(len(rows), 10)
-        self.assertTrue(all(row.height() <= 52 for row in rows))
+        # Text scaling may legitimately grow a wrapped diagnostics row while
+        # it must remain compact enough to keep several entries visible.
+        self.assertTrue(all(row.height() <= 72 for row in rows))
         dialog.close()
         window.service.close()
 
@@ -437,16 +553,65 @@ class UiTests(unittest.TestCase):
             if button.objectName() == "settingsNav"
         ]
         self.assertEqual([button.text() for button in navigation], [
-            "Generali", "Privacy", "Rete", "Sicurezza", "Diagnostica",
+            "Generali", "Aspetto", "Privacy", "Rete", "Sicurezza", "Diagnostica",
         ])
         self.assertTrue(all(not button.icon().isNull() for button in navigation))
         self.assertGreaterEqual(len(dialog.findChildren(ToggleSwitch)), 6)
-        navigation[3].click()
+        navigation[4].click()
         self.app.processEvents()
         stream_switch = next(switch for switch in dialog.findChildren(ToggleSwitch) if switch.isVisible())
         switch_position = stream_switch.mapTo(dialog, stream_switch.rect().topLeft())
         self.assertLessEqual(switch_position.x() + stream_switch.width(), dialog.width())
         dialog.close()
+        window.service.close()
+
+    def test_appearance_page_previews_all_themes_text_scale_and_density(self):
+        previous_style = self.app.styleSheet()
+        window = KerberusWindow()
+        window._build_ui()
+        window.show_settings()
+        self.app.processEvents()
+        dialog = next(iter(window._open_dialogs))
+        navigation = [
+            button for button in dialog.findChildren(QPushButton)
+            if button.objectName() == "settingsNav"
+        ]
+        navigation[1].click()
+        theme = dialog.findChild(ModernComboBox, "applicationTheme")
+        text_scale = dialog.findChild(ModernComboBox, "textScale")
+        density = dialog.findChild(ModernComboBox, "uiDensity")
+        self.assertEqual([theme.itemData(index) for index in range(theme.count())], [
+            "default", "pink", "orange", "white", "dark",
+        ])
+        self.assertEqual([text_scale.itemData(index) for index in range(text_scale.count())], [90, 100, 110, 120])
+        self.assertEqual([density.itemData(index) for index in range(density.count())], [
+            "compact", "comfortable", "spacious",
+        ])
+        white_swatch = dialog.findChild(QFrame, "themeSwatch-white")
+        self.assertIn("background: #ffffff", white_swatch.styleSheet())
+        self.assertNotIn("#16865f", white_swatch.styleSheet())
+        theme.setCurrentIndex(1)
+        text_scale.setCurrentIndex(2)
+        density.setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertIn("#f472b6", self.app.styleSheet())
+        self.assertIn("font-size: 15px", self.app.styleSheet())
+        dialog.reject()
+        self.app.processEvents()
+        self.assertIn("#35d09a", self.app.styleSheet())
+        self.app.setStyleSheet(previous_style)
+        window.service.close()
+
+    def test_rebuilding_ui_for_theme_preserves_connected_i2p_indicator(self):
+        window = KerberusWindow()
+        window._router_connected = True
+        window._router_detail = "I2P: connesso"
+
+        window._build_ui()
+
+        self.assertEqual(window.router_text.text(), "I2P: connesso")
+        self.assertEqual(window.router_meta.text(), "Tunnel pronto · SAM locale")
+        self.assertEqual(window.router_text.toolTip(), "I2P: connesso")
         window.service.close()
 
     def test_audio_settings_list_devices_and_route_tests_to_selected_output(self):
@@ -518,7 +683,7 @@ class UiTests(unittest.TestCase):
             button for button in dialog.findChildren(QPushButton)
             if button.objectName() == "settingsNav"
         ]
-        navigation[2].click()
+        navigation[3].click()
         self.app.processEvents()
         row = dialog.findChild(SettingsToggleRow, "lowLatencySetting")
         switch = row.findChild(ToggleSwitch)
@@ -619,8 +784,36 @@ class UiTests(unittest.TestCase):
             self.assertTrue(any("Disable it for maximum privacy" in text for text in texts))
             self.assertIn("Mask which contacts are recent", texts)
             self.assertTrue(any("Does not spoof I2P" in text for text in texts))
+            self.assertIn("Open UI console", texts)
             self.assertNotIn("Generali", texts)
             self.assertNotIn("Protezione streaming", texts)
+            dialog.close()
+            window.service.close()
+        finally:
+            set_language("it")
+
+    def test_ui_console_translates_runtime_protocol_and_ack_details(self):
+        set_language("en")
+        try:
+            window = KerberusWindow()
+            window._build_ui()
+            window._protocol_event(
+                "message_stream_sent",
+                "Frame scritto sullo stream in 0.42s; attendo conferma cifrata",
+            )
+            window._protocol_event("message_delivered", "Messaggio consegnato e confermato")
+            window.show_ui_console()
+            self.app.processEvents()
+            dialog = next(iter(window._open_dialogs))
+            console = dialog.findChild(QPlainTextEdit)
+            contents = console.toPlainText()
+            self.assertIn("Protocol event: message_stream_sent", contents)
+            self.assertIn("Frame written to the stream in 0.42s; waiting for encrypted ACK", contents)
+            self.assertIn("Protocol event: message_delivered · Message delivered and confirmed", contents)
+            self.assertIn("Opening UI console", contents)
+            self.assertNotIn("Frame scritto sullo stream", contents)
+            self.assertEqual(dialog.windowTitle(), "UI console")
+            self.assertEqual(window.statusBar().currentMessage(), "Message delivered and confirmed")
             dialog.close()
             window.service.close()
         finally:

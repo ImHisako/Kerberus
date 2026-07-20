@@ -24,6 +24,8 @@ def empty_state() -> dict[str, Any]:
         "outbox": [],
         "control_outbox": [],
         "seen": [],
+        "attachment_seen": {},
+        "attachment_transfers": {},
         "pending": {},
         "used_contact_codes": [],
         "chat_settings": {},
@@ -41,6 +43,9 @@ def empty_state() -> dict[str, Any]:
             "audio_input_device_id": "",
             "audio_output_device_id": "",
             "language": "it",
+            "theme": "default",
+            "text_scale": 100,
+            "ui_density": "comfortable",
         },
     }
 
@@ -80,6 +85,8 @@ class Vault:
         self.state.setdefault("seen", [])
         self.state.setdefault("outbox", [])
         self.state.setdefault("control_outbox", [])
+        self.state.setdefault("attachment_seen", {})
+        self.state.setdefault("attachment_transfers", {})
         self.state.setdefault("pending", {})
         self.state.setdefault("used_contact_codes", [])
         self.state.setdefault("chat_settings", {})
@@ -100,6 +107,9 @@ class Vault:
         settings.setdefault("audio_input_device_id", "")
         settings.setdefault("audio_output_device_id", "")
         settings.setdefault("language", "it")
+        settings.setdefault("theme", "default")
+        settings.setdefault("text_scale", 100)
+        settings.setdefault("ui_density", "comfortable")
         for obsolete in ("dns_mode", "dns_host", "dns_ipv4", "dns_ipv6", "dns_port", "minimize_to_tray", "ipinfo_token"):
             settings.pop(obsolete, None)
 

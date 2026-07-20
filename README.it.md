@@ -23,12 +23,12 @@ Il progetto segue alcuni principi fondamentali:
 
 | Area | Funzionalità |
 |---|---|
-| Messaggi | Testo e vocali diretti, outbox locale cifrata, retry automatico, inoltro con nuova cifratura, eliminazione locale, stati di consegna e lettura |
+| Messaggi | Testo, vocali e allegati cifrati, anteprime inline per immagini e video, outbox locale, retry automatico, inoltro con nuova cifratura, eliminazione locale, stati di consegna e lettura |
 | Identità | Profili firmati Ed25519, ID crittografico stabile, username, avatar, destination I2P persistente |
 | Contatti | Codici a rotazione, uso singolo opzionale, request/accept/reject firmati, cancellazione delle richieste pendenti |
 | Cifratura | Envelope ibrido X25519 + ML-KEM-768, XChaCha20-Poly1305, autenticazione Ed25519, Double Ratchet v3, messaggi fuori ordine limitati |
 | Privacy | Nessuna telemetria applicativa, ricevute e reazioni cifrate, impostazioni per chat, anteprime opzionali, padding a classi di dimensione, esclusione Windows e privacy curtain Linux |
-| Interfaccia | Desktop PyQt6, italiano e inglese, pannelli interni per emoji e profili, reazioni, dropdown moderni, impostazioni organizzate, system tray |
+| Interfaccia | Desktop PyQt6, italiano e inglese, temi Default/Pink/Orange/White/Dark, scala testo e densità configurabili, pannelli interni per emoji e profili, reazioni, dropdown moderni, impostazioni organizzate, system tray |
 | Diagnostica | Console eventi locale, errori espliciti, peer di trasporto I2P con dettagli geografici automatici, export JSON per chat |
 | Trasporto | I2P SAM v3, sessione e stream persistenti, multiplexer Go nativo con fallback Python, risposte inline full-duplex |
 | Piattaforme | Installer standalone Windows, build portabili Linux, avvio dal sorgente con Python 3.11+ |
@@ -56,9 +56,15 @@ L’audio del dispositivo viene affidato al helper Go locale, che esegue downmix
 
 Inoltrare un vocale crea message ID, chiavi ratchet, nonce ed envelope ibrido nuovi. Il report diagnostico include soltanto codec, durata e tempi locali di codifica/decodifica, mai i dati audio. Il contenuto è privato e autenticato, ma non è corretto promettere anonimato assoluto: durata, dimensione e tempistica del traffico possono facilitare la correlazione e un endpoint compromesso può accedere all’audio riprodotto o registrato.
 
+### Allegati cifrati
+
+Il pulsante circolare **+** a sinistra del compositore invia file fino a 25 MB e video fino a 100 MB. Ogni allegato viene diviso in blocchi da 512 KB, cifrati separatamente nello stesso Double Ratchet dei messaggi e confermati uno alla volta: un errore ritenta soltanto il blocco corrente e un riavvio riprende dall’ultimo blocco confermato. La chat mostra avanzamento, pausa/ripresa e annullamento. I blocchi temporanei sono cifrati anche a riposo e il file ricomposto viene accettato soltanto se dimensione e SHA-256 coincidono con il manifest firmato.
+
+Immagini e video sono mostrati nella chat; i video possono essere riprodotti inline. Gli altri formati espongono un pulsante **Salva file** e non vengono scritti automaticamente in chiaro sul disco. L’export diagnostico include soltanto nome, tipo MIME, dimensione, numero di blocchi e hash, mai i byte dell’allegato.
+
 ### Reazioni ed emoji
 
-Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. I messaggi brevi composti soltanto da emoji vengono riconosciuti come reazioni rapide e mostrati in una bolla compatta con emoji ingrandite; le reazioni applicate a un messaggio sono raccolte in chip dedicati. Ogni partecipante può aggiungere più reazioni allo stesso messaggio. Le reazioni sono cifrate nel canale ratchet; un clic sinistro su una propria reazione la rimuove e invia al peer un evento autenticato relativo soltanto a quell’emoji.
+Kerberus include un selettore ricercabile basato sull’intero catalogo emoji distribuito dal pacchetto `emoji`, comprese varianti, tonalità della pelle, bandiere e sequenze ZWJ. La ricerca riconosce nomi italiani e inglesi. I messaggi brevi composti soltanto da emoji vengono riconosciuti come reazioni rapide e mostrati in una bolla compatta con emoji ingrandite; le reazioni applicate sono aggregate sotto il messaggio in chip con emoji e numero di partecipanti. Ogni partecipante può aggiungere più reazioni allo stesso messaggio. Le reazioni sono cifrate nel canale ratchet; un clic sinistro su una propria reazione la rimuove e invia al peer un evento autenticato relativo soltanto a quell’emoji.
 
 ### Azioni sui messaggi
 
@@ -455,7 +461,7 @@ docs/adr/           decisioni architetturali
 - **Esposizione anteprime:** le anteprime abilitate contattano siti clearnet e rivelano a questi l’IP clearnet del dispositivo.
 - **Export in chiaro:** export diagnostici e appunti spostano intenzionalmente plaintext fuori dal vault.
 - **Fiducia nelle release:** gli aggiornamenti richiedono manifest SHA-256 corrispondenti e rifiutano rollback, ma artefatto e checksum provengono dalla stessa release GitHub. Non esiste ancora una firma offline indipendente o un certificato code-signing del progetto.
-- **Funzioni non implementate:** gruppi, sincronizzazione multi-device, allegati, voce/video, backup delle chiavi e mailbox distribuite.
+- **Funzioni non implementate:** gruppi, sincronizzazione multi-device, chiamate audio/video, backup delle chiavi e mailbox distribuite.
 
 ## Licenze
 

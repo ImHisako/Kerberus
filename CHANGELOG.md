@@ -2,7 +2,10 @@
 
 ## 0.8.1
 
-- TODO: descrivere le modifiche della release.
+- Allegati cifrati a blocchi da 512 KB (25 MB per file, 100 MB per video), retry e ripresa persistenti, SHA-256 finale, pausa/annullamento, immagini e video inline e salvataggio esplicito degli altri formati.
+- Nuova pagina Aspetto con temi Default, Pink, Orange, White e Dark, anteprima immediata, scala del testo e densità dell’interfaccia persistenti.
+- Reazioni aggregate in chip compatti sotto il messaggio, con emoji e conteggio sempre visibile anche quando vale uno.
+- Pulsante emoji con icona Lucide e selettore integrato ridisegnato con header, ricerca, categorie, pager e colori coerenti con il tema attivo.
 
 ## 0.8.0
 
