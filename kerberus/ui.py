@@ -3937,6 +3937,7 @@ class KerberusWindow(QMainWindow):
         self._workers: list[threading.Thread] = []
         self._preview_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="kerberus-preview")
         self._network_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kerberus-ip-info")
+        self._resources_released = False
         self._download_dialog: KerberusProgressDialog | None = None
         # Il bordo resta ridimensionabile, ma non copre la scrollbar della chat.
         self._resize_margin = 2
@@ -6760,12 +6761,30 @@ class KerberusWindow(QMainWindow):
                 self.message_view.stop_inline_video()
             if self._tray is not None:
                 self._tray.hide()
-            self._preview_pool.shutdown(wait=False, cancel_futures=True)
-            self._network_pool.shutdown(wait=False, cancel_futures=True)
-            self.service.close()
+            self._release_resources()
             RouterInstaller.stop_running()
-            self._attachment_temp_dir.cleanup()
         self._quit_application()
+
+    def _release_resources(self, *, wait: bool = False) -> None:
+        """Release non-Qt resources before this window can be destroyed.
+
+        Worker callbacks retain Qt signal objects, so test and application
+        teardown must stop their executors before Qt starts deleting widgets.
+        Waiting is useful for deterministic test cleanup; the interactive
+        shutdown remains immediate because its workers are best-effort tasks.
+        """
+        if self._resources_released:
+            return
+        self._resources_released = True
+        self._preview_pool.shutdown(wait=wait, cancel_futures=True)
+        self._network_pool.shutdown(wait=wait, cancel_futures=True)
+        if wait:
+            current = threading.current_thread()
+            for worker in self._workers:
+                if worker is not current and worker.is_alive():
+                    worker.join(timeout=10)
+        self.service.close()
+        self._attachment_temp_dir.cleanup()
 
     @staticmethod
     def _quit_application() -> None:

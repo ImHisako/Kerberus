@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QStyleOptionViewItem, QToolButton
-from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, Qt
+from PyQt6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QPointF, QRect, Qt
 from PyQt6.QtGui import QCloseEvent, QImage, QPainter, QWheelEvent
 from PyQt6.QtTest import QSignalSpy, QTest
 
@@ -23,6 +23,35 @@ class UiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._windows: list[KerberusWindow] = []
+        original_init = KerberusWindow.__init__
+
+        def tracked_init(window, *args, **kwargs):
+            original_init(window, *args, **kwargs)
+            self._windows.append(window)
+
+        self._window_init_patcher = patch.object(KerberusWindow, "__init__", tracked_init)
+        self._window_init_patcher.start()
+
+    def tearDown(self):
+        # KerberusWindow owns Python workers in addition to its Qt children.
+        # Drain them before deferred Qt deletion to avoid callbacks reaching
+        # already-destroyed widgets and aborting the whole test process.
+        try:
+            for window in self._windows:
+                for dialog in list(window._open_dialogs):
+                    dialog.close()
+                window._release_resources(wait=True)
+            self.app.processEvents()
+            for window in self._windows:
+                window.hide()
+                window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+        finally:
+            self._window_init_patcher.stop()
 
     def test_message_bubble_renders_text_and_delivery_state(self):
         bubble = MessageBubble("Messaggio visibile", 1_700_000_000, True, "pending")
